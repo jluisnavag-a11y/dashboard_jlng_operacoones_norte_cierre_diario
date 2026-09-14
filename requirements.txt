@@ -2,3 +2,4 @@ streamlit
 pandas
 supabase
 plotly
+pyarrow==24.0.0
