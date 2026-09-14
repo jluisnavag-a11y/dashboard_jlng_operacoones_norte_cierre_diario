@@ -1111,21 +1111,14 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
             for obj in archivos_nube:
                 nombre_f = obj.get("name", "")
                 if nombre_f.endswith(".csv"):
-                    try:
-                        res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_f)
-                        if res and len(res) > 0:
-                            df_c = pd.read_csv(io.BytesIO(res), on_bad_lines='skip')
-                            if not df_c.empty:
-                                df_c["Archivo_Origen"] = nombre_f
-                                coleccion_dfs.append(df_c)
-                                archivos_procesados.add(nombre_f.upper())
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    # 2. FALLBACK A CARGA LOCAL (SI NO HUBO ARCHIVOS EN NUBE)
-    carpeta_origen = "datos_semanales"
+                    res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_f)
+                    df_c = pd.read_csv(io.BytesIO(res), on_bad_lines='skip')
+                    if not df_c.empty:
+                        df_c["Archivo_Origen"] = nombre_f  # Guardar el nombre de origen
+                        coleccion_dfs.append(df_c)
+                        archivos_procesados.add(nombre_f.upper())
+        except Exception as e:
+            st.warning(f"No se pudieron leer archivos de Supabase: {e}")
 
     # 2. CARGAR DE LA CARPETA LOCAL (SOLO LOS QUE AÚN NO ESTÁN EN LA NUBE)
     carpeta_origen = "datos_semanales"
@@ -1801,31 +1794,63 @@ def main() -> None:
     # --------------------------------------------------------------------------
     st.markdown("""
         <style>
-        /* 1. Pestañas INACTIVAS (Texto e iconos siempre visibles en azul/gris oscuro) */
-        button[data-baseweb="tab"] p, 
-        button[data-baseweb="tab"] span, 
-        button[data-baseweb="tab"] {
-            color: #1e293b !important;
-            font-weight: 600 !important;
-            opacity: 0.8 !important;
+        /* Contenedor principal de la barra de pestañas */
+        div[data-baseweb="tab-list"] {
+            background-color: #0d1117 !important;
+            padding: 8px !important;
+            border-radius: 12px !important;
+            border: 1px solid #1e293b !important;
+            gap: 8px !important;
         }
 
-        /* 2. Pestaña ACTIVA (Resaltada con el fondo turquesa) */
-        button[data-baseweb="tab"][aria-selected="true"] {
-            background-color: #00D2C8 !important;
-            border-radius: 6px !important;
+        /* Pestañas inactivas (Estilo botón oscuro con borde sutil) */
+        button[data-baseweb="tab"] {
+            background-color: #161b22 !important;
+            border: 1px solid #30363d !important;
+            border-radius: 8px !important;
+            padding: 10px 18px !important;
+            white-space: nowrap !important;
+            position: relative !important;
+            transition: all 0.2s ease-in-out !important;
         }
+
+        /* Texto de pestañas inactivas */
+        button[data-baseweb="tab"] p, 
+        button[data-baseweb="tab"] span {
+            color: #9198a1 !important;
+            font-weight: 600 !important;
+        }
+
+        /* Hover al pasar el ratón */
+        button[data-baseweb="tab"]:hover {
+            background-color: #21262d !important;
+            border-color: #38bdf8 !important;
+        }
+
+        /* Pestaña ACTIVA con la BARRA AZUL destacada */
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background-color: #1e293b !important;
+            border: 2px solid #0284c7 !important;
+            box-shadow: 0px 0px 10px rgba(2, 132, 199, 0.4) !important;
+        }
+
+        /* Barra Azul superior en la pestaña activa */
+        button[data-baseweb="tab"][aria-selected="true"]::before {
+            content: "" !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            height: 4px !important;
+            background-color: #38bdf8 !important;
+            border-radius: 8px 8px 0 0 !important;
+        }
+
+        /* Texto de la pestaña activa */
         button[data-baseweb="tab"][aria-selected="true"] p,
         button[data-baseweb="tab"][aria-selected="true"] span {
-            color: #0f172a !important;
+            color: #38bdf8 !important;
             font-weight: 700 !important;
-            opacity: 1 !important;
-        }
-
-        /* 3. Efecto al pasar el cursor (Hover) */
-        button[data-baseweb="tab"]:hover p,
-        button[data-baseweb="tab"]:hover span {
-            color: #00D2C8 !important;
         }
         </style>
     """, unsafe_allow_html=True)
