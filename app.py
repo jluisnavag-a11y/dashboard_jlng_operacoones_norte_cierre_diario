@@ -1121,6 +1121,11 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
                                 archivos_procesados.add(nombre_f.upper())
                     except Exception:
                         pass
+        except Exception:
+            pass
+
+    # 2. FALLBACK A CARGA LOCAL (SI NO HUBO ARCHIVOS EN NUBE)
+    carpeta_origen = "datos_semanales"
 
     # 2. CARGAR DE LA CARPETA LOCAL (SOLO LOS QUE AÚN NO ESTÁN EN LA NUBE)
     carpeta_origen = "datos_semanales"
