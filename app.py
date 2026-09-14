@@ -1427,22 +1427,22 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
 
     with sub_tab5:
         # ==============================================================================
-        # ESTILO PERSONALIZADO: VERDE COQUETO PARA LA CAJA DE TEXTO
+        # ESTILO PERSONALIZADO: GRIS TENUE Y ELEGANTE PARA LA CAJA DE TEXTO
         # ==============================================================================
         st.markdown("""
             <style>
             /* Caja de texto principal */
             div[data-testid="stTextArea"] textarea {
-                background-color: #0d2818 !important; /* Fondo verde bosque coqueto */
-                color: #d8f3dc !important;            /* Texto verde menta claro */
-                border: 2px solid #52b788 !important; /* Borde verde menta brillante */
-                border-radius: 10px !important;       /* Bordes curvos elegantes */
+                background-color: #1a1d24 !important; /* Gris oscuro tenue de fondo */
+                color: #e2e8f0 !important;            /* Texto gris claro muy legible */
+                border: 1px solid #374151 !important; /* Borde gris sutil */
+                border-radius: 8px !important;        /* Bordes suavemente redondeados */
                 font-family: monospace !important;     /* Fuente tipo código muy limpia */
             }
-            /* Al hacer clic o enfocarse en la caja */
+            /* Al hacer clic o seleccionarla */
             div[data-testid="stTextArea"] textarea:focus {
-                border-color: #74c69d !important; /* Verde menta encendido */
-                box-shadow: 0 0 12px rgba(116, 198, 157, 0.5) !important; /* Resplandor neón */
+                border-color: #6b7280 !important; /* Borde gris medio encendido */
+                box-shadow: 0 0 8px rgba(107, 114, 128, 0.3) !important; /* Resplandor tenue suave */
             }
             </style>
         """, unsafe_allow_html=True)
@@ -1789,6 +1789,40 @@ def main() -> None:
         initial_sidebar_state="expanded"
     )
 
+    # --------------------------------------------------------------------------
+    # ESTILO FORZADO PARA PESTAÑAS (TABS) - VISIBILIDAD TOTAL EN CUALQUIER TEMA
+    # --------------------------------------------------------------------------
+    st.markdown("""
+        <style>
+        /* 1. Pestañas INACTIVAS (Texto e iconos siempre visibles en azul/gris oscuro) */
+        button[data-baseweb="tab"] p, 
+        button[data-baseweb="tab"] span, 
+        button[data-baseweb="tab"] {
+            color: #1e293b !important;
+            font-weight: 600 !important;
+            opacity: 0.8 !important;
+        }
+
+        /* 2. Pestaña ACTIVA (Resaltada con el fondo turquesa) */
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background-color: #00D2C8 !important;
+            border-radius: 6px !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"] p,
+        button[data-baseweb="tab"][aria-selected="true"] span {
+            color: #0f172a !important;
+            font-weight: 700 !important;
+            opacity: 1 !important;
+        }
+
+        /* 3. Efecto al pasar el cursor (Hover) */
+        button[data-baseweb="tab"]:hover p,
+        button[data-baseweb="tab"]:hover span {
+            color: #00D2C8 !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     inyectar_estilos_css_enterprise()
 
     # ENCABEZADO PRINCIPAL CON BOTONES DE ACTUALIZACIÓN DERECHA
@@ -1797,7 +1831,7 @@ def main() -> None:
     with col_hdr_left:
         st.markdown(f"""
             <div class="main-header-enterprise">
-                <h1>TOTALPLAY / OPERACIONES — REGIÓN NORTE LA BAJA</h1>
+                <h1>OPERACIONES — REGIÓN NORTE LA BAJA</h1>
                 <p>Módulo Consolidado de Analítica, Pólizas y Control Técnico de Campo ({ANIO_BASE_ESTRICTO})</p>
             </div>
         """, unsafe_allow_html=True)
