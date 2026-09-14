@@ -1116,15 +1116,22 @@ def obtener_archivos_supabase():
             archivos_nube = supabase.storage.from_("Totalplay_datos_semanales").list()
             for obj in archivos_nube:
                 nombre_f = obj.get("name", "")
-                if nombre_f.endswith(".csv"):
-                    res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_f)
-                    df_c = pd.read_csv(io.BytesIO(res), on_bad_lines='skip')
-                    if df_c is not None and not df_c.empty:
-                        df_c["Archivo_Origen"] = nombre_f  # Guardar el nombre de origen
-                        dfs_descargados.append(df_c)
-                        procesados.add(nombre_f.upper())
+                # Asegura que sea un archivo CSV válido y ignora elementos nulos/carpetas
+                if nombre_f and nombre_f.endswith(".csv"):
+                    try:
+                        res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_f)
+                        df_c = pd.read_csv(io.BytesIO(res), on_bad_lines='skip')
+                        if df_c is not None and not df_c.empty:
+                            df_c["Archivo_Origen"] = nombre_f
+                            dfs_descargados.append(df_c)
+                            procesados.add(nombre_f.upper())
+                    except Exception as err_file:
+                        # Si un archivo particular da 404, lo ignora y sigue con los demás
+                        logger.warning(f"No se pudo descargar el archivo {nombre_f}: {err_file}")
+                        continue
         except Exception as e:
-            st.warning(f"No se pudieron leer archivos de Supabase: {e}")
+            logger.warning(f"No se pudieron leer archivos de Supabase Storage: {e}")
+            
     return dfs_descargados, procesados
 
 
