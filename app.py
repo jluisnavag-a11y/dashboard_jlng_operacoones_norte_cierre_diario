@@ -23,7 +23,7 @@ from supabase import create_client, Client
 @st.cache_resource
 def get_supabase_client() -> Optional[Client]:
     try:
-        url = st.secrets["SUPABASE_URL"]
+        url = "https://rmvfhhtugdvdkadickpf.supabase.co"
         key = st.secrets["SUPABASE_KEY"]
         return create_client(url, key)
     except Exception as e:
@@ -875,19 +875,105 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df = calcular_reincidencias_vectorizadas(df)
 
     return df
+import io
+import re
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+# ==============================================================================
+# CSS DE ALTO IMPACTO (COMPATIBLE CON STREAMLIT CLOUD Y LOCALHOST)
+# ==============================================================================
+
+def inyectar_estilos_base_ui():
+    """Inyecta CSS global forzado usando selectores nativos de Streamlit (.stTabs)
+    para evitar bloqueos por Shadow DOM o librerías dinámicas de React/BaseWeb.
+    """
+    st.markdown("""
+        <style>
+        /* 1. CONTENEDOR PRINCIPAL DE LAS PESTAÑAS (TABS) */
+        div[data-testid="stTabs"] {
+            background-color: #0f172a !important;
+            padding: 8px !important;
+            border-radius: 12px !important;
+            border: 1px solid #1e293b !important;
+        }
+
+        /* BARRA DE LISTA DE TABS */
+        div[data-testid="stTabs"] > div[role="tablist"] {
+            gap: 8px !important;
+            background-color: transparent !important;
+            border-bottom: none !important;
+        }
+
+        /* 2. ESTILO BASE DE CADA BOTÓN/TAB */
+        div[data-testid="stTabs"] button[role="tab"] {
+            background-color: #1e293b !important;
+            border: 1px solid #334155 !important;
+            border-radius: 8px !important;
+            padding: 10px 20px !important;
+            transition: all 0.25s ease-in-out !important;
+        }
+
+        /* TEXTO DENTRO DE LA PESTAÑA */
+        div[data-testid="stTabs"] button[role="tab"] p,
+        div[data-testid="stTabs"] button[role="tab"] span {
+            color: #94a3b8 !important;
+            font-size: 14px !important;
+            font-weight: 600 !important;
+        }
+
+        /* 3. HOVER (CUANDO EL MOUSE PASA POR ENCIMA) */
+        div[data-testid="stTabs"] button[role="tab"]:hover {
+            background-color: #334155 !important;
+            border-color: #475569 !important;
+        }
+        div[data-testid="stTabs"] button[role="tab"]:hover p {
+            color: #f8fafc !important;
+        }
+
+        /* 4. PESTAÑA ACTIVA (SELECCIONADA) */
+        div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+            background-color: #0284c7 !important;
+            border-color: #38bdf8 !important;
+            box-shadow: 0 4px 12px rgba(2, 132, 199, 0.4) !important;
+        }
+
+        div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p {
+            color: #ffffff !important;
+            font-weight: 700 !important;
+        }
+
+        /* ELIMINAR LÍNEA INFERIOR ROJA/AZUL NATIVA DE STREAMLIT */
+        div[data-testid="stTabs"] div[data-baseweb="tab-highlight"] {
+            display: none !important;
+        }
+
+        /* 5. FIX PARA TEXTAREA Y INPUTS EN MODO OSCURO */
+        div[data-testid="stTextArea"] textarea, div[data-testid="stTextInput"] input {
+            background-color: #0f172a !important;
+            color: #f8fafc !important;
+            border: 1px solid #334155 !important;
+            border-radius: 8px !important;
+            font-family: monospace !important;
+        }
+        
+        div[data-testid="stTextArea"] textarea:focus, div[data-testid="stTextInput"] input:focus {
+            border-color: #38bdf8 !important;
+            box-shadow: 0 0 0 1px #38bdf8 !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+
 # ==============================================================================
 # 7. VISTAS Y SECCIONES (OPTIMIZACIÓN VECTORIZADA DE ALTO RENDIMIENTO)
 # ==============================================================================
 
 def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel: str) -> None:
+    inyectar_estilos_base_ui()
     kpis = extraer_metricas_kpi_totales(df_folios)
-    
-    st.markdown("""
-        <style>
-        div[data-baseweb="tab-list"] { gap: 16px !important; }
-        button[data-baseweb="tab"] { padding: 10px 24px !important; white-space: nowrap !important; }
-        </style>
-    """, unsafe_allow_html=True)
 
     sub_tab1, sub_tab2, sub_tab3, sub_tab4, sub_tab5 = st.tabs([
         "📈 Evolución & Productividad",
@@ -897,12 +983,15 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         "☁️ Cargar Datos (Supabase)"
     ])
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 1: EVOLUCIÓN & PRODUCTIVIDAD
+    # --------------------------------------------------------------------------
     with sub_tab1:
         mask_grafico = df_folios[dimension_sel].notnull() & (~df_folios[dimension_sel].astype(str).str.lower().isin(["nan", "none", "null", ""]))
         df_folios_grafico = df_folios[mask_grafico]
         
         fig_evolucion = generar_figura_evolucion_temporal(df_folios_grafico, dimension_sel)
-        st.plotly_chart(fig_evolucion, use_container_width="stretch", key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
+        st.plotly_chart(fig_evolucion, use_container_width=True, key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
 
         nom_dim_label = {
             "FECHA_TRUNCADA": "Día",
@@ -912,9 +1001,9 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         }.get(dimension_sel, "Período")
 
         st.markdown(f"""
-        <div class="matrix-title-card">
-            <b style="color:#000000; font-size:15px;">👥 CUADRILLAS/TÉCNICOS FIRMADOS POR {nom_dim_label.upper()} Y PROVEEDOR</b>
-            <p style="color:#475569; margin:2px 0 0 0; font-size:12px;">Conteo de usuarios técnicos únicos con actividad registrada por semana.</p>
+        <div class="matrix-title-card" style="background:#1e293b; padding:12px; border-radius:8px; margin-bottom:12px; border:1px solid #334155;">
+            <b style="color:#f8fafc; font-size:15px;">👥 CUADRILLAS/TÉCNICOS FIRMADOS POR {nom_dim_label.upper()} Y PROVEEDOR</b>
+            <p style="color:#94a3b8; margin:2px 0 0 0; font-size:12px;">Conteo de usuarios técnicos únicos con actividad registrada por período.</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -952,15 +1041,15 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             ]
             cols_ordenadas_limpias = list(df_matriz.columns)
 
-            # Optimización de arrays vectorizados
-            matriz_vals = df_matriz[cols_ordenadas_limpias].values
+            # Vectorización optimizada de arrays con NumPy
+            matriz_vals = df_matriz[cols_ordenadas_limpias].to_numpy()
             df_matriz["TENDENCIA"] = matriz_vals.tolist()
             df_matriz["PROMEDIO_PERIODO"] = np.round(matriz_vals.mean(axis=1), 1)
 
             df_totales = df_folios.groupby(dimension_sel)["Usuario_Tecnico"].nunique()
             fila_total_serie = df_totales.reindex(cols_ordenadas).fillna(0).astype(int)
 
-            dict_total = {col_limpia: val for col_limpia, val in zip(cols_ordenadas_limpias, fila_total_serie.values)}
+            dict_total = dict(zip(cols_ordenadas_limpias, fila_total_serie.values))
             dict_total["TENDENCIA"] = fila_total_serie.tolist()
             dict_total["PROMEDIO_PERIODO"] = round(float(fila_total_serie.mean()), 1)
             
@@ -977,7 +1066,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     "TENDENCIA": st.column_config.LineChartColumn("Tendencia", width="small", y_min=0, pinned=True),
                     "PROMEDIO_PERIODO": st.column_config.NumberColumn("PROMEDIO_PERIODO", format="%.1f")
                 },
-                use_container_width="stretch", hide_index=True, height=320
+                use_container_width=True, hide_index=True, height=320
             )
             
             st.markdown("---")
@@ -990,14 +1079,14 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     color_discrete_sequence=[PALETA_COLOR["azul_marina"]]
                 )
                 fig_pol.update_layout(
-                    paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-                    font=dict(family="Plus Jakarta Sans", size=12, color="#000000"),
-                    title=dict(font=dict(color="#000000", size=14)),
-                    xaxis=dict(showgrid=True, gridcolor="#E2E8F0", tickfont=dict(color="#000000", size=11, weight="bold")),
-                    yaxis=dict(tickfont=dict(color="#000000", size=11, weight="bold"))
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="Plus Jakarta Sans", size=12, color="#E2E8F0"),
+                    title=dict(font=dict(color="#FFFFFF", size=14)),
+                    xaxis=dict(showgrid=True, gridcolor="#334155", tickfont=dict(color="#E2E8F0", size=11, weight="bold")),
+                    yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
                 )
-                fig_pol.update_traces(textposition="outside", textfont=dict(color="#000000", size=11, weight="bold"))
-                st.plotly_chart(fig_pol, use_container_width="stretch", config={'displayModeBar': False})
+                fig_pol.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
+                st.plotly_chart(fig_pol, use_container_width=True, config={'displayModeBar': False})
 
             with col2:
                 df_eve = df_folios.groupby("Tipo_Orden", observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True).tail(10)
@@ -1007,15 +1096,18 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     color_discrete_sequence=[PALETA_COLOR["turquesa_cyan"]]
                 )
                 fig_eve.update_layout(
-                    paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-                    font=dict(family="Plus Jakarta Sans", size=12, color="#000000"),
-                    title=dict(font=dict(color="#000000", size=14)),
-                    xaxis=dict(showgrid=True, gridcolor="#E2E8F0", tickfont=dict(color="#000000", size=11, weight="bold")),
-                    yaxis=dict(tickfont=dict(color="#000000", size=11, weight="bold"))
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="Plus Jakarta Sans", size=12, color="#E2E8F0"),
+                    title=dict(font=dict(color="#FFFFFF", size=14)),
+                    xaxis=dict(showgrid=True, gridcolor="#334155", tickfont=dict(color="#E2E8F0", size=11, weight="bold")),
+                    yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
                 )
-                fig_eve.update_traces(textposition="outside", textfont=dict(color="#000000", size=11, weight="bold"))
-                st.plotly_chart(fig_eve, use_container_width="stretch", config={'displayModeBar': False})
+                fig_eve.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
+                st.plotly_chart(fig_eve, use_container_width=True, config={'displayModeBar': False})
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 2: DESGROSE POR PÓLIZAS
+    # --------------------------------------------------------------------------
     with sub_tab2:
         st.markdown("### 📂 Resumen Operativo por Tipo de Póliza Catalogada")
         if not df_folios.empty:
@@ -1027,12 +1119,17 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     Dias_Operativos=("FECHA_TRUNCADA", "nunique")
                 ).reset_index()
             )
-            df_res_pol["Productividad_Promedio"] = [
-                calcular_indice_productividad_diaria(ev, u, d)
-                for ev, u, d in zip(df_res_pol["Total_Eventos"], df_res_pol["Tecnicos_Unicos"], df_res_pol["Dias_Operativos"])
-            ]
-            st.dataframe(df_res_pol, use_container_width="stretch", hide_index=True)
+            v_calc_prod = np.vectorize(calcular_indice_productividad_diaria)
+            df_res_pol["Productividad_Promedio"] = v_calc_prod(
+                df_res_pol["Total_Eventos"].to_numpy(),
+                df_res_pol["Tecnicos_Unicos"].to_numpy(),
+                df_res_pol["Dias_Operativos"].to_numpy()
+            )
+            st.dataframe(df_res_pol, use_container_width=True, hide_index=True)
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 3: RANKING DE CUADRILLAS / TÉCNICOS
+    # --------------------------------------------------------------------------
     with sub_tab3:
         st.markdown("### 🏆 Ranking de Productividad por Cuadrilla / Técnico")
         if not df_folios.empty:
@@ -1041,35 +1138,27 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                 .agg(Eventos_Totales=("FOLIO_KEY", "count"), Dias_Activos=("FECHA_TRUNCADA", "nunique"))
                 .reset_index()
             )
-            df_rank["Productividad_Diaria"] = [
-                calcular_indice_productividad_diaria(ev, 1, d)
-                for ev, d in zip(df_rank["Eventos_Totales"], df_rank["Dias_Activos"])
-            ]
+            v_calc_prod = np.vectorize(calcular_indice_productividad_diaria)
+            df_rank["Productividad_Diaria"] = v_calc_prod(
+                df_rank["Eventos_Totales"].to_numpy(),
+                1,
+                df_rank["Dias_Activos"].to_numpy()
+            )
             df_rank = df_rank.sort_values(by="Productividad_Diaria", ascending=False)
-            st.dataframe(df_rank, use_container_width="stretch", hide_index=True, height=400)
+            st.dataframe(df_rank, use_container_width=True, hide_index=True, height=400)
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 4: DESCARGA DE REPORTES
+    # --------------------------------------------------------------------------
     with sub_tab4:
         st.markdown("### 📥 Descarga de Reportes")
         csv_bytes = df_folios.to_csv(index=False).encode("utf-8")
         st.download_button("📄 Descargar Dataset (CSV)", csv_bytes, f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv")
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 5: CARGAR DATOS (SUPABASE)
+    # --------------------------------------------------------------------------
     with sub_tab5:
-        st.markdown("""
-            <style>
-            div[data-testid="stTextArea"] textarea {
-                background-color: #1a1d24 !important;
-                color: #e2e8f0 !important;
-                border: 1px solid #374151 !important;
-                border-radius: 8px !important;
-                font-family: monospace !important;
-            }
-            div[data-testid="stTextArea"] textarea:focus {
-                border-color: #6b7280 !important;
-                box-shadow: 0 0 8px rgba(107, 114, 128, 0.3) !important;
-            }
-            </style>
-        """, unsafe_allow_html=True)
-
         CLAVE_ACCESO_CARGA = "Totalplay1#Norte"
 
         st.subheader("🚀 Cargar Nueva Semana a Supabase Storage")
@@ -1089,7 +1178,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             type="password"
         )
 
-        if st.button("🚀 Guardar y Subir", type="primary", use_container_width="stretch"):
+        if st.button("🚀 Guardar y Subir", type="primary", use_container_width=True):
             if not nombre_archivo_input.strip() or not contenido_csv_input.strip():
                 st.warning("⚠️ Debe proporcionar tanto el nombre del archivo como el contenido CSV.")
             elif clave_ingresada != CLAVE_ACCESO_CARGA:
@@ -1112,6 +1201,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                         st.balloons()
                 except Exception as e:
                     st.error(f"❌ Error al intentar subir el archivo a Supabase: {e}")
+
 
 @st.dialog("Detalle Ampliado de Reincidencia por Usuario", width="large")
 def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
@@ -1138,7 +1228,7 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
     }
     
     df_mostrar_modal = df_modal[cols_presentes].rename(columns=nombres_popup)
-    st.dataframe(df_mostrar_modal, use_container_width="stretch", hide_index=True, height=400)
+    st.dataframe(df_mostrar_modal, use_container_width=True, hide_index=True, height=400)
     
     csv_popup = df_mostrar_modal.to_csv(index=False).encode('utf-8')
     st.download_button(
@@ -1146,8 +1236,9 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
         data=csv_popup,
         file_name=f"Reincidencias_{usuario_nom}.csv",
         mime="text/csv",
-        use_container_width="stretch"
+        use_container_width=True
     )
+
 
 def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_sel: str) -> None:
     st.markdown("### Módulo Avanzado de Reincidencias y Control de Efectividad")
@@ -1212,7 +1303,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     tasa_efectividad = round(((total_base_evaluados - total_reincidentes_filtrados) / total_base_evaluados * 100), 2) if total_base_evaluados > 0 else 100.0
 
     st.markdown(f"""
-        <div class="kpi-wrapper-grid" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="kpi-wrapper-grid" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;">
             <div class="kpi-card-enterprise">
                 <div class="kpi-card-title">EVENTOS BASE (EFECTIVIDAD)</div>
                 <div class="kpi-card-value">{total_base_evaluados:,}</div>
@@ -1237,9 +1328,9 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     """, unsafe_allow_html=True)
 
     st.markdown("""
-        <div class="matrix-title-card">
-            <b style="color:#000000; font-size:15px;"> EVALUACIÓN DE EFECTIVIDAD Y REINCIDENCIA POR TÉCNICO ORIGEN</b>
-            <p style="color:#475569; margin:2px 0 0 0; font-size:12px;">Consolidado total único por Técnico (Eventos Atendidos vs Reincidencias Provocadas).</p>
+        <div class="matrix-title-card" style="background:#1e293b; padding:12px; border-radius:8px; margin:16px 0 12px 0; border:1px solid #334155;">
+            <b style="color:#f8fafc; font-size:15px;">📊 EVALUACIÓN DE EFECTIVIDAD Y REINCIDENCIA POR TÉCNICO ORIGEN</b>
+            <p style="color:#94a3b8; margin:2px 0 0 0; font-size:12px;">Consolidado total único por Técnico (Eventos Atendidos vs Reincidencias Provocadas).</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -1247,21 +1338,26 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         col_tech_base = detectar_columna_por_patrones(list(df_folios.columns), ["usuario_tecnico", "tecnico", "tech", "usuario", "atendio"]) or "Usuario_Tecnico"
         eventos_por_tech = df_base_efectividad.groupby(col_tech_base, observed=True).size().to_dict()
 
-        # Concatenación rápida de strings vectorizada
+        # Concatenación vectorizada optimizada usando sets para deduplicar cadenas
         df_agrupado_tech = df_filtrado_rein.groupby(
             ["Usuario_Origen_Reincidencia", "Empresa_Origen_Reincidencia"], observed=True
         ).agg(
             Total_Reincidencias=("FOLIO_KEY", "count"),
-            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(pd.Series(x).dropna().unique())),
-            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(pd.Series(x).dropna().unique()))
+            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(set(filter(None, x)))),
+            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(set(filter(None, x))))
         ).reset_index()
 
         df_agrupado_tech["Eventos_Atendidos"] = df_agrupado_tech["Usuario_Origen_Reincidencia"].map(eventos_por_tech).fillna(df_agrupado_tech["Total_Reincidencias"])
         df_agrupado_tech["Eventos_Atendidos"] = np.maximum(df_agrupado_tech["Eventos_Atendidos"], df_agrupado_tech["Total_Reincidencias"])
 
-        atendidos = df_agrupado_tech["Eventos_Atendidos"].values
-        reincidencias = df_agrupado_tech["Total_Reincidencias"].values
-        df_agrupado_tech["Efectividad_%"] = np.where(atendidos > 0, np.round(((atendidos - reincidencias) / atendidos) * 100, 2), 0.0)
+        atendidos = df_agrupado_tech["Eventos_Atendidos"].to_numpy()
+        reincidencias = df_agrupado_tech["Total_Reincidencias"].to_numpy()
+        
+        df_agrupado_tech["Efectividad_%"] = np.where(
+            atendidos > 0, 
+            np.round(((atendidos - reincidencias) / atendidos) * 100, 2), 
+            0.0
+        )
 
         df_agrupado_tech = df_agrupado_tech.rename(columns={
             "Usuario_Origen_Reincidencia": "Técnico Reincidente (Origen)",
@@ -1281,7 +1377,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         with col_t1:
             st.dataframe(
                 df_agrupado_tech, 
-                use_container_width="stretch", 
+                use_container_width=True, 
                 hide_index=True, 
                 height=380,
                 column_config={"% Efectividad Operativa": st.column_config.NumberColumn(format="%.2f %%")}
@@ -1292,7 +1388,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             tech_lista = sorted(df_agrupado_tech["Técnico Reincidente (Origen)"].unique())
             tech_seleccionado = st.selectbox("Seleccionar Técnico:", tech_lista, key="sb_pop_tech")
             
-            if st.button("Abrir Detalle Pop-Up", use_container_width="stretch", key="btn_pop_tech"):
+            if st.button("Abrir Detalle Pop-Up", use_container_width=True, key="btn_pop_tech"):
                 sub_df = df_filtrado_rein[df_filtrado_rein["Usuario_Origen_Reincidencia"] == tech_seleccionado]
                 mostrar_modal_detalle_usuario(sub_df, tech_seleccionado)
     else:
@@ -1301,9 +1397,9 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     st.markdown("---")
 
     st.markdown("""
-        <div class="matrix-title-card">
-            <b style="color:#000000; font-size:15px;"> HISTORIAL OPERATIVO POR CUENTA DE CLIENTE</b>
-            <p style="color:#475569; margin:2px 0 0 0; font-size:12px;">Desglose de visitas por Cuenta de Cliente reincidente.</p>
+        <div class="matrix-title-card" style="background:#1e293b; padding:12px; border-radius:8px; margin-bottom:12px; border:1px solid #334155;">
+            <b style="color:#f8fafc; font-size:15px;">📜 HISTORIAL OPERATIVO POR CUENTA DE CLIENTE</b>
+            <p style="color:#94a3b8; margin:2px 0 0 0; font-size:12px;">Desglose de visitas por Cuenta de Cliente reincidente.</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -1311,16 +1407,18 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         df_agrupado_cuenta = df_filtrado_rein.groupby("Cuenta_Cliente", observed=True).agg(
             Visitas_Totales=("FOLIO_KEY", "count"),
             Semanas_Con_Incidencia=("Num_Semana_Archivo", lambda x: ", ".join(map(str, sorted(set(x))))),
-            Causas_Historicas=("TIPO_2", lambda x: " | ".join(pd.Series(x).dropna().unique())),
-            Fallas_Reportadas=("Falla_Nueva", lambda x: " | ".join(pd.Series(x).dropna().unique())),
-            Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(pd.Series(x).dropna().unique()))
+            Causas_Historicas=("TIPO_2", lambda x: " | ".join(set(filter(None, x)))),
+            Fallas_Reportadas=("Falla_Nueva", lambda x: " | ".join(set(filter(None, x)))),
+            Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(set(filter(None, x))))
         ).reset_index().sort_values(by="Visitas_Totales", ascending=False)
 
-        st.dataframe(df_agrupado_cuenta, use_container_width="stretch", hide_index=True, height=350)
+        st.dataframe(df_agrupado_cuenta, use_container_width=True, hide_index=True, height=350)
     else:
         st.info("No hay historial de cuentas con reincidencia para mostrar.")
 
+
 def guardar_y_reemplazar_semana_texto(nombre_semana: str, texto_datos: str) -> bool:
+    """Procesa el buffer en texto plano e interactúa con Supabase Storage de manera atómica."""
     try:
         texto_limpio = texto_datos.strip()
         if not texto_limpio:
