@@ -1104,7 +1104,13 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
     coleccion_dfs: List[pd.DataFrame] = []
     archivos_procesados = set()
 
-    # 1. INTENTAR CARGAR DESDE SUPABASE STORAGE (BUCKET: Totalplay_datos_semanales)
+# ==============================================================================
+# 1. INTENTAR CARGAR DESDE SUPABASE STORAGE (OPTIMIZADO CON CACHÉ Y MANEJO DE SEGURO)
+# ==============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def obtener_archivos_supabase():
+    dfs_descargados = []
+    procesados = set()
     if supabase:
         try:
             archivos_nube = supabase.storage.from_("Totalplay_datos_semanales").list()
@@ -1113,14 +1119,26 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
                 if nombre_f.endswith(".csv"):
                     res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_f)
                     df_c = pd.read_csv(io.BytesIO(res), on_bad_lines='skip')
-                    if not df_c.empty:
+                    if df_c is not None and not df_c.empty:
                         df_c["Archivo_Origen"] = nombre_f  # Guardar el nombre de origen
-                        coleccion_dfs.append(df_c)
-                        archivos_procesados.add(nombre_f.upper())
+                        dfs_descargados.append(df_c)
+                        procesados.add(nombre_f.upper())
         except Exception as e:
             st.warning(f"No se pudieron leer archivos de Supabase: {e}")
+    return dfs_descargados, procesados
 
-    # 2. CARGAR DE LA CARPETA LOCAL (SOLO LOS QUE AÚN NO ESTÁN EN LA NUBE)
+
+@st.cache_data(ttl=3600, show_spinner="Procesando datos y optimizando memoria...")
+def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
+    coleccion_dfs = []
+    archivos_procesados = set()
+
+    # 1. Descargar archivos de Supabase
+    dfs_nube, archivos_procesados_nube = obtener_archivos_supabase()
+    coleccion_dfs.extend(dfs_nube)
+    archivos_procesados.update(archivos_procesados_nube)
+
+    # 2. Cargar de la carpeta local (solo los que aún no estén en Supabase)
     carpeta_origen = "datos_semanales"
     if os.path.exists(carpeta_origen):
         archivos_locales = sorted(glob.glob(os.path.join(carpeta_origen, "*.csv")))
@@ -1129,7 +1147,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
             if nombre_local not in archivos_procesados:
                 df_c = _cargar_archivo_robusto(ruta)
                 if df_c is not None and not df_c.empty:
-                    df_c["Archivo_Origen"] = os.path.basename(ruta)  # Guardar el nombre local
+                    df_c["Archivo_Origen"] = os.path.basename(ruta)
                     coleccion_dfs.append(df_c)
 
     if not coleccion_dfs:
@@ -1149,7 +1167,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
     else:
         df["_datetime_parsed"] = pd.NaT
 
-    # Detección de columnas principales (FUERA DEL IF/ELSE)
+    # Detección y normalización de columnas principales
     col_os = detectar_columna_por_patrones(cols, LISTA_ALIAS_ORDEN)
     col_cta = detectar_columna_por_patrones(cols, LISTA_ALIAS_CUENTA)
     col_ot = detectar_columna_por_patrones(cols, LISTA_ALIAS_OT)
@@ -1193,35 +1211,11 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
         df["Codigo_Poliza"] = ""
         df["Nombre_Poliza"] = "NO VALIDO"
 
-    # EXTRACCIÓN Y DIMENSIONES TEMPORALES (BASADAS EN CONTENIDO REAL)
+    # Extracción y Dimensiones Temporales
     semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
     semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else 0
     df["Num_Semana_Archivo"] = pd.to_numeric(semanas_iso.fillna(semanas_archivo), errors="coerce").fillna(0).astype(int)
 
-    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
-    df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
-    df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO)
-    
-    dates_valid = df["_datetime_parsed"].dropna()
-    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
-    if not dates_valid.empty:
-        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
-
-    df = calcular_reincidencias_vectorizadas(df)
-
-    return df
-    # ==============================================================================
-    # EXTRACCIÓN Y DIMENSIONES TEMPORALES (BASADAS EN CONTENIDO REAL)
-    # ==============================================================================
-    # 1. Calcular número de semana ISO desde las fechas reales
-    semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
-    
-    # Respaldo por nombre de archivo solo para filas sin fecha
-    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else 0
-    
-    df["Num_Semana_Archivo"] = pd.to_numeric(semanas_iso.fillna(semanas_archivo), errors="coerce").fillna(0).astype(int)
-
-    # 2. Formatear Dimensiones de Tiempo
     df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
     df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
     df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO)
@@ -1261,7 +1255,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         df_folios_grafico = df_folios[mask_grafico]
         
         fig_evolucion = generar_figura_evolucion_temporal(df_folios_grafico, dimension_sel)
-        st.plotly_chart(fig_evolucion, use_container_width=True, key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
+        st.plotly_chart(fig_evolucion, use_container_width="stretch", key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
 
         nom_dim_label = {
             "FECHA_TRUNCADA": "Día",
@@ -1336,7 +1330,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     "TENDENCIA": st.column_config.LineChartColumn("Tendencia", width="small", y_min=0, pinned=True),
                     "PROMEDIO_PERIODO": st.column_config.NumberColumn("PROMEDIO_PERIODO", format="%.1f")
                 },
-                use_container_width=True, hide_index=True, height=320
+                use_container_width="stretch", hide_index=True, height=320
             )
             
             st.markdown("---")
@@ -1356,7 +1350,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     yaxis=dict(tickfont=dict(color="#000000", size=11, weight="bold"))
                 )
                 fig_pol.update_traces(textposition="outside", textfont=dict(color="#000000", size=11, weight="bold"))
-                st.plotly_chart(fig_pol, use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(fig_pol, use_container_width="stretch", config={'displayModeBar': False})
 
             with col2:
                 df_eve = df_folios.groupby("Tipo_Orden", observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True).tail(10)
@@ -1373,7 +1367,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     yaxis=dict(tickfont=dict(color="#000000", size=11, weight="bold"))
                 )
                 fig_eve.update_traces(textposition="outside", textfont=dict(color="#000000", size=11, weight="bold"))
-                st.plotly_chart(fig_eve, use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(fig_eve, use_container_width="stretch", config={'displayModeBar': False})
 
     with sub_tab2:
         st.markdown("### 📂 Resumen Operativo por Tipo de Póliza Catalogada")
@@ -1390,7 +1384,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                 calcular_indice_productividad_diaria(ev, u, d)
                 for ev, u, d in zip(df_res_pol["Total_Eventos"], df_res_pol["Tecnicos_Unicos"], df_res_pol["Dias_Operativos"])
             ]
-            st.dataframe(df_res_pol, use_container_width=True, hide_index=True)
+            st.dataframe(df_res_pol, use_container_width="stretch", hide_index=True)
 
     with sub_tab3:
         st.markdown("### 🏆 Ranking de Productividad por Cuadrilla / Técnico")
@@ -1405,7 +1399,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                 for ev, d in zip(df_rank["Eventos_Totales"], df_rank["Dias_Activos"])
             ]
             df_rank = df_rank.sort_values(by="Productividad_Diaria", ascending=False)
-            st.dataframe(df_rank, use_container_width=True, hide_index=True, height=400)
+            st.dataframe(df_rank, use_container_width="stretch", hide_index=True, height=400)
 
     with sub_tab4:
         st.markdown("### 📥 Descarga de Reportes")
@@ -1448,7 +1442,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             type="password"
         )
 
-        if st.button("🚀 Guardar y Subir", type="primary", use_container_width=True):
+        if st.button("🚀 Guardar y Subir", type="primary", use_container_width="stretch"):
             if not nombre_archivo_input.strip() or not contenido_csv_input.strip():
                 st.warning("⚠️ Debe proporcionar tanto el nombre del archivo como el contenido CSV.")
             elif clave_ingresada != CLAVE_ACCESO_CARGA:
@@ -1497,7 +1491,7 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
     }
     
     df_mostrar_modal = df_modal[cols_presentes].rename(columns=nombres_popup)
-    st.dataframe(df_mostrar_modal, use_container_width=True, hide_index=True, height=400)
+    st.dataframe(df_mostrar_modal, use_container_width="stretch", hide_index=True, height=400)
     
     csv_popup = df_mostrar_modal.to_csv(index=False).encode('utf-8')
     st.download_button(
@@ -1505,7 +1499,7 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
         data=csv_popup,
         file_name=f"Reincidencias_{usuario_nom}.csv",
         mime="text/csv",
-        use_container_width=True
+        use_container_width="stretch"
     )
 
 def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_sel: str) -> None:
@@ -1640,7 +1634,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         with col_t1:
             st.dataframe(
                 df_agrupado_tech, 
-                use_container_width=True, 
+                use_container_width="stretch", 
                 hide_index=True, 
                 height=380,
                 column_config={"% Efectividad Operativa": st.column_config.NumberColumn(format="%.2f %%")}
@@ -1651,7 +1645,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             tech_lista = sorted(df_agrupado_tech["Técnico Reincidente (Origen)"].unique())
             tech_seleccionado = st.selectbox("Seleccionar Técnico:", tech_lista, key="sb_pop_tech")
             
-            if st.button("Abrir Detalle Pop-Up", use_container_width=True, key="btn_pop_tech"):
+            if st.button("Abrir Detalle Pop-Up", use_container_width="stretch", key="btn_pop_tech"):
                 sub_df = df_filtrado_rein[df_filtrado_rein["Usuario_Origen_Reincidencia"] == tech_seleccionado]
                 mostrar_modal_detalle_usuario(sub_df, tech_seleccionado)
     else:
@@ -1675,7 +1669,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(pd.Series(x).dropna().unique()))
         ).reset_index().sort_values(by="Visitas_Totales", ascending=False)
 
-        st.dataframe(df_agrupado_cuenta, use_container_width=True, hide_index=True, height=350)
+        st.dataframe(df_agrupado_cuenta, use_container_width="stretch", hide_index=True, height=350)
     else:
         st.info("No hay historial de cuentas con reincidencia para mostrar.")
 
@@ -1850,11 +1844,11 @@ def main() -> None:
 
         btn_c1, btn_c2 = st.columns(2)
         with btn_c1:
-            if st.button("🔄 Recargar", use_container_width=True, type="primary"):
+            if st.button("🔄 Recargar", use_container_width="stretch", type="primary"):
                 st.cache_data.clear()
                 st.rerun()
         with btn_c2:
-            if st.button("🧹 Limpiar Caché", use_container_width=True, type="secondary"):
+            if st.button("🧹 Limpiar Caché", use_container_width="stretch", type="secondary"):
                 st.cache_data.clear()
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
