@@ -748,7 +748,7 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
             pass
     return "|".join(info)
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner="Procesando datos y optimizando memoria...")
 def obtener_archivos_supabase():
     dfs_descargados = []
     procesados = set()
