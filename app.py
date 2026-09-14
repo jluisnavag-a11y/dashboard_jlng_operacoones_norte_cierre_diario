@@ -991,7 +991,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         df_folios_grafico = df_folios[mask_grafico]
         
         fig_evolucion = generar_figura_evolucion_temporal(df_folios_grafico, dimension_sel)
-        st.plotly_chart(fig_evolucion, use_container_width=True, key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
+        st.plotly_chart(fig_evolucion, width="stretch", key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
 
         nom_dim_label = {
             "FECHA_TRUNCADA": "Día",
@@ -1066,7 +1066,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     "TENDENCIA": st.column_config.LineChartColumn("Tendencia", width="small", y_min=0, pinned=True),
                     "PROMEDIO_PERIODO": st.column_config.NumberColumn("PROMEDIO_PERIODO", format="%.1f")
                 },
-                use_container_width=True, hide_index=True, height=320
+                width="stretch", hide_index=True, height=320
             )
             
             st.markdown("---")
@@ -1086,7 +1086,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
                 )
                 fig_pol.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
-                st.plotly_chart(fig_pol, use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(fig_pol, width="stretch", config={'displayModeBar': False})
 
             with col2:
                 df_eve = df_folios.groupby("Tipo_Orden", observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True).tail(10)
@@ -1103,7 +1103,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
                 )
                 fig_eve.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
-                st.plotly_chart(fig_eve, use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(fig_eve, width="stretch", config={'displayModeBar': False})
 
     # --------------------------------------------------------------------------
     # SUBTAB 2: DESGROSE POR PÓLIZAS
@@ -1125,7 +1125,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                 df_res_pol["Tecnicos_Unicos"].to_numpy(),
                 df_res_pol["Dias_Operativos"].to_numpy()
             )
-            st.dataframe(df_res_pol, use_container_width=True, hide_index=True)
+            st.dataframe(df_res_pol, width="stretch", hide_index=True)
 
     # --------------------------------------------------------------------------
     # SUBTAB 3: RANKING DE CUADRILLAS / TÉCNICOS
@@ -1145,7 +1145,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                 df_rank["Dias_Activos"].to_numpy()
             )
             df_rank = df_rank.sort_values(by="Productividad_Diaria", ascending=False)
-            st.dataframe(df_rank, use_container_width=True, hide_index=True, height=400)
+            st.dataframe(df_rank, width="stretch", hide_index=True, height=400)
 
     # --------------------------------------------------------------------------
     # SUBTAB 4: DESCARGA DE REPORTES
@@ -1178,7 +1178,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             type="password"
         )
 
-        if st.button("🚀 Guardar y Subir", type="primary", use_container_width=True):
+        if st.button("🚀 Guardar y Subir", type="primary", width="stretch"):
             if not nombre_archivo_input.strip() or not contenido_csv_input.strip():
                 st.warning("⚠️ Debe proporcionar tanto el nombre del archivo como el contenido CSV.")
             elif clave_ingresada != CLAVE_ACCESO_CARGA:
@@ -1228,7 +1228,7 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
     }
     
     df_mostrar_modal = df_modal[cols_presentes].rename(columns=nombres_popup)
-    st.dataframe(df_mostrar_modal, use_container_width=True, hide_index=True, height=400)
+    st.dataframe(df_mostrar_modal, width="stretch", hide_index=True, height=400)
     
     csv_popup = df_mostrar_modal.to_csv(index=False).encode('utf-8')
     st.download_button(
@@ -1236,7 +1236,7 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
         data=csv_popup,
         file_name=f"Reincidencias_{usuario_nom}.csv",
         mime="text/csv",
-        use_container_width=True
+        width="stretch"
     )
 
 
@@ -1377,7 +1377,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         with col_t1:
             st.dataframe(
                 df_agrupado_tech, 
-                use_container_width=True, 
+                width="stretch", 
                 hide_index=True, 
                 height=380,
                 column_config={"% Efectividad Operativa": st.column_config.NumberColumn(format="%.2f %%")}
@@ -1388,7 +1388,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             tech_lista = sorted(df_agrupado_tech["Técnico Reincidente (Origen)"].unique())
             tech_seleccionado = st.selectbox("Seleccionar Técnico:", tech_lista, key="sb_pop_tech")
             
-            if st.button("Abrir Detalle Pop-Up", use_container_width=True, key="btn_pop_tech"):
+            if st.button("Abrir Detalle Pop-Up", width="stretch", key="btn_pop_tech"):
                 sub_df = df_filtrado_rein[df_filtrado_rein["Usuario_Origen_Reincidencia"] == tech_seleccionado]
                 mostrar_modal_detalle_usuario(sub_df, tech_seleccionado)
     else:
@@ -1412,7 +1412,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(set(filter(None, x))))
         ).reset_index().sort_values(by="Visitas_Totales", ascending=False)
 
-        st.dataframe(df_agrupado_cuenta, use_container_width=True, hide_index=True, height=350)
+        st.dataframe(df_agrupado_cuenta, width="stretch", hide_index=True, height=350)
     else:
         st.info("No hay historial de cuentas con reincidencia para mostrar.")
 
