@@ -1099,7 +1099,7 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
             pass
     return "|".join(info)
 
-@st.cache_data(ttl=3600, show_spinner="Cargando datos desde la nube y local...")
+@st.cache_data(ttl=3600, show_spinner=False)
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
     coleccion_dfs: List[pd.DataFrame] = []
     archivos_procesados = set()
@@ -1112,7 +1112,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
                 nombre_f = obj.get("name", "")
                 if nombre_f.endswith(".csv"):
                     res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_f)
-                    df_c = pd.read_csv(io.BytesIO(res))
+                    df_c = pd.read_csv(io.BytesIO(res), on_bad_lines='skip')
                     if not df_c.empty:
                         df_c["Archivo_Origen"] = nombre_f  # Guardar el nombre de origen
                         coleccion_dfs.append(df_c)
