@@ -1,3 +1,12 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+import re
+import os
+import glob
+import plotly.express as px
+
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
 # Archivo: app.py
@@ -5,18 +14,12 @@
 # ==============================================================================
 
 import os
-import re
-import io
 import glob
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 
-import pandas as pd
-import numpy as np
-import streamlit as st
-import plotly.express as px
 import plotly.graph_objects as go
 from supabase import create_client, Client
 
@@ -748,32 +751,51 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
             pass
     return "|".join(info)
 
-@st.cache_data(ttl=86400, show_spinner="Procesando datos y optimizando memoria...")
+import concurrent.futures
+import io
+import pandas as pd
+import streamlit as st
+
+@st.cache_data(ttl=86400, show_spinner="Descargando datos de la nube...")
 def obtener_archivos_supabase():
-    dfs_descargados = []
-    procesados = set()
-    client = get_supabase_client() if "get_supabase_client" in globals() else supabase
-    
-    if client:
-        try:
-            archivos_nube = client.storage.from_("Totalplay_datos_semanales").list()
-            for obj in archivos_nube:
-                nombre_f = obj.get("name", "")
-                if nombre_f and nombre_f.endswith(".csv"):
-                    try:
-                        res = client.storage.from_("Totalplay_datos_semanales").download(nombre_f)
-                        df_c = pd.read_csv(io.BytesIO(res), on_bad_lines='skip')
-                        if df_c is not None and not df_c.empty:
-                            df_c["Archivo_Origen"] = nombre_f
-                            dfs_descargados.append(df_c)
-                            procesados.add(nombre_f.upper())
-                    except Exception as err_file:
-                        logger.warning(f"No se pudo descargar el archivo {nombre_f}: {err_file}")
-                        continue
-        except Exception as e:
-            logger.warning(f"No se pudieron leer archivos de Supabase Storage: {e}")
-            
-    return dfs_descargados, procesados
+    try:
+        # 1. Obtener la lista de archivos en el bucket
+        archivos = supabase.storage.from_("Totalplay_datos_semanales").list()
+        csv_files = [f['name'] for f in archivos if f['name'].endswith('.csv')]
+        
+        if not csv_files:
+            return [], set()
+
+        # Función interna para descargar un solo archivo en su propio hilo
+        def descargar_individual(nombre_archivo):
+            try:
+                res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
+                # Engine C de Pandas para lectura ultrarrápida
+                df_temp = pd.read_csv(io.BytesIO(res), engine='c', low_memory=False)
+                if not df_temp.empty:
+                    df_temp["Archivo_Origen"] = nombre_archivo
+                    return df_temp, nombre_archivo.upper()
+            except Exception as e:
+                pass
+            return None, None
+
+        # 2. Descargar todos los CSV simultáneamente (Multithreading)
+        coleccion_dfs = []
+        archivos_procesados = set()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            resultados = list(executor.map(descargar_individual, csv_files))
+
+        for df_res, nom_res in resultados:
+            if df_res is not None:
+                coleccion_dfs.append(df_res)
+                archivos_procesados.add(nom_res)
+
+        return coleccion_dfs, archivos_procesados
+
+    except Exception as e:
+        st.error(f"Error al conectar con Supabase Storage: {e}")
+        return [], set()
 
 @st.cache_data(ttl=3600, show_spinner="Procesando datos y optimizando memoria...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
@@ -875,12 +897,6 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df = calcular_reincidencias_vectorizadas(df)
 
     return df
-import io
-import re
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import streamlit as st
 
 # ==============================================================================
 # CSS DE ALTO IMPACTO (COMPATIBLE CON STREAMLIT CLOUD Y LOCALHOST)
