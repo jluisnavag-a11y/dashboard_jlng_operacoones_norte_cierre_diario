@@ -1235,27 +1235,16 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str) -> pd.DataFrame:
 
     return df
 # ==============================================================================
-# 7. VISTAS Y SECCIONES
+# 7. VISTAS Y SECCIONES (OPTIMIZACIÓN VECTORIZADA DE ALTO RENDIMIENTO)
 # ==============================================================================
 
 def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel: str) -> None:
     kpis = extraer_metricas_kpi_totales(df_folios)
-    c1 = f"""<div class="kpi-card-enterprise" style="flex: 1;"><div class="kpi-card-title">EVENTOS COMPLETADOS</div><div class="kpi-card-value">{kpis.total_eventos:,}</div></div>"""
-    c2 = f"""<div class="kpi-card-enterprise" style="flex: 1;"><div class="kpi-card-title">USUARIOS TÉCNICOS</div><div class="kpi-card-value">{kpis.total_usuarios:,}</div></div>"""
-    c3 = f"""<div class="kpi-card-enterprise" style="flex: 1;"><div class="kpi-card-title">PRODUCTIVIDAD DIARIA</div><div class="kpi-card-value">{kpis.productividad_diaria:.2f}</div></div>"""
-    c4 = f"""<div class="kpi-card-enterprise" style="flex: 1;"><div class="kpi-card-title">PÓLIZA R3 (RECOLECCIÓN)</div><div class="kpi-card-value">{kpis.eventos_r3:,}</div></div>"""
-    c5 = f"""<div class="kpi-card-enterprise" style="flex: 1;"><div class="kpi-card-title">MTTO PI (MT SEPARADO)</div><div class="kpi-card-value">{kpis.eventos_mt:,}</div></div>"""
     
-    # CSS para separar e independizar los botones de las pestañas
     st.markdown("""
         <style>
-        div[data-baseweb="tab-list"] {
-            gap: 16px !important;
-        }
-        button[data-baseweb="tab"] {
-            padding: 10px 24px !important;
-            white-space: nowrap !important;
-        }
+        div[data-baseweb="tab-list"] { gap: 16px !important; }
+        button[data-baseweb="tab"] { padding: 10px 24px !important; white-space: nowrap !important; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -1268,12 +1257,11 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
     ])
 
     with sub_tab1:
-        df_folios_grafico = df_folios[
-            df_folios[dimension_sel].notnull() & 
-            (~df_folios[dimension_sel].astype(str).str.lower().isin(["nan", "none", "null", ""]))
-        ]
+        mask_grafico = df_folios[dimension_sel].notnull() & (~df_folios[dimension_sel].astype(str).str.lower().isin(["nan", "none", "null", ""]))
+        df_folios_grafico = df_folios[mask_grafico]
+        
         fig_evolucion = generar_figura_evolucion_temporal(df_folios_grafico, dimension_sel)
-        st.plotly_chart(fig_evolucion, use_container_width=True, key="grafico_evolucion_temporal_polizas")
+        st.plotly_chart(fig_evolucion, use_container_width=True, key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
 
         nom_dim_label = {
             "FECHA_TRUNCADA": "Día",
@@ -1309,17 +1297,13 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             elif dimension_sel == "MES_DIM":
                 cols_ordenadas = [m for m in LISTA_ORDENADA_MESES if m in cols_raw]
             else:
-                import re
                 def extraer_numero(texto):
                     nums = re.findall(r'\d+', str(texto))
                     return int(nums[0]) if nums else 99999
-
                 cols_validas = [c for c in cols_raw if str(c).lower() not in ["nan", "none", "null", ""]]
                 cols_ordenadas = sorted(cols_validas, key=extraer_numero)
 
             df_matriz = df_matriz[cols_ordenadas]
-
-            # Limpieza de nombres de columna (Elimina el .0 de Semana 1.0 -> Semana 1)
             df_matriz.columns = [
                 f"Semana {int(float(str(c).replace('Semana','').strip()))}" 
                 if "Semana" in str(c) and ".0" in str(c) else str(c) 
@@ -1327,16 +1311,17 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             ]
             cols_ordenadas_limpias = list(df_matriz.columns)
 
-            df_matriz["TENDENCIA"] = df_matriz[cols_ordenadas_limpias].values.tolist()
-            df_matriz["PROMEDIO_PERIODO"] = df_matriz[cols_ordenadas_limpias].mean(axis=1).round(1)
+            # Optimización de arrays vectorizados
+            matriz_vals = df_matriz[cols_ordenadas_limpias].values
+            df_matriz["TENDENCIA"] = matriz_vals.tolist()
+            df_matriz["PROMEDIO_PERIODO"] = np.round(matriz_vals.mean(axis=1), 1)
 
             df_totales = df_folios.groupby(dimension_sel)["Usuario_Tecnico"].nunique()
             fila_total_serie = df_totales.reindex(cols_ordenadas).fillna(0).astype(int)
 
-            # Crear la fila de Total General explícitamente como DataFrame para evitar errores de tipo
             dict_total = {col_limpia: val for col_limpia, val in zip(cols_ordenadas_limpias, fila_total_serie.values)}
             dict_total["TENDENCIA"] = fila_total_serie.tolist()
-            dict_total["PROMEDIO_PERIODO"] = round(fila_total_serie.mean(), 1)
+            dict_total["PROMEDIO_PERIODO"] = round(float(fila_total_serie.mean()), 1)
             
             df_total = pd.DataFrame([dict_total], index=["TOTAL GENERAL"])
             df_matriz = pd.concat([df_matriz, df_total])
@@ -1357,7 +1342,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             st.markdown("---")
             col1, col2 = st.columns(2)
             with col1:
-                df_pol = df_folios.groupby(["Nombre_Poliza"]).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True)
+                df_pol = df_folios.groupby(["Nombre_Poliza"], observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True)
                 fig_pol = px.bar(
                     df_pol, x="Total_Eventos", y="Nombre_Poliza", orientation="h", text="Total_Eventos",
                     title="<b>VOLUMEN TOTAL POR TIPO DE PÓLIZA</b>",
@@ -1371,10 +1356,10 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     yaxis=dict(tickfont=dict(color="#000000", size=11, weight="bold"))
                 )
                 fig_pol.update_traces(textposition="outside", textfont=dict(color="#000000", size=11, weight="bold"))
-                st.plotly_chart(fig_pol, use_container_width=True)
+                st.plotly_chart(fig_pol, use_container_width=True, config={'displayModeBar': False})
 
             with col2:
-                df_eve = df_folios.groupby("Tipo_Orden").size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True).tail(10)
+                df_eve = df_folios.groupby("Tipo_Orden", observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True).tail(10)
                 fig_eve = px.bar(
                     df_eve, x="Total_Eventos", y="Tipo_Orden", orientation="h", text="Total_Eventos",
                     title="<b>TOP 10 TIPOS DE EVENTO / ORDEN</b>",
@@ -1388,35 +1373,37 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                     yaxis=dict(tickfont=dict(color="#000000", size=11, weight="bold"))
                 )
                 fig_eve.update_traces(textposition="outside", textfont=dict(color="#000000", size=11, weight="bold"))
-                st.plotly_chart(fig_eve, use_container_width=True)
+                st.plotly_chart(fig_eve, use_container_width=True, config={'displayModeBar': False})
 
     with sub_tab2:
         st.markdown("### 📂 Resumen Operativo por Tipo de Póliza Catalogada")
         if not df_folios.empty:
             df_res_pol = (
-                df_folios.groupby(["Codigo_Poliza", "Nombre_Poliza"])
+                df_folios.groupby(["Codigo_Poliza", "Nombre_Poliza"], observed=True)
                 .agg(
                     Total_Eventos=("FOLIO_KEY", "count"),
                     Tecnicos_Unicos=("Usuario_Tecnico", "nunique"),
                     Dias_Operativos=("FECHA_TRUNCADA", "nunique")
                 ).reset_index()
             )
-            df_res_pol["Productividad_Promedio"] = df_res_pol.apply(
-                lambda r: calcular_indice_productividad_diaria(r["Total_Eventos"], r["Tecnicos_Unicos"], r["Dias_Operativos"]), axis=1
-            )
+            df_res_pol["Productividad_Promedio"] = [
+                calcular_indice_productividad_diaria(ev, u, d)
+                for ev, u, d in zip(df_res_pol["Total_Eventos"], df_res_pol["Tecnicos_Unicos"], df_res_pol["Dias_Operativos"])
+            ]
             st.dataframe(df_res_pol, use_container_width=True, hide_index=True)
 
     with sub_tab3:
         st.markdown("### 🏆 Ranking de Productividad por Cuadrilla / Técnico")
         if not df_folios.empty:
             df_rank = (
-                df_folios.groupby(["Usuario_Tecnico", "Codigo_Poliza", "Nombre_Poliza", "Empresa"])
+                df_folios.groupby(["Usuario_Tecnico", "Codigo_Poliza", "Nombre_Poliza", "Empresa"], observed=True)
                 .agg(Eventos_Totales=("FOLIO_KEY", "count"), Dias_Activos=("FECHA_TRUNCADA", "nunique"))
                 .reset_index()
             )
-            df_rank["Productividad_Diaria"] = df_rank.apply(
-                lambda r: calcular_indice_productividad_diaria(r["Eventos_Totales"], 1, r["Dias_Activos"]), axis=1
-            )
+            df_rank["Productividad_Diaria"] = [
+                calcular_indice_productividad_diaria(ev, 1, d)
+                for ev, d in zip(df_rank["Eventos_Totales"], df_rank["Dias_Activos"])
+            ]
             df_rank = df_rank.sort_values(by="Productividad_Diaria", ascending=False)
             st.dataframe(df_rank, use_container_width=True, hide_index=True, height=400)
 
@@ -1426,23 +1413,18 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         st.download_button("📄 Descargar Dataset (CSV)", csv_bytes, f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv")
 
     with sub_tab5:
-        # ==============================================================================
-        # ESTILO PERSONALIZADO: GRIS TENUE Y ELEGANTE PARA LA CAJA DE TEXTO
-        # ==============================================================================
         st.markdown("""
             <style>
-            /* Caja de texto principal */
             div[data-testid="stTextArea"] textarea {
-                background-color: #1a1d24 !important; /* Gris oscuro tenue de fondo */
-                color: #e2e8f0 !important;            /* Texto gris claro muy legible */
-                border: 1px solid #374151 !important; /* Borde gris sutil */
-                border-radius: 8px !important;        /* Bordes suavemente redondeados */
-                font-family: monospace !important;     /* Fuente tipo código muy limpia */
+                background-color: #1a1d24 !important;
+                color: #e2e8f0 !important;
+                border: 1px solid #374151 !important;
+                border-radius: 8px !important;
+                font-family: monospace !important;
             }
-            /* Al hacer clic o seleccionarla */
             div[data-testid="stTextArea"] textarea:focus {
-                border-color: #6b7280 !important; /* Borde gris medio encendido */
-                box-shadow: 0 0 8px rgba(107, 114, 128, 0.3) !important; /* Resplandor tenue suave */
+                border-color: #6b7280 !important;
+                box-shadow: 0 0 8px rgba(107, 114, 128, 0.3) !important;
             }
             </style>
         """, unsafe_allow_html=True)
@@ -1461,66 +1443,48 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             height=250
         )
 
-        # Campo de Clave de Seguridad
         clave_ingresada = st.text_input(
             "🔒 Ingrese la clave de autorización para confirmar la subida:", 
             type="password"
         )
 
         if st.button("🚀 Guardar y Subir", type="primary", use_container_width=True):
-            # 1. Validación de campos vacíos
             if not nombre_archivo_input.strip() or not contenido_csv_input.strip():
                 st.warning("⚠️ Debe proporcionar tanto el nombre del archivo como el contenido CSV.")
-            
-            # 2. Validación de Clave de Seguridad
             elif clave_ingresada != CLAVE_ACCESO_CARGA:
                 st.error("❌ Clave de autorización incorrecta. No se realizaron cambios en Supabase.")
-                
             else:
                 try:
                     with st.spinner("Procesando y subiendo datos a Supabase Storage..."):
-                        # Formatear el nombre del archivo
                         nombre_f = nombre_archivo_input.strip()
                         if not nombre_f.lower().endswith(".csv"):
                             nombre_f += ".csv"
                         
-                        # Convertir contenido a bytes
                         bytes_data = contenido_csv_input.encode("utf-8")
-                        
-                        # Subir o sobrescribir en Supabase Storage
                         res = supabase.storage.from_("Totalplay_datos_semanales").upload(
                             path=nombre_f,
                             file=bytes_data,
                             file_options={"upsert": "true", "content-type": "text/csv"}
                         )
-                        
-                        # Clear cache automático
                         st.cache_data.clear()
-                        
-                        # Letrero Verde de Confirmación Exitosa
-                        st.success(f"✅ ¡Archivo '{nombre_f}' ✅ ¡Archivo guardado y subido con éxito ! El caché ha sido actualizado..")
+                        st.success(f"✅ ¡Archivo '{nombre_f}' guardado y subido con éxito! El caché ha sido actualizado.")
                         st.balloons()
-                    
                 except Exception as e:
                     st.error(f"❌ Error al intentar subir el archivo a Supabase: {e}")
 
-@st.dialog(" Detalle Ampliado de Reincidencia por Usuario", width="large")
+@st.dialog("Detalle Ampliado de Reincidencia por Usuario", width="large")
 def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
-    st.markdown(f"###  Historial de Reincidencias Provocadas por: **{usuario_nom}**")
+    st.markdown(f"### Historial de Reincidencias Provocadas por: **{usuario_nom}**")
     
     if df_usuario.empty:
         st.info("No se encontraron folios reincidentes para este usuario.")
         return
 
     df_modal = df_usuario.copy()
-    
     if "TIPO_2" not in df_modal.columns:
         df_modal["TIPO_2"] = df_modal.get("Causa_Origen", "N/A")
 
-    cols_popup = [
-        "FOLIO_KEY", "Cuenta_Cliente", "Num_Semana_Archivo", 
-        "TIPO_2", "Falla_Nueva", "Empresa_Origen_Reincidencia"
-    ]
+    cols_popup = ["FOLIO_KEY", "Cuenta_Cliente", "Num_Semana_Archivo", "TIPO_2", "Falla_Nueva", "Empresa_Origen_Reincidencia"]
     cols_presentes = [c for c in cols_popup if c in df_modal.columns]
     
     nombres_popup = {
@@ -1537,7 +1501,7 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
     
     csv_popup = df_mostrar_modal.to_csv(index=False).encode('utf-8')
     st.download_button(
-        label=f" Descargar Historial de {usuario_nom} (CSV)",
+        label=f"Descargar Historial de {usuario_nom} (CSV)",
         data=csv_popup,
         file_name=f"Reincidencias_{usuario_nom}.csv",
         mime="text/csv",
@@ -1545,21 +1509,19 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
     )
 
 def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_sel: str) -> None:
-    st.markdown("###  Módulo Avanzado de Reincidencias y Control de Efectividad")
+    st.markdown("### Módulo Avanzado de Reincidencias y Control de Efectividad")
     
     if df_folios.empty:
-        st.warning(" No se encontraron registros con los filtros seleccionados.")
+        st.warning("⚠️ No se encontraron registros con los filtros seleccionados.")
         return
 
-    # Asegurar columnas requeridas
     for col_req in ["Empresa_Origen_Reincidencia", "Usuario_Origen_Reincidencia", "Causa_Origen", "TIPO_2", "Falla_Nueva", "ES_CASO_ESPECIAL"]:
         if col_req not in df_folios.columns:
             df_folios[col_req] = df_folios["Causa_Origen"] if col_req == "TIPO_2" else "N/A"
 
-    df_rein_base = df_folios[df_folios["ES_REINCIDENCIA"] == "SI"].copy()
+    df_rein_base = df_folios[df_folios["ES_REINCIDENCIA"] == "SI"]
 
-    # --- FILTROS ESPECÍFICOS DE REINCIDENCIA CON TÍTULOS ---
-    st.markdown("####  Filtros Avanzados de Reincidencias")
+    st.markdown("#### Filtros Avanzados de Reincidencias")
     col_f0, col_f1, col_f2, col_f3, col_f4 = st.columns(5)
 
     with col_f0:
@@ -1587,8 +1549,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         fallas_nuevas = sorted([x for x in df_rein_base["Falla_Nueva"].unique() if str(x).upper() not in ["N/A", "NAN", "NONE", ""]])
         f_falla_nueva = st.multiselect("Filtrar Falla Nueva:", fallas_nuevas, key="fltr_falla_rein", label_visibility="collapsed")
 
-    # Aplicación de filtros
-    df_filtrado_rein = df_rein_base.copy()
+    df_filtrado_rein = df_rein_base
     if f_dist_rein:
         df_filtrado_rein = df_filtrado_rein[df_filtrado_rein["Distrito"].isin(f_dist_rein)]
     if f_emp_rein:
@@ -1600,7 +1561,6 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     if f_falla_nueva:
         df_filtrado_rein = df_filtrado_rein[df_filtrado_rein["Falla_Nueva"].isin(f_falla_nueva)]
 
-    # --- CÁLCULO GENERAL DE EFECTIVIDAD EN KPIS ---
     patron_efectividad = r"INSTALA|SOPORTE|CAMBIO.*DOMICILIO|CAMBIO.*EQUIPO"
     col_tipo_base = "Tipo_Orden" if "Tipo_Orden" in df_folios.columns else "TIPO"
     mask_base_efectividad = df_folios[col_tipo_base].astype(str).str.upper().str.contains(patron_efectividad, regex=True, na=False)
@@ -1629,13 +1589,12 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             </div>
             <div class="kpi-card-enterprise">
                 <div class="kpi-card-title">CASOS ESPECIALES DETECTADOS</div>
-                <div class="kpi-card-value">{len(df_folios[df_folios["ES_CASO_ESPECIAL"] == "SI"]):,}</div>
+                <div class="kpi-card-value">{(df_folios["ES_CASO_ESPECIAL"] == "SI").sum():,}</div>
                 <div class="kpi-card-subtitle">Secuencias Especiales</div>
             </div>
         </div>
     """, unsafe_allow_html=True)
 
-    # --- TABLA 1: CONSOLIDADO POR TÉCNICO Y EFECTIVIDAD ---
     st.markdown("""
         <div class="matrix-title-card">
             <b style="color:#000000; font-size:15px;"> EVALUACIÓN DE EFECTIVIDAD Y REINCIDENCIA POR TÉCNICO ORIGEN</b>
@@ -1645,25 +1604,23 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
 
     if not df_filtrado_rein.empty:
         col_tech_base = detectar_columna_por_patrones(list(df_folios.columns), ["usuario_tecnico", "tecnico", "tech", "usuario", "atendio"]) or "Usuario_Tecnico"
+        eventos_por_tech = df_base_efectividad.groupby(col_tech_base, observed=True).size().to_dict()
 
-        eventos_por_tech = df_base_efectividad.groupby(col_tech_base).size().to_dict()
-
+        # Concatenación rápida de strings vectorizada
         df_agrupado_tech = df_filtrado_rein.groupby(
-            ["Usuario_Origen_Reincidencia", "Empresa_Origen_Reincidencia"]
+            ["Usuario_Origen_Reincidencia", "Empresa_Origen_Reincidencia"], observed=True
         ).agg(
             Total_Reincidencias=("FOLIO_KEY", "count"),
-            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(set(str(v) for v in x if pd.notna(v)))),
-            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(set(str(v) for v in x if pd.notna(v))))
+            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(pd.Series(x).dropna().unique())),
+            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(pd.Series(x).dropna().unique()))
         ).reset_index()
 
-        df_agrupado_tech["Eventos_Atendidos"] = df_agrupado_tech["Usuario_Origen_Reincidencia"].map(
-            lambda t: eventos_por_tech.get(t, df_agrupado_tech.loc[df_agrupado_tech["Usuario_Origen_Reincidencia"]==t, "Total_Reincidencias"].values[0])
-        )
-        df_agrupado_tech["Eventos_Atendidos"] = df_agrupado_tech.apply(lambda r: max(r["Eventos_Atendidos"], r["Total_Reincidencias"]), axis=1)
+        df_agrupado_tech["Eventos_Atendidos"] = df_agrupado_tech["Usuario_Origen_Reincidencia"].map(eventos_por_tech).fillna(df_agrupado_tech["Total_Reincidencias"])
+        df_agrupado_tech["Eventos_Atendidos"] = np.maximum(df_agrupado_tech["Eventos_Atendidos"], df_agrupado_tech["Total_Reincidencias"])
 
-        df_agrupado_tech["Efectividad_%"] = df_agrupado_tech.apply(
-            lambda r: round(((r["Eventos_Atendidos"] - r["Total_Reincidencias"]) / r["Eventos_Atendidos"] * 100), 2) if r["Eventos_Atendidos"] > 0 else 0.0, axis=1
-        )
+        atendidos = df_agrupado_tech["Eventos_Atendidos"].values
+        reincidencias = df_agrupado_tech["Total_Reincidencias"].values
+        df_agrupado_tech["Efectividad_%"] = np.where(atendidos > 0, np.round(((atendidos - reincidencias) / atendidos) * 100, 2), 0.0)
 
         df_agrupado_tech = df_agrupado_tech.rename(columns={
             "Usuario_Origen_Reincidencia": "Técnico Reincidente (Origen)",
@@ -1686,9 +1643,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
                 use_container_width=True, 
                 hide_index=True, 
                 height=380,
-                column_config={
-                    "% Efectividad Operativa": st.column_config.NumberColumn(format="%.2f %%")
-                }
+                column_config={"% Efectividad Operativa": st.column_config.NumberColumn(format="%.2f %%")}
             )
 
         with col_t2:
@@ -1696,7 +1651,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             tech_lista = sorted(df_agrupado_tech["Técnico Reincidente (Origen)"].unique())
             tech_seleccionado = st.selectbox("Seleccionar Técnico:", tech_lista, key="sb_pop_tech")
             
-            if st.button(" Abrir Detalle Pop-Up", use_container_width=True, key="btn_pop_tech"):
+            if st.button("Abrir Detalle Pop-Up", use_container_width=True, key="btn_pop_tech"):
                 sub_df = df_filtrado_rein[df_filtrado_rein["Usuario_Origen_Reincidencia"] == tech_seleccionado]
                 mostrar_modal_detalle_usuario(sub_df, tech_seleccionado)
     else:
@@ -1704,7 +1659,6 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
 
     st.markdown("---")
 
-    # --- TABLA 2: HISTORIAL POR CUENTA CLIENTE ---
     st.markdown("""
         <div class="matrix-title-card">
             <b style="color:#000000; font-size:15px;"> HISTORIAL OPERATIVO POR CUENTA DE CLIENTE</b>
@@ -1713,12 +1667,12 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     """, unsafe_allow_html=True)
 
     if not df_filtrado_rein.empty:
-        df_agrupado_cuenta = df_filtrado_rein.groupby("Cuenta_Cliente").agg(
+        df_agrupado_cuenta = df_filtrado_rein.groupby("Cuenta_Cliente", observed=True).agg(
             Visitas_Totales=("FOLIO_KEY", "count"),
             Semanas_Con_Incidencia=("Num_Semana_Archivo", lambda x: ", ".join(map(str, sorted(set(x))))),
-            Causas_Historicas=("TIPO_2", lambda x: " | ".join(set(str(v) for v in x if pd.notna(v)))),
-            Fallas_Reportadas=("Falla_Nueva", lambda x: " | ".join(set(str(v) for v in x if pd.notna(v)))),
-            Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(set(str(v) for v in x if pd.notna(v))))
+            Causas_Historicas=("TIPO_2", lambda x: " | ".join(pd.Series(x).dropna().unique())),
+            Fallas_Reportadas=("Falla_Nueva", lambda x: " | ".join(pd.Series(x).dropna().unique())),
+            Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(pd.Series(x).dropna().unique()))
         ).reset_index().sort_values(by="Visitas_Totales", ascending=False)
 
         st.dataframe(df_agrupado_cuenta, use_container_width=True, hide_index=True, height=350)
@@ -1726,17 +1680,12 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         st.info("No hay historial de cuentas con reincidencia para mostrar.")
 
 def guardar_y_reemplazar_semana_texto(nombre_semana: str, texto_datos: str) -> bool:
-    """
-    Procesa texto plano copiado desde Excel, limpia nombres de columnas
-    y sube/reemplaza el archivo CSV en el bucket de Supabase.
-    """
     try:
         texto_limpio = texto_datos.strip()
         if not texto_limpio:
             st.error("El cuadro de texto está vacío.")
             return False
 
-        # Detección automática de separador (Tabulación de Excel o Coma)
         try:
             df_nuevo = pd.read_csv(io.StringIO(texto_limpio), sep="\t", dtype=str)
             if len(df_nuevo.columns) <= 1:
@@ -1745,21 +1694,17 @@ def guardar_y_reemplazar_semana_texto(nombre_semana: str, texto_datos: str) -> b
             st.error(f"Error al interpretar la estructura de la tabla: {e_parse}")
             return False
 
-        # Limpieza de encabezados de columnas
         df_nuevo.columns = df_nuevo.columns.astype(str).str.strip()
 
-        # Estandarización de nombre de Semana
         nombre_semana_clean = nombre_semana.strip().upper()
         df_nuevo["Num_Semana_Archivo"] = nombre_semana_clean
         if "SEMANA" not in df_nuevo.columns:
             df_nuevo["SEMANA"] = nombre_semana_clean
 
-        # Crear CSV en formato binario compatible con UTF-8 (BOM)
         csv_buffer = io.StringIO()
         df_nuevo.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
         bytes_datos = csv_buffer.getvalue().encode("utf-8-sig")
 
-        # Nombre y carga a Supabase Storage
         nombre_archivo = f"{nombre_semana_clean}.csv"
         
         if supabase:
@@ -1920,7 +1865,7 @@ def main() -> None:
     df_raw = ejecutar_pipeline_ingestion_datos(hash_actual)
 
     if df_raw.empty:
-        st.error("⚠️ No hay datos disponibles para procesar en la carpeta 'datos_semanales'. Verifique que los CSV/Excel estén presentes.")
+        st.error("⚠️ No hay datos disponibles para procesar en Supabase o en la carpeta 'datos_semanales'. Verifique las conexiones y archivos.")
         return
 
     # --------------------------------------------------------------------------
