@@ -1354,13 +1354,13 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         col_tech_base = detectar_columna_por_patrones(list(df_folios.columns), ["usuario_tecnico", "tecnico", "tech", "usuario", "atendio"]) or "Usuario_Tecnico"
         eventos_por_tech = df_base_efectividad.groupby(col_tech_base, observed=True).size().to_dict()
 
-        # Concatenación vectorizada optimizada usando sets para deduplicar cadenas
+        # Concatenación blindada contra tipos de datos mixtos o nulos en agregaciones
         df_agrupado_tech = df_filtrado_rein.groupby(
             ["Usuario_Origen_Reincidencia", "Empresa_Origen_Reincidencia"], observed=True
         ).agg(
             Total_Reincidencias=("FOLIO_KEY", "count"),
-            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(set(filter(None, x)))),
-            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(set(filter(None, x))))
+            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() != "")))),
+            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() != ""))))
         ).reset_index()
 
         df_agrupado_tech["Eventos_Atendidos"] = df_agrupado_tech["Usuario_Origen_Reincidencia"].map(eventos_por_tech).fillna(df_agrupado_tech["Total_Reincidencias"])
@@ -1423,9 +1423,9 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         df_agrupado_cuenta = df_filtrado_rein.groupby("Cuenta_Cliente", observed=True).agg(
             Visitas_Totales=("FOLIO_KEY", "count"),
             Semanas_Con_Incidencia=("Num_Semana_Archivo", lambda x: ", ".join(map(str, sorted(set(x))))),
-            Causas_Historicas=("TIPO_2", lambda x: " | ".join(set(filter(None, x)))),
-            Fallas_Reportadas=("Falla_Nueva", lambda x: " | ".join(set(filter(None, x)))),
-            Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(set(filter(None, x))))
+            Causas_Historicas=("TIPO_2", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() != "")))),
+            Fallas_Reportadas=("Falla_Nueva", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() != "")))),
+            Tecnicos_Involucrados=("Usuario_Origen_Reincidencia", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() != ""))))
         ).reset_index().sort_values(by="Visitas_Totales", ascending=False)
 
         st.dataframe(df_agrupado_cuenta, width="stretch", hide_index=True, height=350)
