@@ -5,25 +5,35 @@ import io
 import re
 import os
 import glob
+import logging
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+
 import plotly.express as px
-import concurrent.futures
+import plotly.graph_objects as go
+from supabase import create_client, Client
 
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
 # Archivo: app.py
-# Versión: 13.4.0-FORCE-REFRESH Totalplay Región Norte La Baja Edition
+# Versión: 14.0.0-PARQUET-ENGINE Totalplay Región Norte La Baja Edition
 # ==============================================================================
 
-import os
-import glob
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
+st.set_page_config(layout="wide")
 
-import plotly.graph_objects as go
-from supabase import create_client, Client
+# Configuración de Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("ControlCuadrillas.Monolith")
 
+# -----------------------------------------------------------------------------
+# 0.1. CLIENTE SUPABASE
+# -----------------------------------------------------------------------------
 @st.cache_resource
 def get_supabase_client() -> Optional[Client]:
     try:
@@ -35,14 +45,73 @@ def get_supabase_client() -> Optional[Client]:
         return None
 
 supabase = get_supabase_client()
-st.set_page_config(layout="wide")
 
-# Configuración de Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("ControlCuadrillas.Monolith")
+# -----------------------------------------------------------------------------
+# 0.2. MOTOR DE PERSISTENCIA PARQUET + CACHÉ DINÁMICO (OPTIMIZADO CPU)
+# -----------------------------------------------------------------------------
+CACHE_DIR = Path("/tmp/supabase_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _procesar_y_guardar_local(nombre_archivo, _supabase_client):
+    """Descarga el CSV solo si no existe la versión .parquet localmente"""
+    archivo_parquet = CACHE_DIR / f"{Path(nombre_archivo).stem}.parquet"
+    
+    # Si ya se convirtió a Parquet previamente en disco local, se omite descarga/parseo CSV
+    if archivo_parquet.exists():
+        return archivo_parquet
+
+    try:
+        data_bytes = _supabase_client.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
+        df_temp = pd.read_csv(io.BytesIO(data_bytes), low_memory=False)
+        df_temp.to_parquet(archivo_parquet, compression="snappy")
+        return archivo_parquet
+    except Exception as e:
+        logger.error(f"Error procesando {nombre_archivo}: {e}")
+        return None
+
+@st.cache_data(ttl=3600, show_spinner="Cargando motor de datos dinámico La Baja...")
+def cargar_dataset_dinamico(_supabase_client):
+    """
+    1. Lista dinámicamente TODOS los CSVs del bucket (sean 3 o 300).
+    2. Procesa los archivos faltantes en paralelo.
+    3. Consolida y retorna el DataFrame general sin sobrecargar CPU.
+    """
+    if not _supabase_client:
+        return pd.DataFrame()
+
+    # Obtener lista completa de archivos en tiempo real desde Supabase Storage
+    archivos_bucket = _supabase_client.storage.from_("Totalplay_datos_semanales").list()
+    archivos_csv = [item['name'] for item in archivos_bucket if item['name'].endswith('.csv')]
+
+    if not archivos_csv:
+        logger.warning("No se encontraron archivos .csv en el bucket de Supabase.")
+        return pd.DataFrame()
+
+    # Carga paralela por hilos
+    archivos_parquet = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(_procesar_y_guardar_local, archivo, _supabase_client)
+            for archivo in archivos_csv
+        ]
+        for future in futures:
+            res = future.result()
+            if res is not None:
+                archivos_parquet.append(res)
+
+    if not archivos_parquet:
+        return pd.DataFrame()
+
+    # Lectura ultrarrápida de binarios Parquet a memoria RAM
+    dfs = [pd.read_parquet(p) for p in archivos_parquet]
+    df_consolidado = pd.concat(dfs, ignore_index=True)
+    return df_consolidado
+
+# -----------------------------------------------------------------------------
+# 0.3. EJECUCIÓN CONTINUA DEL DASHBOARD
+# -----------------------------------------------------------------------------
+# Sustituye la llamada a la antigua función por esta variable general:
+df = cargar_dataset_dinamico(supabase)
 
 # ==============================================================================
 # 1. CONSTANTES GLOBALES Y DICCIONARIOS DE NEGOCIO
