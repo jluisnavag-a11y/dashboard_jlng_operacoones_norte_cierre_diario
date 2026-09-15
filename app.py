@@ -751,13 +751,8 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
             pass
     return "|".join(info)
 
-import concurrent.futures
-import io
-import pandas as pd
-import streamlit as st
-
-@st.cache_data(ttl=86400, show_spinner="Descargando datos de la nube...")
-def obtener_archivos_supabase():
+@st.cache_data(ttl=3600, show_spinner="Descargando datos de la nube...")
+def obtener_archivos_supabase(hash_archivos: str = ""):
     try:
         # 1. Obtener la lista de archivos en el bucket
         archivos = supabase.storage.from_("Totalplay_datos_semanales").list()
@@ -775,7 +770,7 @@ def obtener_archivos_supabase():
                 if not df_temp.empty:
                     df_temp["Archivo_Origen"] = nombre_archivo
                     return df_temp, nombre_archivo.upper()
-            except Exception as e:
+            except Exception:
                 pass
             return None, None
 
@@ -802,8 +797,8 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     coleccion_dfs = []
     archivos_procesados = set()
 
-    # 1. Descargar archivos de Supabase
-    dfs_nube, archivos_procesados_nube = obtener_archivos_supabase()
+    # 1. Descargar archivos de Supabase usando el hash dinámico
+    dfs_nube, archivos_procesados_nube = obtener_archivos_supabase(hash_archivos)
     coleccion_dfs.extend(dfs_nube)
     archivos_procesados.update(archivos_procesados_nube)
 
@@ -826,7 +821,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
-    # Normalización de Fecha compatible con Supabase / GitHub / Excel
+    # Normalización de Fecha compatible con Números Serie de Excel (ej: 46203.45024)
     col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
     if col_fecha and col_fecha in df.columns:
         es_num = pd.to_numeric(df[col_fecha], errors='coerce')
@@ -880,10 +875,16 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         df["Codigo_Poliza"] = ""
         df["Nombre_Poliza"] = "NO VALIDO"
 
-    # Extracción y Dimensiones Temporales
+    # Extracción y Dimensiones Temporales Robusta (Prioridad: Nombre del archivo)
+    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(0, index=df.index)
     semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
-    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else 0
-    df["Num_Semana_Archivo"] = pd.to_numeric(semanas_iso.fillna(semanas_archivo), errors="coerce").fillna(0).astype(int)
+
+    # Si la extracción del nombre da >0 la toma, si no, usa el respaldo ISO de la fecha
+    df["Num_Semana_Archivo"] = np.where(
+        semanas_archivo > 0, 
+        semanas_archivo, 
+        pd.to_numeric(semanas_iso, errors="coerce").fillna(0).astype(int)
+    )
 
     df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
     df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
