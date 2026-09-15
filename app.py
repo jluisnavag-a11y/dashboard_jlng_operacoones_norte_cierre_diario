@@ -752,22 +752,22 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
             pass
     return "|".join(info)
 
+# ------------------------------------------------------------------------------
+# NUEVO (Descarga multihilo con motor C de alta velocidad):
+# ------------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="Descargando datos de la nube...")
 def obtener_archivos_supabase(hash_archivos: str = ""):
     try:
-        # 1. Obtener la lista de archivos en el bucket
         archivos = supabase.storage.from_("Totalplay_datos_semanales").list()
         csv_files = [f['name'] for f in archivos if f['name'].endswith('.csv')]
         
         if not csv_files:
             return [], set()
 
-        # Función interna para descargar un solo archivo en su propio hilo
         def descargar_individual(nombre_archivo):
             try:
                 res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
-                # Engine C de Pandas para lectura ultrarrápida
-                df_temp = pd.read_csv(io.BytesIO(res), engine='c', low_memory=False)
+                df_temp = pd.read_csv(io.BytesIO(res), engine='c', low_memory=False, dtype=str)
                 if not df_temp.empty:
                     df_temp["Archivo_Origen"] = nombre_archivo
                     return df_temp, nombre_archivo.upper()
@@ -775,11 +775,10 @@ def obtener_archivos_supabase(hash_archivos: str = ""):
                 pass
             return None, None
 
-        # 2. Descargar todos los CSV simultáneamente (Multithreading)
         coleccion_dfs = []
         archivos_procesados = set()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             resultados = list(executor.map(descargar_individual, csv_files))
 
         for df_res, nom_res in resultados:
@@ -1361,8 +1360,8 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             ["Usuario_Origen_Reincidencia", "Empresa_Origen_Reincidencia"], observed=True
         ).agg(
             Total_Reincidencias=("FOLIO_KEY", "count"),
-            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() != "")))),
-            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() != ""))))
+            Causas_TIPO_2=("TIPO_2", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() not in ["", "nan", "None"])))),
+            Fallas_Nuevas=("Falla_Nueva", lambda x: " | ".join(sorted(set(str(v).strip() for v in x if pd.notna(v) and str(v).strip() not in ["", "nan", "None"]))))
         ).reset_index()
 
         df_agrupado_tech["Eventos_Atendidos"] = df_agrupado_tech["Usuario_Origen_Reincidencia"].map(eventos_por_tech).fillna(df_agrupado_tech["Total_Reincidencias"])
