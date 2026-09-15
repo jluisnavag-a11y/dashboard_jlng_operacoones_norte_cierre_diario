@@ -11,9 +11,11 @@ import concurrent.futures
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
 # Archivo: app.py
-# Versión: 13.5.0-ENTERPRISE Totalplay Región Norte La Baja Edition
+# Versión: 13.4.0-FORCE-REFRESH Totalplay Región Norte La Baja Edition
 # ==============================================================================
 
+import os
+import glob
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Any
@@ -49,7 +51,7 @@ logger = logging.getLogger("ControlCuadrillas.Monolith")
 ANIO_BASE_ESTRICTO: int = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str = "TOTALPLAY / OPERACIONES - REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str = "13.5.0-ENTERPRISE"
+VERSION_SISTEMA: str = "13.4.0-FORCE-REFRESH"
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -139,7 +141,6 @@ MAPEO_BASE_CLUSTERS: Dict[str, str] = {
 }
 
 RE_SEMANA = re.compile(r"(?:SEM|SEMANA|S)[\s_\-]*(\d{1,2})", re.IGNORECASE)
-
 # ==============================================================================
 # 2. DATACLASSES
 # ==============================================================================
@@ -297,50 +298,10 @@ def inyectar_estilos_css_enterprise() -> None:
         border-radius: 6px;
         margin-top: 15px;
         margin-bottom: 12px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.03);
+       box-shadow: 0 2px 5px rgba(0,0,0,0.03);
     }}
 
-    /* TARJETA DE AVISO PROXIMAMENTE CON ESTILO ENTERPRISE */
-    .proximamente-card {{
-        background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
-        border: 2px solid {PALETA_COLOR["turquesa_cyan"]};
-        border-radius: 16px;
-        padding: 40px;
-        text-align: center;
-        color: #FFFFFF !important;
-        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
-        margin: 20px 0;
-    }}
-
-    .proximamente-badge {{
-        background-color: {PALETA_COLOR["turquesa_cyan"]};
-        color: {PALETA_COLOR["azul_noche"]};
-        font-weight: 800;
-        font-size: 12px;
-        text-transform: uppercase;
-        padding: 6px 16px;
-        border-radius: 20px;
-        display: inline-block;
-        margin-bottom: 15px;
-        letter-spacing: 1px;
-    }}
-
-    .proximamente-title {{
-        font-size: 26px;
-        font-weight: 800;
-        margin-bottom: 10px;
-        color: #FFFFFF !important;
-    }}
-
-    .proximamente-desc {{
-        font-size: 14px;
-        color: #94A3B8 !important;
-        max-width: 600px;
-        margin: 0 auto;
-        line-height: 1.6;
-    }}
-
-    /* Botones secundarios homologados */
+    /* Botones secundarios homologados (Limpiar Caché y CSV) */
     div.stButton > button[kind="secondary"], 
     div.stButton > button:not([kind="primary"]),
     div.stDownloadButton > button {{
@@ -359,23 +320,23 @@ def inyectar_estilos_css_enterprise() -> None:
         border-color: #94A3B8 !important;
         color: #0F172A !important;
     }}
+    /* Botón de Cargar Archivo (st.file_uploader) */
+        [data-testid="stFileUploader"] section button,
+        [data-testid="stFileUploader"] label button {{
+            background-color: #FFFFFF !important;
+            color: #1E293B !important;
+            border: 1px solid #CBD5E1 !important;
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+            box-shadow: 0px 2px 4px rgba(0,0,0,0.05) !important;
+        }}
 
-    [data-testid="stFileUploader"] section button,
-    [data-testid="stFileUploader"] label button {{
-        background-color: #FFFFFF !important;
-        color: #1E293B !important;
-        border: 1px solid #CBD5E1 !important;
-        border-radius: 8px !important;
-        font-weight: 600 !important;
-        box-shadow: 0px 2px 4px rgba(0,0,0,0.05) !important;
-    }}
-
-    [data-testid="stFileUploader"] section button:hover,
-    [data-testid="stFileUploader"] label button:hover {{
-        background-color: #F8FAFC !important;
-        border-color: #94A3B8 !important;
-        color: #0F172A !important;
-    }}
+        [data-testid="stFileUploader"] section button:hover,
+        [data-testid="stFileUploader"] label button:hover {{
+            background-color: #F8FAFC !important;
+            border-color: #94A3B8 !important;
+            color: #0F172A !important;
+        }}
     </style>
     """
     st.markdown(css_custom, unsafe_allow_html=True)
@@ -408,6 +369,7 @@ def extraer_numero_semana_archivo(nombre_archivo):
             return int(match.group(1))
         except (ValueError, TypeError):
             pass
+    # Si la cadena ya era un número puro (ej: "24")
     if str(nombre_archivo).strip().isdigit():
         return int(nombre_archivo)
     return None
@@ -510,6 +472,7 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
         fig_empty.update_layout(title="Sin datos para la selección actual")
         return fig_empty
 
+    # 1. Copia temporal y conversión limpia de semanas
     df_temp = df_folios.copy()
     def _num_sem(val):
         try:
@@ -517,6 +480,7 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
         except (ValueError, TypeError):
             return 999
 
+    # 2. Normalizar la columna SEMANA_DIM en la copia antes de agrupar
     if dimension_temporal == "SEMANA_DIM":
         df_temp["SEMANA_DIM"] = df_temp["SEMANA_DIM"].apply(
             lambda s: f"Semana {_num_sem(s)}" if _num_sem(s) != 999 else str(s)
@@ -530,6 +494,7 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
     else:
         eje_x_base = [str(ANIO_BASE_ESTRICTO)]
 
+    # 3. Agrupaciones sobre la copia homogeneizada (¡Aquí se resuelve la coincidencia de llaves!)
     mapa_eventos = df_temp.groupby(dimension_temporal).size().to_dict()
     mapa_usuarios = df_temp.groupby(dimension_temporal)["Usuario_Tecnico"].nunique().to_dict()
     mapa_dias = df_temp.groupby(dimension_temporal)["FECHA_TRUNCADA"].nunique().to_dict()
@@ -621,6 +586,7 @@ def es_evento_soporte(tipo_str: str) -> bool:
     return "SOPORTE" in txt or "SOP" in txt
 
 def obtener_valor_tipo2(valor_causa, valor_tipo_orden) -> str:
+    """Si la causa es None, N/A, nula o vacía, la reemplaza por el valor de TIPO / Tipo_Orden."""
     val_tipo = str(valor_tipo_orden).strip() if pd.notna(valor_tipo_orden) else "SIN TIPO"
     if val_tipo.upper() in ["NONE", "NULL", "NA", "N/A", "NAN", ""]:
         val_tipo = "SIN TIPO"
@@ -635,6 +601,7 @@ def obtener_valor_tipo2(valor_causa, valor_tipo_orden) -> str:
     return val_causa_str
 
 def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
+    # Inicialización de columnas por defecto
     df["ES_REINCIDENCIA"] = "NO"
     df["CONTEO_PREVIO_8_SEM"] = 0
     df["Usuario_Origen_Reincidencia"] = "N/A"
@@ -650,6 +617,7 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
 
     cols = list(df.columns)
 
+    # Detectar dinámicamente las columnas necesarias
     col_tech = detectar_columna_por_patrones(cols, ["usuario_tecnico", "tecnico", "tech", "usuario", "atendio", "nombre_tecnico"]) or "Usuario_Tecnico"
     col_semana = detectar_columna_por_patrones(cols, ["num_semana_archivo", "semana", "sem"]) or "Num_Semana_Archivo"
     col_causa = detectar_columna_por_patrones(cols, ["causa", "motivo", "subtipo", "diagnostico"]) or "Tipo_Orden"
@@ -657,15 +625,19 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
     col_empresa = detectar_columna_por_patrones(cols, ["empresa", "proveedor", "vendor"]) or "Empresa"
     col_tipo = "Tipo_Orden" if "Tipo_Orden" in cols else ("TIPO" if "TIPO" in cols else col_causa)
 
+    # Preservar el orden original
     df["_INDEX_ORIGINAL"] = range(len(df))
     df["_SEM_TEMP"] = pd.to_numeric(df[col_semana], errors="coerce").fillna(0).astype(int)
 
+    # Filtrar cuentas válidas
     mask_cta_valida = df["Cuenta_Cliente"].notna() & (~df["Cuenta_Cliente"].astype(str).str.upper().isin(["SIN_CTA", "SIN_FOLIO", "NAN", "NONE", ""]))
     
+    # Ordenar por Cuenta y Cronología
     df_valid = df[mask_cta_valida].sort_values(by=["Cuenta_Cliente", "_SEM_TEMP", "_INDEX_ORIGINAL"]).copy()
 
     dict_reincidencias = {}
 
+    # Lógica de reincidencia (Evento N-1)
     for cuenta, g in df_valid.groupby("Cuenta_Cliente"):
         registros = g.to_dict("records")
         n = len(registros)
@@ -676,8 +648,9 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
             reg_actual = registros[i]
             tipo_actual = reg_actual.get("Tipo_Orden", reg_actual.get("TIPO", ""))
 
+            # Si la visita actual es un SOPORTE -> Reincidencia
             if es_evento_soporte(tipo_actual):
-                reg_prev = registros[i - 1]
+                reg_prev = registros[i - 1]  # Evento inmediatamente anterior (visita n-1)
                 
                 tech_prev = str(reg_prev.get(col_tech, "SIN ESPECIFICAR"))
                 if tech_prev.upper() in ["NAN", "NONE", "", "N/A", "NULL"]:
@@ -687,6 +660,7 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
                 if emp_prev.upper() in ["NAN", "NONE", "", "N/A", "NULL"]:
                     emp_prev = "SIN EMPRESA"
 
+                # Generar TIPO_2 resolviendo el fallback si la causa es NA/None
                 causa_raw = reg_prev.get(col_causa)
                 tipo_raw = reg_prev.get(col_tipo)
                 tipo_2_val = obtener_valor_tipo2(causa_raw, tipo_raw)
@@ -702,6 +676,7 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
                     "Falla_Nueva": falla_val
                 }
 
+    # Asignar resultados al DataFrame principal
     if dict_reincidencias:
         keys_rein = set(dict_reincidencias.keys())
         mask_rein = df["FOLIO_KEY"].isin(keys_rein)
@@ -728,6 +703,7 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
             lambda k: dict_reincidencias[k]["Falla_Nueva"] if k in dict_reincidencias else "N/A"
         )
 
+    # Limpiar auxiliares
     df.drop(columns=["_INDEX_ORIGINAL", "_SEM_TEMP"], errors="ignore", inplace=True)
 
     return df
@@ -763,6 +739,7 @@ def _cargar_archivo_robusto(ruta: str) -> Optional[pd.DataFrame]:
     return None
 
 def obtener_hash_archivos_carpeta(carpeta: str) -> str:
+    """Genera una firma única en tiempo real basada en archivos y sus fechas de modificación."""
     if not os.path.exists(carpeta):
         return "sin_carpeta"
     archivos = sorted(glob.glob(os.path.join(carpeta, "*.csv")) + glob.glob(os.path.join(carpeta, "*.xlsx")))
@@ -775,6 +752,9 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
             pass
     return "|".join(info)
 
+# ------------------------------------------------------------------------------
+# NUEVO (Descarga multihilo con motor C de alta velocidad):
+# ------------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="Descargando datos de la nube...")
 def obtener_archivos_supabase(hash_archivos: str = ""):
     try:
@@ -817,10 +797,12 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     coleccion_dfs = []
     archivos_procesados = set()
 
+    # 1. Descargar archivos de Supabase usando el hash dinámico
     dfs_nube, archivos_procesados_nube = obtener_archivos_supabase(hash_archivos)
     coleccion_dfs.extend(dfs_nube)
     archivos_procesados.update(archivos_procesados_nube)
 
+    # 2. Cargar de la carpeta local (solo los que aún no estén en Supabase)
     carpeta_origen = "datos_semanales"
     if os.path.exists(carpeta_origen):
         archivos_locales = sorted(glob.glob(os.path.join(carpeta_origen, "*.csv")))
@@ -839,6 +821,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
+    # Normalización de Fecha compatible con Números Serie de Excel (ej: 46203.45024)
     col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
     if col_fecha and col_fecha in df.columns:
         es_num = pd.to_numeric(df[col_fecha], errors='coerce')
@@ -848,6 +831,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     else:
         df["_datetime_parsed"] = pd.NaT
 
+    # Detección y normalización de columnas principales
     col_os = detectar_columna_por_patrones(cols, LISTA_ALIAS_ORDEN)
     col_cta = detectar_columna_por_patrones(cols, LISTA_ALIAS_CUENTA)
     col_ot = detectar_columna_por_patrones(cols, LISTA_ALIAS_OT)
@@ -891,9 +875,11 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         df["Codigo_Poliza"] = ""
         df["Nombre_Poliza"] = "NO VALIDO"
 
+    # Extracción y Dimensiones Temporales Robusta (Prioridad: Nombre del archivo)
     semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(0, index=df.index)
     semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
 
+    # Si la extracción del nombre da >0 la toma, si no, usa el respaldo ISO de la fecha
     df["Num_Semana_Archivo"] = np.where(
         semanas_archivo > 0, 
         semanas_archivo, 
@@ -918,8 +904,12 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
 # ==============================================================================
 
 def inyectar_estilos_base_ui():
+    """Inyecta CSS global forzado usando selectores nativos de Streamlit (.stTabs)
+    para evitar bloqueos por Shadow DOM o librerías dinámicas de React/BaseWeb.
+    """
     st.markdown("""
         <style>
+        /* 1. CONTENEDOR PRINCIPAL DE LAS PESTAÑAS (TABS) */
         div[data-testid="stTabs"] {
             background-color: #0f172a !important;
             padding: 8px !important;
@@ -927,12 +917,14 @@ def inyectar_estilos_base_ui():
             border: 1px solid #1e293b !important;
         }
 
+        /* BARRA DE LISTA DE TABS */
         div[data-testid="stTabs"] > div[role="tablist"] {
             gap: 8px !important;
             background-color: transparent !important;
             border-bottom: none !important;
         }
 
+        /* 2. ESTILO BASE DE CADA BOTÓN/TAB */
         div[data-testid="stTabs"] button[role="tab"] {
             background-color: #1e293b !important;
             border: 1px solid #334155 !important;
@@ -941,6 +933,7 @@ def inyectar_estilos_base_ui():
             transition: all 0.25s ease-in-out !important;
         }
 
+        /* TEXTO DENTRO DE LA PESTAÑA */
         div[data-testid="stTabs"] button[role="tab"] p,
         div[data-testid="stTabs"] button[role="tab"] span {
             color: #94a3b8 !important;
@@ -948,6 +941,7 @@ def inyectar_estilos_base_ui():
             font-weight: 600 !important;
         }
 
+        /* 3. HOVER (CUANDO EL MOUSE PASA POR ENCIMA) */
         div[data-testid="stTabs"] button[role="tab"]:hover {
             background-color: #334155 !important;
             border-color: #475569 !important;
@@ -956,6 +950,7 @@ def inyectar_estilos_base_ui():
             color: #f8fafc !important;
         }
 
+        /* 4. PESTAÑA ACTIVA (SELECCIONADA) */
         div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
             background-color: #0284c7 !important;
             border-color: #38bdf8 !important;
@@ -967,10 +962,12 @@ def inyectar_estilos_base_ui():
             font-weight: 700 !important;
         }
 
+        /* ELIMINAR LÍNEA INFERIOR ROJA/AZUL NATIVA DE STREAMLIT */
         div[data-testid="stTabs"] div[data-baseweb="tab-highlight"] {
             display: none !important;
         }
 
+        /* 5. FIX PARA TEXTAREA Y INPUTS EN MODO OSCURO */
         div[data-testid="stTextArea"] textarea, div[data-testid="stTextInput"] input {
             background-color: #0f172a !important;
             color: #f8fafc !important;
@@ -985,6 +982,7 @@ def inyectar_estilos_base_ui():
         }
         </style>
     """, unsafe_allow_html=True)
+
 
 # ==============================================================================
 # 7. VISTAS Y SECCIONES (OPTIMIZACIÓN VECTORIZADA DE ALTO RENDIMIENTO)
@@ -1002,6 +1000,9 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         "☁️ Cargar Datos (Supabase)"
     ])
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 1: EVOLUCIÓN & PRODUCTIVIDAD
+    # --------------------------------------------------------------------------
     with sub_tab1:
         mask_grafico = df_folios[dimension_sel].notnull() & (~df_folios[dimension_sel].astype(str).str.lower().isin(["nan", "none", "null", ""]))
         df_folios_grafico = df_folios[mask_grafico]
@@ -1057,6 +1058,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             ]
             cols_ordenadas_limpias = list(df_matriz.columns)
 
+            # Vectorización optimizada de arrays con NumPy
             matriz_vals = df_matriz[cols_ordenadas_limpias].to_numpy()
             df_matriz["TENDENCIA"] = matriz_vals.tolist()
             df_matriz["PROMEDIO_PERIODO"] = np.round(matriz_vals.mean(axis=1), 1)
@@ -1120,6 +1122,9 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                 fig_eve.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
                 st.plotly_chart(fig_eve, width="stretch", config={'displayModeBar': False})
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 2: DESGROSE POR PÓLIZAS
+    # --------------------------------------------------------------------------
     with sub_tab2:
         st.markdown("### 📂 Resumen Operativo por Tipo de Póliza Catalogada")
         if not df_folios.empty:
@@ -1139,6 +1144,9 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             )
             st.dataframe(df_res_pol, width="stretch", hide_index=True)
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 3: RANKING DE CUADRILLAS / TÉCNICOS
+    # --------------------------------------------------------------------------
     with sub_tab3:
         st.markdown("### 🏆 Ranking de Productividad por Cuadrilla / Técnico")
         if not df_folios.empty:
@@ -1156,11 +1164,17 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             df_rank = df_rank.sort_values(by="Productividad_Diaria", ascending=False)
             st.dataframe(df_rank, width="stretch", hide_index=True, height=400)
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 4: DESCARGA DE REPORTES
+    # --------------------------------------------------------------------------
     with sub_tab4:
         st.markdown("### 📥 Descarga de Reportes")
         csv_bytes = df_folios.to_csv(index=False).encode("utf-8")
         st.download_button("📄 Descargar Dataset (CSV)", csv_bytes, f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv")
 
+    # --------------------------------------------------------------------------
+    # SUBTAB 5: CARGAR DATOS (SUPABASE)
+    # --------------------------------------------------------------------------
     with sub_tab5:
         CLAVE_ACCESO_CARGA = "Totalplay1#Norte"
 
@@ -1341,6 +1355,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         col_tech_base = detectar_columna_por_patrones(list(df_folios.columns), ["usuario_tecnico", "tecnico", "tech", "usuario", "atendio"]) or "Usuario_Tecnico"
         eventos_por_tech = df_base_efectividad.groupby(col_tech_base, observed=True).size().to_dict()
 
+        # Concatenación blindada contra tipos de datos mixtos o nulos en agregaciones
         df_agrupado_tech = df_filtrado_rein.groupby(
             ["Usuario_Origen_Reincidencia", "Empresa_Origen_Reincidencia"], observed=True
         ).agg(
@@ -1418,50 +1433,51 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     else:
         st.info("No hay historial de cuentas con reincidencia para mostrar.")
 
-# ==============================================================================
-# PESTAÑAS 3 Y 4: RENDERIZADO DE AVISO PROXIMAMENTE ESTRUCTURADO
-# ==============================================================================
 
-def renderizar_pestana_cambios_equipo(df_folios: pd.DataFrame) -> None:
-    st.markdown(f"""
-        <div class="proximamente-card">
-            <span class="proximamente-badge">🚀 PRÓXIMAMENTE DISPONIBLE</span>
-            <div class="proximamente-title">🛠️ Módulo de Cambios de Equipo & Materiales</div>
-            <p class="proximamente-desc">
-                Este módulo está actualmente en fase de diseño de lógica analítica. Incorporará el análisis cruzado de insumos en campo, trazabilidad de números de serie, consumo por cuadrilla y tasa de reemplazo de hardware.
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("#### 📌 Roadmap de Funcionalidades Planificadas:")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.info("📦 **Control Insumos/ONTS:** Trazabilidad de equipos cambiados y sus seriales de origen.")
-    with c2:
-        st.info("📊 **Tasa de Reemplazo:** Medición del % de cambio de equipo por cuadrilla vs mantenimientos.")
-    with c3:
-        st.info("🔍 **Filtro de Materiales:** Diagnóstico por tipo de hardware (ONT, STB, Extender, Fibra).")
+def guardar_y_reemplazar_semana_texto(nombre_semana: str, texto_datos: str) -> bool:
+    """Procesa el buffer en texto plano e interactúa con Supabase Storage de manera atómica."""
+    try:
+        texto_limpio = texto_datos.strip()
+        if not texto_limpio:
+            st.error("El cuadro de texto está vacío.")
+            return False
 
-def renderizar_pestana_causa_solucion(df_folios: pd.DataFrame) -> None:
-    st.markdown(f"""
-        <div class="proximamente-card">
-            <span class="proximamente-badge">🚀 PRÓXIMAMENTE DISPONIBLE</span>
-            <div class="proximamente-title">🎧 Módulo de Causa & Solución de Soporte</div>
-            <p class="proximamente-desc">
-                En desarrollo activo. Permitirá la matriz cruzada de diagnósticos vs resoluciones en sitio, correlación de códigos de cierre y agrupamiento inteligente por categoría raíz de falla técnica.
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
+        try:
+            df_nuevo = pd.read_csv(io.StringIO(texto_limpio), sep="\t", dtype=str)
+            if len(df_nuevo.columns) <= 1:
+                df_nuevo = pd.read_csv(io.StringIO(texto_limpio), sep=",", dtype=str)
+        except Exception as e_parse:
+            st.error(f"Error al interpretar la estructura de la tabla: {e_parse}")
+            return False
 
-    st.markdown("#### 📌 Roadmap de Funcionalidades Planificadas:")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.info("🩺 **Matriz de Causa Raíz:** Agrupamiento de motivos de falla informados por cliente.")
-    with c2:
-        st.info("🛠️ **Efectividad de Solución:** Cruzamiento entre solución ejecutada y recurrencia técnica.")
-    with c3:
-        st.info("📈 **Pareto de Fallas:** Top 10 causas de soporte técnico por distrito y nodo.")
+        df_nuevo.columns = df_nuevo.columns.astype(str).str.strip()
 
+        nombre_semana_clean = nombre_semana.strip().upper()
+        df_nuevo["Num_Semana_Archivo"] = nombre_semana_clean
+        if "SEMANA" not in df_nuevo.columns:
+            df_nuevo["SEMANA"] = nombre_semana_clean
+
+        csv_buffer = io.StringIO()
+        df_nuevo.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
+        bytes_datos = csv_buffer.getvalue().encode("utf-8-sig")
+
+        nombre_archivo = f"{nombre_semana_clean}.csv"
+        
+        if supabase:
+            supabase.storage.from_("Totalplay_datos_semanales").upload(
+                path=nombre_archivo,
+                file=bytes_datos,
+                file_options={"content-type": "text/csv; charset=utf-8", "upsert": "true"}
+            )
+            st.cache_data.clear()
+            return True
+        else:
+            st.error("No hay una conexión activa con Supabase.")
+            return False
+
+    except Exception as e:
+        st.error(f"Error crítico al subir la semana a Supabase: {e}")
+        return False
 # ==============================================================================
 # 8. NAVEGACIÓN PRINCIPAL
 # ==============================================================================
@@ -1474,8 +1490,12 @@ def main() -> None:
         initial_sidebar_state="expanded"
     )
 
+    # --------------------------------------------------------------------------
+    # ESTILO FORZADO PARA PESTAÑAS (TABS) - VISIBILIDAD TOTAL EN CUALQUIER TEMA
+    # --------------------------------------------------------------------------
     st.markdown("""
         <style>
+        /* Contenedor principal de la barra de pestañas */
         div[data-baseweb="tab-list"] {
             background-color: #0d1117 !important;
             padding: 8px !important;
@@ -1484,6 +1504,7 @@ def main() -> None:
             gap: 8px !important;
         }
 
+        /* Pestañas inactivas (Estilo botón oscuro con borde sutil) */
         button[data-baseweb="tab"] {
             background-color: #161b22 !important;
             border: 1px solid #30363d !important;
@@ -1494,23 +1515,27 @@ def main() -> None:
             transition: all 0.2s ease-in-out !important;
         }
 
+        /* Texto de pestañas inactivas */
         button[data-baseweb="tab"] p, 
         button[data-baseweb="tab"] span {
             color: #9198a1 !important;
             font-weight: 600 !important;
         }
 
+        /* Hover al pasar el ratón */
         button[data-baseweb="tab"]:hover {
             background-color: #21262d !important;
             border-color: #38bdf8 !important;
         }
 
+        /* Pestaña ACTIVA con la BARRA AZUL destacada */
         button[data-baseweb="tab"][aria-selected="true"] {
             background-color: #1e293b !important;
             border: 2px solid #0284c7 !important;
             box-shadow: 0px 0px 10px rgba(2, 132, 199, 0.4) !important;
         }
 
+        /* Barra Azul superior en la pestaña activa */
         button[data-baseweb="tab"][aria-selected="true"]::before {
             content: "" !important;
             position: absolute !important;
@@ -1522,6 +1547,7 @@ def main() -> None:
             border-radius: 8px 8px 0 0 !important;
         }
 
+        /* Texto de la pestaña activa */
         button[data-baseweb="tab"][aria-selected="true"] p,
         button[data-baseweb="tab"][aria-selected="true"] span {
             color: #38bdf8 !important;
@@ -1532,6 +1558,7 @@ def main() -> None:
 
     inyectar_estilos_css_enterprise()
 
+    # ENCABEZADO PRINCIPAL CON BOTONES DE ACTUALIZACIÓN DERECHA
     col_hdr_left, col_hdr_right = st.columns([0.70, 0.30])
     
     with col_hdr_left:
@@ -1546,6 +1573,7 @@ def main() -> None:
         st.write("")
         st.markdown("""
             <style>
+            /* Botón Primario (Recargar) */
             div.stButton > button[kind="primary"] {
                 background-color: #1E293B !important;
                 color: #FFFFFF !important;
@@ -1559,6 +1587,7 @@ def main() -> None:
                 border-color: #0F172A !important;
             }
 
+            /* Botón Secundario (Limpiar Caché) */
             div.stButton > button[kind="secondary"], div.stButton > button:not([kind="primary"]) {
                 background-color: #FFFFFF !important;
                 color: #1E293B !important;
@@ -1587,6 +1616,7 @@ def main() -> None:
                     del st.session_state[key]
                 st.rerun()
 
+    # OBTENER FIRMA DINÁMICA DE LOS ARCHIVOS
     hash_actual = obtener_hash_archivos_carpeta("datos_semanales")
     df_raw = ejecutar_pipeline_ingestion_datos(hash_actual)
 
@@ -1594,6 +1624,9 @@ def main() -> None:
         st.error("⚠️ No hay datos disponibles para procesar en Supabase o en la carpeta 'datos_semanales'. Verifique las conexiones y archivos.")
         return
 
+    # --------------------------------------------------------------------------
+    # BARRA LATERAL (SIDEBAR DE FILTROS A LA IZQUIERDA)
+    # --------------------------------------------------------------------------
     st.sidebar.markdown("### 📅 Granularidad Temporal")
     dimension_sel = st.sidebar.radio(
         "Agrupar tiempo por:",
@@ -1669,10 +1702,12 @@ def main() -> None:
         renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
 
     with tab3:
-        renderizar_pestana_cambios_equipo(df_folios)
+        st.markdown("### 🛠️ Cambios de equipo")
+        st.info("ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas cuando gustes construirlo.")
 
     with tab4:
-        renderizar_pestana_causa_solucion(df_folios)
+        st.markdown("### 🎧 Causa & Solución soporte")
+        st.info("ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas cuando gustes construirlo.")
 
 if __name__ == "__main__":
     main()
