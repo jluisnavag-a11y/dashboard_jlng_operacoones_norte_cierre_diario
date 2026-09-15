@@ -53,27 +53,46 @@ CACHE_DIR = Path("/tmp/supabase_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def _procesar_y_guardar_local(nombre_archivo, _supabase_client):
-    """Descarga el CSV solo si no existe la versión .parquet localmente"""
+    """Descarga y convierte a Parquet manejando cualquier codificación o corrupción de CSV"""
     archivo_parquet = CACHE_DIR / f"{Path(nombre_archivo).stem}.parquet"
     
-   # Si ya se convirtió a Parquet previamente en disco local, se omite descarga/parseo CSV
+    # Si el archivo Parquet existe pero está vacío o corrupto, lo borramos para reintentar
     if archivo_parquet.exists():
-        return archivo_parquet
+        if archivo_parquet.stat().st_size > 0:
+            return archivo_parquet
+        else:
+            archivo_parquet.unlink()
 
     try:
         data_bytes = _supabase_client.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
         
-        # Lectura robusta omitiendo líneas corruptas del archivo dinámico
+        # Intento 1: Carga estándar omitiendo líneas malas
         try:
-            df_temp = pd.read_csv(io.BytesIO(data_bytes), low_memory=False, on_bad_lines='skip')
+            df_temp = pd.read_csv(
+                io.BytesIO(data_bytes), 
+                low_memory=False, 
+                on_bad_lines='skip',
+                encoding='utf-8'
+            )
         except Exception:
-            df_temp = pd.read_csv(io.BytesIO(data_bytes), low_memory=False, sep=None, engine='python', on_bad_lines='skip')
+            # Intento 2: Carga para archivos de Excel/Latinoamérica (latin1, auto-separador)
+            df_temp = pd.read_csv(
+                io.BytesIO(data_bytes), 
+                low_memory=False, 
+                on_bad_lines='skip', 
+                encoding='latin1',
+                sep=None, 
+                engine='python'
+            )
 
+        # Guardar en Parquet binario
         df_temp.to_parquet(archivo_parquet, compression="snappy")
         return archivo_parquet
+        
     except Exception as e:
         logger.error(f"Error procesando {nombre_archivo}: {e}")
         return None
+    
 
 @st.cache_data(ttl=3600, show_spinner="Cargando motor de datos dinámico La Baja...")
 def cargar_dataset_dinamico(_supabase_client):
