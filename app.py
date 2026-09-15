@@ -6,6 +6,7 @@ import re
 import os
 import glob
 import plotly.express as px
+import concurrent.futures
 
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
