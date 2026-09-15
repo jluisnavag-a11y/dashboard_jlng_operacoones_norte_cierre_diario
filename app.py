@@ -56,13 +56,19 @@ def _procesar_y_guardar_local(nombre_archivo, _supabase_client):
     """Descarga el CSV solo si no existe la versión .parquet localmente"""
     archivo_parquet = CACHE_DIR / f"{Path(nombre_archivo).stem}.parquet"
     
-    # Si ya se convirtió a Parquet previamente en disco local, se omite descarga/parseo CSV
+   # Si ya se convirtió a Parquet previamente en disco local, se omite descarga/parseo CSV
     if archivo_parquet.exists():
         return archivo_parquet
 
     try:
         data_bytes = _supabase_client.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
-        df_temp = pd.read_csv(io.BytesIO(data_bytes), low_memory=False)
+        
+        # Lectura robusta omitiendo líneas corruptas del archivo dinámico
+        try:
+            df_temp = pd.read_csv(io.BytesIO(data_bytes), low_memory=False, on_bad_lines='skip')
+        except Exception:
+            df_temp = pd.read_csv(io.BytesIO(data_bytes), low_memory=False, sep=None, engine='python', on_bad_lines='skip')
+
         df_temp.to_parquet(archivo_parquet, compression="snappy")
         return archivo_parquet
     except Exception as e:
