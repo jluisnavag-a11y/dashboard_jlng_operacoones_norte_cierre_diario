@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -48,107 +49,91 @@ def get_supabase_client() -> Optional[Client]:
 supabase = get_supabase_client()
 
 # -----------------------------------------------------------------------------
-# 0.2. MOTOR DE PERSISTENCIA PARQUET + CACHÉ DINÁMICO (OPTIMIZADO CPU)
+# 0.2. MOTOR DE CONSULTA Y LECTURA DIRECTA DESDE GITHUB (PÚBLICO)
 # -----------------------------------------------------------------------------
-CACHE_DIR = Path("/tmp/supabase_cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+import io
+import requests
 
-@st.cache_data(ttl=3600, show_spinner="Comprobando datos en Supabase Storage...")
-def obtener_archivos_supabase(hash_archivos: str = ""):
-    if not supabase:
-        st.error("No hay un cliente de Supabase inicializado.")
-        return [], set()
+# Datos del repositorio público en GitHub
+GITHUB_USER = "jluisnavag-a11y"
+GITHUB_REPO = "dashboard_jlng_operacoones_norte_cierre_diario"
+GITHUB_BRANCH = "main"
+GITHUB_FOLDER = "datos_semanales"
 
-    try:
-        # Obtener lista completa de archivos en el bucket de Supabase
-        archivos = supabase.storage.from_("Totalplay_datos_semanales").list(
-            path="", 
-            options={"limit": 1000, "offset": 0, "sortBy": {"column": "name", "order": "asc"}}
-        )
-        
-        csv_files = [f['name'] for f in archivos if isinstance(f, dict) and f.get('name', '').endswith('.csv')]
-        
-        # Sincronización de caché local: Eliminar archivos Parquet de la computadora que ya no estén en Supabase
-        nombres_base_nube = {Path(name).stem for name in csv_files}
-        for archivo_local in CACHE_DIR.glob("*.parquet"):
-            if archivo_local.stem not in nombres_base_nube:
-                try:
-                    archivo_local.unlink()
-                except Exception:
-                    pass
-
-        if not csv_files:
-            st.info("El bucket de Supabase está vacío. Carga nuevos archivos CSV en la pestaña 'Cargar Datos (Supabase)' o en la consola para iniciar.")
-            return [], set()
-
-        def descargar_individual(nombre_archivo):
-            archivo_parquet = CACHE_DIR / f"{Path(nombre_archivo).stem}.parquet"
-            
-            # Usar caché local solo si el archivo existe en la nube
-            if archivo_parquet.exists() and archivo_parquet.stat().st_size > 0:
-                try:
-                    df_cached = pd.read_parquet(archivo_parquet)
-                    return df_cached, nombre_archivo.upper()
-                except Exception:
-                    archivo_parquet.unlink()
-
-            try:
-                res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
-                try:
-                    df_temp = pd.read_csv(io.BytesIO(res), low_memory=False, dtype=str, encoding='utf-8', on_bad_lines='skip')
-                except Exception:
-                    df_temp = pd.read_csv(io.BytesIO(res), low_memory=False, dtype=str, encoding='latin1', on_bad_lines='skip')
-
-                if df_temp is not None and not df_temp.empty:
-                    df_temp["Archivo_Origen"] = nombre_archivo
-                    df_temp.to_parquet(archivo_parquet, compression="snappy")
-                    return df_temp, nombre_archivo.upper()
-            except Exception as e_desc:
-                logger.error(f"Error descargando {nombre_archivo}: {e_desc}")
-            return None, None
-
-        coleccion_dfs = []
-        archivos_procesados = set()
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            resultados = list(executor.map(descargar_individual, csv_files))
-
-        for df_res, nom_res in resultados:
-            if df_res is not None:
-                coleccion_dfs.append(df_res)
-                archivos_procesados.add(nom_res)
-
-        return coleccion_dfs, archivos_procesados
-
-    except Exception as e:
-        st.error(f"Error al conectar con Supabase Storage: {e}")
-        return [], set()
+# URLs de la API y Descarga Directa (Raw)
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_FOLDER}?ref={GITHUB_BRANCH}"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}"
 
 
-@st.cache_data(ttl=3600, show_spinner="Procesando datos estrictamente desde Supabase Storage...")
+@st.cache_data(ttl=3600, show_spinner="Consultando datos directamente desde el repositorio de GitHub...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     coleccion_dfs = []
 
-    # 1. Descargar EXCLUSIVAMENTE los archivos que existen en Supabase Storage
-    dfs_nube, _ = obtener_archivos_supabase(hash_archivos)
-    if dfs_nube:
-        coleccion_dfs.extend(dfs_nube)
+    try:
+        # 1. Consultar la API pública de GitHub para obtener la lista de archivos
+        respuesta = requests.get(GITHUB_API_URL, timeout=10)
+        
+        if respuesta.status_code == 200:
+            archivos_github = respuesta.json()
+            # Filtrar únicamente archivos CSV o Parquet
+            lista_archivos = [
+                f["name"] for f in archivos_github 
+                if isinstance(f, dict) and (f["name"].endswith(".csv") or f["name"].endswith(".parquet"))
+            ]
+        else:
+            logger.warning(f"No se pudo consultar la API de GitHub (Status Code: {respuesta.status_code}).")
+            lista_archivos = []
+
+    except Exception as e:
+        logger.error(f"Error al conectar con la API de GitHub: {e}")
+        lista_archivos = []
+
+    if not lista_archivos:
+        # Retornar estructura base en caso de no encontrar archivos
+        cols_base = [
+            "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
+            "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
+            "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+        ]
+        return pd.DataFrame(columns=cols_base)
+
+    # 2. Descargar y procesar cada archivo directamente vía URL Raw
+    for nombre_archivo in lista_archivos:
+        url_raw = f"{GITHUB_RAW_BASE}/{nombre_archivo}"
+        try:
+            if nombre_archivo.endswith(".parquet"):
+                df_temp = pd.read_parquet(url_raw)
+            else:
+                try:
+                    df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
+                except Exception:
+                    df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
+
+            df_temp["Archivo_Origen"] = nombre_archivo
+            coleccion_dfs.append(df_temp)
+        except Exception as e:
+            logger.error(f"Error al procesar {nombre_archivo} desde GitHub: {e}")
 
     if not coleccion_dfs:
-        return pd.DataFrame()
+        cols_base = [
+            "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
+            "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
+            "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+        ]
+        return pd.DataFrame(columns=cols_base)
 
     df = pd.concat(coleccion_dfs, ignore_index=True)
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
-    # Normalización de Fecha compatible con Números Serie de Excel (ej: 46203.45024 o 46203,45024)
+    # Normalización de Fecha compatible con Números Serie de Excel
     col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
     if col_fecha and col_fecha in df.columns:
-        serie_fecha_clean = df[col_fecha].astype(str).str.replace(',', '.', regex=False).str.strip()
-        es_num = pd.to_numeric(serie_fecha_clean, errors='coerce')
+        serie_fecha_clean = df[col_fecha].astype(str).str.replace(",", ".", regex=False).str.strip()
+        es_num = pd.to_numeric(serie_fecha_clean, errors="coerce")
         
-        fechas_excel = pd.to_datetime('1899-12-30') + pd.to_timedelta(es_num, unit='D', errors='coerce')
-        fechas_texto = pd.to_datetime(df[col_fecha], errors='coerce', dayfirst=True, format='mixed')
+        fechas_excel = pd.to_datetime("1899-12-30") + pd.to_timedelta(es_num, unit="D", errors="coerce")
+        fechas_texto = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True, format="mixed")
         df["_datetime_parsed"] = fechas_excel.fillna(fechas_texto)
     else:
         df["_datetime_parsed"] = pd.NaT
@@ -219,7 +204,6 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df = calcular_reincidencias_vectorizadas(df)
 
     return df
-
 # -----------------------------------------------------------------------------
 # 0.3. EJECUCIÓN CONTINUA DEL DASHBOARD
 # -----------------------------------------------------------------------------
