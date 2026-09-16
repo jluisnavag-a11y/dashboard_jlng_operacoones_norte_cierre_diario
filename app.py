@@ -1,79 +1,39 @@
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import io
-import re
-import os
-import glob
-import logging
-import concurrent.futures
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
-
-import plotly.express as px
-import plotly.graph_objects as go
-from supabase import create_client, Client
-
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py
-# Versión: 14.0.0-PARQUET-ENGINE Totalplay Región Norte La Baja Edition
+# Archivo: app.py | Versión: 14.1.0-LIGHT-ENGINE (Ingestión GitHub Directa)
 # ==============================================================================
 
-st.set_page_config(layout="wide")
+import os, re, io, glob, logging, requests
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from concurrent.futures import ThreadPoolExecutor
 
-# Configuración de Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+st.set_page_config(page_title="Control Operativo Cuadrillas 2026", layout="wide")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("ControlCuadrillas.Monolith")
-
-# -----------------------------------------------------------------------------
-# 0.1. CLIENTE SUPABASE
-# -----------------------------------------------------------------------------
-@st.cache_resource
-def get_supabase_client() -> Optional[Client]:
-    try:
-        url = "https://rmvfhhtugdvdkadickpf.supabase.co"
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
-    except Exception as e:
-        st.warning(f"No se pudo conectar a Supabase Secrets: {e}")
-        return None
-
-supabase = get_supabase_client()
 
 # -----------------------------------------------------------------------------
 # 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA DESDE GITHUB
 # -----------------------------------------------------------------------------
-import io
-import requests
-from concurrent.futures import ThreadPoolExecutor
+gh_cfg = st.secrets.get("github", {})
+GITHUB_USER = gh_cfg.get("user", "jluisnavag-a11y")
+GITHUB_REPO = gh_cfg.get("repo", "dashboard_jlng_operacoones_norte_cierre_diario")
+GITHUB_BRANCH = gh_cfg.get("branch", "main")
+GITHUB_FOLDER = gh_cfg.get("folder", "datos_semanales")
+GITHUB_TOKEN = gh_cfg.get("token", "")
 
-# Lectura segura desde Secrets o Fallback público
-GITHUB_USER = st.secrets.get("github", {}).get("user", "jluisnavag-a11y")
-GITHUB_REPO = st.secrets.get("github", {}).get("repo", "dashboard_jlng_operacoones_norte_cierre_diario")
-GITHUB_BRANCH = st.secrets.get("github", {}).get("branch", "main")
-GITHUB_FOLDER = st.secrets.get("github", {}).get("folder", "datos_semanales")
-GITHUB_TOKEN = st.secrets.get("github", {}).get("token", "")
-
-# Encabezados con autenticación para evitar el Rate Limit de GitHub
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_FOLDER}?ref={GITHUB_BRANCH}"
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}"
 
 
 def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
-    """Descarga optimizada con soporte de sesión e inspección de errores."""
-    url_raw = f"{GITHUB_RAW_BASE}/{nombre_archivo}"
+    """Descarga optimizada con soporte Parquet/CSV e inspección de errores."""
     try:
-        resp = requests.get(url_raw, headers=HEADERS, timeout=10)
+        resp = requests.get(f"{GITHUB_RAW_BASE}/{nombre_archivo}", headers=HEADERS, timeout=10)
         if resp.status_code == 200:
             bytes_data = io.BytesIO(resp.content)
             if nombre_archivo.endswith(".parquet"):
@@ -88,8 +48,6 @@ def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
             if df_temp is not None and not df_temp.empty:
                 df_temp["Archivo_Origen"] = nombre_archivo
                 return df_temp
-        else:
-            logger.warning(f"Respuesta HTTP {resp.status_code} al descargar {nombre_archivo}")
     except Exception as e:
         logger.error(f"Error procesando {nombre_archivo}: {e}")
     return None
@@ -97,125 +55,92 @@ def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=86400, show_spinner="Cargando datos optimizados desde GitHub...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
+    cols_base = ["FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"]
+    
     try:
-        respuesta = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
-        
-        if respuesta.status_code == 200:
-            archivos_github = respuesta.json()
-            lista_archivos = [
-                f["name"] for f in archivos_github 
-                if isinstance(f, dict) and (f["name"].endswith(".csv") or f["name"].endswith(".parquet"))
-            ]
-        else:
-            logger.warning(f"Error en API GitHub ({respuesta.status_code}). Verifica Token o permisos.")
-            lista_archivos = []
-
+        resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+        lista_archivos = [f["name"] for f in resp.json() if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))] if resp.status_code == 200 else []
     except Exception as e:
-        logger.error(f"Error al conectar con la API de GitHub: {e}")
+        logger.error(f"Error conectando con GitHub API: {e}")
         lista_archivos = []
 
     if not lista_archivos:
-        cols_base = [
-            "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
-            "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
-            "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
-        ]
         return pd.DataFrame(columns=cols_base)
 
-    # Concurrencia moderada (max_workers=4) para no saturar las conexiones de red
     with ThreadPoolExecutor(max_workers=4) as executor:
         resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
 
     coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
-
     if not coleccion_dfs:
-        cols_base = [
-            "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
-            "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
-            "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
-        ]
         return pd.DataFrame(columns=cols_base)
 
     df = pd.concat(coleccion_dfs, ignore_index=True)
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
-    # Normalización de Fecha compatible con Números Serie de Excel
-    col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
+    # Helpers seguros de unificación
+    get_col = lambda alias: detectar_columna_por_patrones(cols, alias) if 'detectar_columna_por_patrones' in globals() else None
+    sanit_fol = lambda s: s.apply(sanitizar_folio_identificador) if 'sanitizar_folio_identificador' in globals() else s
+    sanit_txt = lambda s: s.apply(sanitizar_cadena_texto) if 'sanitizar_cadena_texto' in globals() else s
+
+    # Parseo de Fechas (Excel Serie / Mixto)
+    col_fecha = get_col(LISTA_ALIAS_CREACION if 'LISTA_ALIAS_CREACION' in globals() else [])
     if col_fecha and col_fecha in df.columns:
-        serie_fecha_clean = df[col_fecha].astype(str).str.replace(",", ".", regex=False).str.strip()
-        es_num = pd.to_numeric(serie_fecha_clean, errors="coerce")
-        
-        fechas_excel = pd.to_datetime("1899-12-30") + pd.to_timedelta(es_num, unit="D", errors="coerce")
-        fechas_texto = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True, format="mixed")
-        df["_datetime_parsed"] = fechas_excel.fillna(fechas_texto)
+        s_clean = pd.to_numeric(df[col_fecha].astype(str).str.replace(",", ".", regex=False).str.strip(), errors="coerce")
+        df["_datetime_parsed"] = (pd.to_datetime("1899-12-30") + pd.to_timedelta(s_clean, unit="D", errors="coerce")).fillna(pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True, format="mixed"))
     else:
         df["_datetime_parsed"] = pd.NaT
 
-    # Detección y normalización de columnas principales
-    col_os = detectar_columna_por_patrones(cols, LISTA_ALIAS_ORDEN)
-    col_cta = detectar_columna_por_patrones(cols, LISTA_ALIAS_CUENTA)
-    col_ot = detectar_columna_por_patrones(cols, LISTA_ALIAS_OT)
-    col_tipo = detectar_columna_por_patrones(cols, LISTA_ALIAS_TIPO)
-    col_usr = detectar_columna_por_patrones(cols, LISTA_ALIAS_USUARIO)
-    col_nom = detectar_columna_por_patrones(cols, LISTA_ALIAS_NOMBRE)
-    col_prov = detectar_columna_por_patrones(cols, LISTA_ALIAS_PROVEEDOR)
-    col_dist = detectar_columna_por_patrones(cols, LISTA_ALIAS_DISTRITO)
-    col_cluster = detectar_columna_por_patrones(cols, LISTA_ALIAS_CLUSTER)
-        
-    serie_os = df[col_os].apply(sanitizar_folio_identificador) if col_os else "SIN_OS"
-    serie_cta = df[col_cta].apply(sanitizar_folio_identificador) if col_cta else "SIN_CTA"
-    serie_ot = df[col_ot].apply(sanitizar_folio_identificador) if col_ot else "SIN_OT"
-    serie_tipo = df[col_tipo].apply(sanitizar_cadena_texto) if col_tipo else "EVENTO GENERAL"
+    # Mapeo y Detección de Columnas Principales
+    c_os, c_cta, c_ot, c_tipo = get_col(LISTA_ALIAS_ORDEN if 'LISTA_ALIAS_ORDEN' in globals() else []), get_col(LISTA_ALIAS_CUENTA if 'LISTA_ALIAS_CUENTA' in globals() else []), get_col(LISTA_ALIAS_OT if 'LISTA_ALIAS_OT' in globals() else []), get_col(LISTA_ALIAS_TIPO if 'LISTA_ALIAS_TIPO' in globals() else [])
+    c_usr, c_nom, c_prov, c_dist, c_cluster = get_col(LISTA_ALIAS_USUARIO if 'LISTA_ALIAS_USUARIO' in globals() else []), get_col(LISTA_ALIAS_NOMBRE if 'LISTA_ALIAS_NOMBRE' in globals() else []), get_col(LISTA_ALIAS_PROVEEDOR if 'LISTA_ALIAS_PROVEEDOR' in globals() else []), get_col(LISTA_ALIAS_DISTRITO if 'LISTA_ALIAS_DISTRITO' in globals() else []), get_col(LISTA_ALIAS_CLUSTER if 'LISTA_ALIAS_CLUSTER' in globals() else [])
 
-    df["FOLIO_KEY"] = serie_os.astype(str) + "_" + serie_cta.astype(str) + "_" + serie_ot.astype(str) + "_" + serie_tipo.astype(str)
-    df["Cuenta_Cliente"] = serie_cta.astype(str)
-    
-    serie_u = df[col_usr].apply(sanitizar_cadena_texto) if col_usr else "SIN ESPECIFICAR"
-    serie_n = df[col_nom].apply(sanitizar_cadena_texto) if col_nom else "SIN ESPECIFICAR"
-    
-    df["Usuario_Tecnico"] = np.where(
-        (serie_u != "SIN ESPECIFICAR") & (serie_n != "SIN ESPECIFICAR"),
-        serie_u + " | " + serie_n,
-        np.where(serie_n != "SIN ESPECIFICAR", serie_n, serie_u)
-    )
+    s_os = sanit_fol(df[c_os]) if c_os else "SIN_OS"
+    s_cta = sanit_fol(df[c_cta]) if c_cta else "SIN_CTA"
+    s_ot = sanit_fol(df[c_ot]) if c_ot else "SIN_OT"
+    s_tipo = sanit_txt(df[c_tipo]) if c_tipo else "EVENTO GENERAL"
 
-    df["Empresa"] = df[col_prov].apply(sanitizar_cadena_texto) if col_prov else "SIN PROVEEDOR"
-    df["Distrito"] = df[col_dist].apply(sanitizar_cadena_texto) if col_dist else "DISTRITO GENERAL"
-    df["Tipo_Orden"] = serie_tipo
+    df["FOLIO_KEY"] = s_os.astype(str) + "_" + s_cta.astype(str) + "_" + s_ot.astype(str) + "_" + s_tipo.astype(str)
+    df["Cuenta_Cliente"] = s_cta.astype(str)
 
-    df["Cluster_Raw"] = df[col_cluster].apply(sanitizar_cadena_texto) if col_cluster else "SIN CLUSTER"
-    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
+    s_u = sanit_txt(df[c_usr]) if c_usr else "SIN ESPECIFICAR"
+    s_n = sanit_txt(df[c_nom]) if c_nom else "SIN ESPECIFICAR"
+    df["Usuario_Tecnico"] = np.where((s_u != "SIN ESPECIFICAR") & (s_n != "SIN ESPECIFICAR"), s_u + " | " + s_n, np.where(s_n != "SIN ESPECIFICAR", s_n, s_u))
 
-    col_origen_pol = col_usr if col_usr else col_nom
-    if col_origen_pol:
-        sub_cods = df[col_origen_pol].astype(str).str[3:5]
+    df["Empresa"] = sanit_txt(df[c_prov]) if c_prov else "SIN PROVEEDOR"
+    df["Distrito"] = sanit_txt(df[c_dist]) if c_dist else "DISTRITO GENERAL"
+    df["Tipo_Orden"] = s_tipo
+    df["Cluster_Raw"] = sanit_txt(df[c_cluster]) if c_cluster else "SIN CLUSTER"
+    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"]) if 'normalizar_clusters_vectorizado' in globals() else df["Cluster_Raw"]
+
+    # Mapeo de Pólizas
+    c_pol = c_usr or c_nom
+    if c_pol and 'MAPEO_POLIZAS' in globals():
+        sub_cods = df[c_pol].astype(str).str[3:5]
         df["Codigo_Poliza"] = np.where(sub_cods.isin(MAPEO_POLIZAS.keys()), sub_cods, "")
         df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("NO VALIDO")
     else:
-        df["Codigo_Poliza"] = ""
-        df["Nombre_Poliza"] = "NO VALIDO"
+        df["Codigo_Poliza"], df["Nombre_Poliza"] = "", "NO VALIDO"
 
-    # Extracción y Dimensiones Temporales Robusta
-    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(0, index=df.index)
-    semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
+    # Dimensiones Temporales
+    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns and 'extraer_numero_semana_archivo' in globals() else 0
+    semanas_iso = pd.to_numeric(df["_datetime_parsed"].dt.isocalendar().week, errors="coerce").fillna(0).astype(int)
+    df["Num_Semana_Archivo"] = np.where(semanas_archivo > 0, semanas_archivo, semanas_iso)
 
-    df["Num_Semana_Archivo"] = np.where(
-        semanas_archivo > 0, 
-        semanas_archivo, 
-        pd.to_numeric(semanas_iso, errors="coerce").fillna(0).astype(int)
-    )
+    anio_base = ANIO_BASE_ESTRICTO if 'ANIO_BASE_ESTRICTO' in globals() else 2026
+    mapeo_meses = MAPEO_MESES_TEXTO if 'MAPEO_MESES_TEXTO' in globals() else {}
 
-    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
+    df["AÑO_DIM"] = str(anio_base)
     df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
-    df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO)
-    
-    dates_valid = df["_datetime_parsed"].dropna()
-    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
-    if not dates_valid.empty:
-        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
+    df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(mapeo_meses).fillna("ENERO")
 
-    df = calcular_reincidencias_vectorizadas(df)
+    dates_valid = df["_datetime_parsed"].dropna()
+    df["FECHA_TRUNCADA"] = f"01.01.{anio_base}"
+    if not dates_valid.empty:
+        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{anio_base}")
+
+    if 'calcular_reincidencias_vectorizadas' in globals():
+        df = calcular_reincidencias_vectorizadas(df)
 
     return df
 
@@ -938,54 +863,35 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
 # NUEVO (Descarga multihilo con motor C de alta velocidad):
 # ------------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="Descargando datos de la nube...")
-def obtener_archivos_supabase(hash_archivos: str = ""):
-    try:
-        archivos = supabase.storage.from_("Totalplay_datos_semanales").list()
-        csv_files = [f['name'] for f in archivos if f['name'].endswith('.csv')]
-        
-        if not csv_files:
-            return [], set()
-
-        def descargar_individual(nombre_archivo):
-            try:
-                res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
-                df_temp = pd.read_csv(io.BytesIO(res), engine='c', low_memory=False, dtype=str)
-                if not df_temp.empty:
-                    df_temp["Archivo_Origen"] = nombre_archivo
-                    return df_temp, nombre_archivo.upper()
-            except Exception:
-                pass
-            return None, None
-
-        coleccion_dfs = []
-        archivos_procesados = set()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            resultados = list(executor.map(descargar_individual, csv_files))
-
-        for df_res, nom_res in resultados:
-            if df_res is not None:
-                coleccion_dfs.append(df_res)
-                archivos_procesados.add(nom_res)
-
-        return coleccion_dfs, archivos_procesados
-
-    except Exception as e:
-        st.error(f"Error al conectar con Supabase Storage: {e}")
-        return [], set()
-
-@st.cache_data(ttl=3600, show_spinner="Procesando datos y optimizando memoria...")
+@st.cache_data(ttl=86400, show_spinner="Cargando y procesando datos optimizados...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     coleccion_dfs = []
     archivos_procesados = set()
 
-    # 1. Descargar archivos de Supabase usando el hash dinámico para refresco automático
+    # 1. Intentar descarga desde sistema local
     dfs_nube, archivos_procesados_nube = obtener_archivos_supabase(hash_archivos)
     if dfs_nube:
         coleccion_dfs.extend(dfs_nube)
         archivos_procesados.update(archivos_procesados_nube)
 
-    # 2. Cargar de la carpeta local (solo los que aún no estén en Supabase)
+    # 2. Descarga complementaria desde GitHub API
+    try:
+        respuesta = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+        if respuesta.status_code == 200:
+            archivos_github = respuesta.json()
+            lista_github = [
+                f["name"] for f in archivos_github 
+                if isinstance(f, dict) and (f["name"].endswith(".csv") or f["name"].endswith(".parquet"))
+                and f["name"].upper() not in archivos_procesados
+            ]
+            if lista_github:
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    res_gh = list(executor.map(descargar_y_procesar_archivo, lista_github))
+                coleccion_dfs.extend([d for d in res_gh if d is not None and not d.empty])
+    except Exception as e:
+        logger.error(f"Error consultando GitHub API: {e}")
+
+    # 3. Fallback/Lectura local si existen archivos
     carpeta_origen = "datos_semanales"
     if os.path.exists(carpeta_origen):
         archivos_locales = sorted(glob.glob(os.path.join(carpeta_origen, "*.csv")) + glob.glob(os.path.join(carpeta_origen, "*.xlsx")))
@@ -998,7 +904,6 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
                     coleccion_dfs.append(df_c)
 
     if not coleccion_dfs:
-        # Crea la estructura mínima vacía para que el flujo y las pestañas no se rompan
         cols_base = [
             "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
             "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
@@ -1010,20 +915,18 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
-    # Normalización de Fecha compatible con Números Serie de Excel (ej: 46203.45024 o 46203,45024)
+    # Normalización de Fecha
     col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
     if col_fecha and col_fecha in df.columns:
-        # Reemplazar comas por puntos en strings antes de convertir a numérico float
         serie_fecha_clean = df[col_fecha].astype(str).str.replace(',', '.', regex=False).str.strip()
         es_num = pd.to_numeric(serie_fecha_clean, errors='coerce')
-        
         fechas_excel = pd.to_datetime('1899-12-30') + pd.to_timedelta(es_num, unit='D', errors='coerce')
         fechas_texto = pd.to_datetime(df[col_fecha], errors='coerce', dayfirst=True, format='mixed')
         df["_datetime_parsed"] = fechas_excel.fillna(fechas_texto)
     else:
         df["_datetime_parsed"] = pd.NaT
 
-    # Detección y normalización de columnas principales
+    # Mapeo de Identificadores y Columnas
     col_os = detectar_columna_por_patrones(cols, LISTA_ALIAS_ORDEN)
     col_cta = detectar_columna_por_patrones(cols, LISTA_ALIAS_CUENTA)
     col_ot = detectar_columna_por_patrones(cols, LISTA_ALIAS_OT)
@@ -1033,7 +936,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     col_prov = detectar_columna_por_patrones(cols, LISTA_ALIAS_PROVEEDOR)
     col_dist = detectar_columna_por_patrones(cols, LISTA_ALIAS_DISTRITO)
     col_cluster = detectar_columna_por_patrones(cols, LISTA_ALIAS_CLUSTER)
-        
+
     serie_os = df[col_os].apply(sanitizar_folio_identificador) if col_os else "SIN_OS"
     serie_cta = df[col_cta].apply(sanitizar_folio_identificador) if col_cta else "SIN_CTA"
     serie_ot = df[col_ot].apply(sanitizar_folio_identificador) if col_ot else "SIN_OT"
@@ -1041,10 +944,10 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
 
     df["FOLIO_KEY"] = serie_os.astype(str) + "_" + serie_cta.astype(str) + "_" + serie_ot.astype(str) + "_" + serie_tipo.astype(str)
     df["Cuenta_Cliente"] = serie_cta.astype(str)
-    
+
     serie_u = df[col_usr].apply(sanitizar_cadena_texto) if col_usr else "SIN ESPECIFICAR"
     serie_n = df[col_nom].apply(sanitizar_cadena_texto) if col_nom else "SIN ESPECIFICAR"
-    
+
     df["Usuario_Tecnico"] = np.where(
         (serie_u != "SIN ESPECIFICAR") & (serie_n != "SIN ESPECIFICAR"),
         serie_u + " | " + serie_n,
@@ -1067,11 +970,10 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         df["Codigo_Poliza"] = ""
         df["Nombre_Poliza"] = "NO VALIDO"
 
-    # Extracción y Dimensiones Temporales Robusta (Prioridad: Nombre del archivo)
+    # Dimensiones Temporales
     semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(0, index=df.index)
     semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
 
-    # Si la extracción del nombre da >0 la toma, si no, usa el respaldo ISO de la fecha
     df["Num_Semana_Archivo"] = np.where(
         semanas_archivo > 0, 
         semanas_archivo, 
@@ -1081,14 +983,13 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
     df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
     df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO)
-    
+
     dates_valid = df["_datetime_parsed"].dropna()
     df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
     if not dates_valid.empty:
         df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
 
     df = calcular_reincidencias_vectorizadas(df)
-
     return df
 
 # ==============================================================================
@@ -1189,7 +1090,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         "📊 Desglose por Pólizas",
         "🏆 Ranking de Cuadrillas / Técnicos",
         "📥 Descarga de Reportes",
-        "☁️ Cargar Datos (Supabase)"
+        "📂 Cargar Datos Localmente"
     ])
 
     # --------------------------------------------------------------------------
@@ -1370,7 +1271,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
     with sub_tab5:
         CLAVE_ACCESO_CARGA = "Totalplay1#Norte"
 
-        st.subheader("🚀 Cargar Nueva Semana a Supabase Storage")
+        st.subheader("🚀 Cargar Nueva Semana a sistema local")
 
         nombre_archivo_input = st.text_input(
             "Nombre del archivo CSV (ej. CIERRE DIARIO SEM 26 2026):", 
@@ -1391,10 +1292,10 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
             if not nombre_archivo_input.strip() or not contenido_csv_input.strip():
                 st.warning("⚠️ Debe proporcionar tanto el nombre del archivo como el contenido CSV.")
             elif clave_ingresada != CLAVE_ACCESO_CARGA:
-                st.error("❌ Clave de autorización incorrecta. No se realizaron cambios en Supabase.")
+                st.error("❌ Clave de autorización incorrecta. No se realizaron cambios en sistema local.")
             else:
                 try:
-                    with st.spinner("Procesando y subiendo datos a Supabase Storage..."):
+                    with st.spinner("Procesando y subiendo datos a sistema local..."):
                         nombre_f = nombre_archivo_input.strip()
                         if not nombre_f.lower().endswith(".csv"):
                             nombre_f += ".csv"
@@ -1409,7 +1310,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
                         st.success(f"✅ ¡Archivo '{nombre_f}' guardado y subido con éxito! El caché ha sido actualizado.")
                         st.balloons()
                 except Exception as e:
-                    st.error(f"❌ Error al intentar subir el archivo a Supabase: {e}")
+                    st.error(f"❌ Error al intentar subir el archivo a sistema local: {e}")
 
 
 @st.dialog("Detalle Ampliado de Reincidencia por Usuario", width="large")
@@ -1627,7 +1528,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
 
 
 def guardar_y_reemplazar_semana_texto(nombre_semana: str, texto_datos: str) -> bool:
-    """Procesa el buffer en texto plano e interactúa con Supabase Storage de manera atómica."""
+    """Procesa el buffer en texto plano e interactúa con sistema local de manera atómica."""
     try:
         texto_limpio = texto_datos.strip()
         if not texto_limpio:
@@ -1664,11 +1565,11 @@ def guardar_y_reemplazar_semana_texto(nombre_semana: str, texto_datos: str) -> b
             st.cache_data.clear()
             return True
         else:
-            st.error("No hay una conexión activa con Supabase.")
+            st.error("No hay una conexión activa con sistema local.")
             return False
 
     except Exception as e:
-        st.error(f"Error crítico al subir la semana a Supabase: {e}")
+        st.error(f"Error crítico al subir la semana a sistema local: {e}")
         return False
 # ==============================================================================
 # 8. NAVEGACIÓN PRINCIPAL
@@ -1813,7 +1714,7 @@ def main() -> None:
     df_raw = ejecutar_pipeline_ingestion_datos(hash_actual)
 
     if df_raw.empty:
-        st.error("⚠️ No hay datos disponibles para procesar en Supabase o en la carpeta 'datos_semanales'. Verifique las conexiones y archivos.")
+        st.error("⚠️ No hay datos disponibles para procesar en sistema local o en la carpeta 'datos_semanales'. Verifique las conexiones y archivos.")
         return
 
     # --------------------------------------------------------------------------
