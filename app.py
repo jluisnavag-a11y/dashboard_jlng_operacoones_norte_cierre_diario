@@ -8,6 +8,7 @@ import re
 import io
 import glob
 import logging
+import base64
 import requests
 import numpy as np
 import pandas as pd
@@ -1313,11 +1314,11 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         st.download_button("📄 Descargar Dataset (CSV)", csv_bytes, f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv")
 
 # ==============================================================================
-# MÓDULO DE CARGA DIRECTA A GITHUB + BITÁCORA + DEDUPLICACIÓN
+# MÓDULO DE CARGA DIRECTA A GITHUB + BITÁCORA + DEDUPLICACIÓN (REPOSITORIO PRIVADO)
 # ==============================================================================
 
 def renderizar_modulo_carga_github():
-    st.markdown("### Cargar Nueva Semana a GitHub")
+    st.markdown("### ☁️ Cargar Nueva Semana a GitHub (Repositorio Privado)")
     
     col_nom, col_pwd = st.columns([2, 1])
     with col_nom:
@@ -1326,28 +1327,32 @@ def renderizar_modulo_carga_github():
             value="CIERRE DIARIO SEM 27 2026"
         )
     with col_pwd:
-        token_auth = st.text_input("Clave de autorización:", type="password")
+        token_auth = st.text_input("Clave de autorización del portal:", type="password")
 
     contenido_txt = st.text_area(
         "Pega el contenido copiado directamente desde Excel para subir el archivo CSV a la nube:",
         height=180
     )
 
-    if st.button("Guardar y Subir a GitHub"):
-        # Validaciones de entrada
+    if st.button("🚀 Guardar y Subir a GitHub", type="primary"):
+        # 1. Validaciones de entrada y token
         clave_correcta = st.secrets.get("UPLOAD_PASSWORD", "admin123")
         if token_auth != clave_correcta:
-            st.error("Clave de autorización incorrecta.")
+            st.error("❌ Clave de autorización incorrecta.")
             return
 
         if not contenido_txt.strip():
-            st.error("El contenido a procesar no puede estar vacío.")
+            st.error("⚠️ El contenido a procesar no puede estar vacío.")
+            return
+
+        if not GITHUB_TOKEN:
+            st.error("⚠️ No se ha detectado el token de GitHub en .streamlit/secrets.toml")
             return
 
         nombre_clean = nombre_archivo_input.strip()
         nombre_csv = nombre_clean if nombre_clean.lower().endswith(".csv") else f"{nombre_clean}.csv"
 
-        # Parseo de CSV en memoria
+        # 2. Parseo de CSV en memoria
         try:
             from io import StringIO
             df_nuevo = pd.read_csv(StringIO(contenido_txt), sep=None, engine="python", dtype=str)
@@ -1357,17 +1362,17 @@ def renderizar_modulo_carga_github():
 
         total_filas_recibidas = len(df_nuevo)
 
-        # Descarga de Parquet actual para evaluación de duplicados
+        # 3. Descarga de Parquet actual con autenticación
         url_parquet = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
         df_actual = pd.DataFrame()
         try:
             resp = requests.get(url_parquet, headers=HEADERS, timeout=15)
             if resp.status_code == 200:
                 df_actual = pd.read_parquet(io.BytesIO(resp.content))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"No se pudo consultar Parquet remoto previo: {e}")
 
-        # Concatenación y deduplicación por clave primaria
+        # 4. Concatenación y deduplicación por clave primaria
         df_combinado = pd.concat([df_actual, df_nuevo], ignore_index=True) if not df_actual.empty else df_nuevo
         if "FOLIO_KEY" in df_combinado.columns and "FECHA_TRUNCADA" in df_combinado.columns:
             df_dedup = df_combinado.drop_duplicates(subset=["FOLIO_KEY", "FECHA_TRUNCADA"], keep="first")
@@ -1377,18 +1382,19 @@ def renderizar_modulo_carga_github():
         filas_nuevas_agregadas = len(df_dedup) - len(df_actual) if not df_actual.empty else len(df_dedup)
         duplicados_omitidos = total_filas_recibidas - filas_nuevas_agregadas
 
-        # Envío del nuevo CSV a GitHub vía API
-        ruta_github_csv = f"datos_semanales/{nombre_csv}"
-        url_api_csv = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{ruta_github_csv}"
+        # 5. Envío vía REST API usando la carpeta y rama dinámicas
+        ruta_github_csv = f"{GITHUB_FOLDER}/{nombre_csv}"
+        url_api_csv = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{ruta_github_csv}"
 
-        res_check = requests.get(url_api_csv, headers=HEADERS)
+        # Obtener el SHA si el archivo ya existe en la rama de destino
+        res_check = requests.get(f"{url_api_csv}?ref={GITHUB_BRANCH}", headers=HEADERS)
         sha_csv = res_check.json().get("sha") if res_check.status_code == 200 else None
 
         contenido_b64 = base64.b64encode(contenido_txt.encode("utf-8")).decode("utf-8")
         payload_csv = {
-            "message": f"Añadir {nombre_csv} desde portal web",
+            "message": f"Añadir/Actualizar {nombre_csv} desde portal web",
             "content": contenido_b64,
-            "branch": "main"
+            "branch": GITHUB_BRANCH
         }
         if sha_csv:
             payload_csv["sha"] = sha_csv
@@ -1396,10 +1402,10 @@ def renderizar_modulo_carga_github():
         r_csv = requests.put(url_api_csv, json=payload_csv, headers=HEADERS)
 
         if r_csv.status_code in [200, 201]:
-            st.success(f"Archivo {nombre_csv} subido exitosamente a GitHub.")
-            st.info(f"Registros recibidos: {total_filas_recibidas:,} | Nuevos agregados: {filas_nuevas_agregadas:,} | Duplicados omitidos: {duplicados_omitidos:,}")
+            st.success(f"✅ Archivo **{nombre_csv}** subido exitosamente a GitHub ({GITHUB_USER}/{GITHUB_REPO}).")
+            st.info(f"📊 Registros recibidos: {total_filas_recibidas:,} | Nuevos agregados: {filas_nuevas_agregadas:,} | Duplicados omitidos: {duplicados_omitidos:,}")
             
-            # Renderizar Bitácora inmediata
+            # Bitácora inmediata
             bitacora_data = pd.DataFrame([{
                 "Nombre Archivo": nombre_csv,
                 "Total Registros": f"{total_filas_recibidas:,}",
@@ -1412,7 +1418,7 @@ def renderizar_modulo_carga_github():
             
             st.cache_data.clear()
         else:
-            st.error(f"Error en la API de GitHub: {r_csv.text}")
+            st.error(f"❌ Error API GitHub ({r_csv.status_code}): {r_csv.text}")
             
 
 @st.dialog("Detalle Ampliado de Reincidencia por Usuario", width="large")
@@ -1822,53 +1828,53 @@ def main() -> None:
     # --------------------------------------------------------------------------
     # BARRA LATERAL (SIDEBAR DE FILTROS A LA IZQUIERDA)
     # --------------------------------------------------------------------------
-    st.sidebar.markdown("### 📅 Granularidad Temporal")
+    st.sidebar.markdown("### 📅 Dimensión Temporal")
     dimension_sel = st.sidebar.radio(
         "Agrupar tiempo por:",
         ["SEMANA_DIM", "FECHA_TRUNCADA", "MES_DIM", "AÑO_DIM"],
         index=0,
         format_func=lambda x: {
-            "SEMANA_DIM": "Semana (Semana 01)",
-            "FECHA_TRUNCADA": "Fecha Truncada (dd.mm.2026)",
-            "MES_DIM": "Mes (mmmm)",
-            "AÑO_DIM": "Año (2026)"
+            "SEMANA_DIM": "Semana",
+            "FECHA_TRUNCADA": "Día",
+            "MES_DIM": "Mes",
+            "AÑO_DIM": "Año"
         }[x]
     )
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🔍 Multifiltros Dinámicos")
+    st.sidebar.markdown("### 🔍 Filtos Dinámicos")
 
     df_temp = df_raw.copy()
 
     meses_disponibles = [m for m in LISTA_ORDENADA_MESES if m in df_temp["MES_DIM"].unique()]
-    filtro_meses_sel = st.sidebar.multiselect("📅 Mes:", meses_disponibles)
+    filtro_meses_sel = st.sidebar.multiselect("Mes:", meses_disponibles)
     if filtro_meses_sel:
         df_temp = df_temp[df_temp["MES_DIM"].isin(filtro_meses_sel)]
 
     semanas_disponibles = sorted([str(s) for s in df_temp["SEMANA_DIM"].dropna().unique()])
-    filtro_semanas_sel = st.sidebar.multiselect("📅 Semana:", semanas_disponibles)
+    filtro_semanas_sel = st.sidebar.multiselect("Semana:", semanas_disponibles)
     if filtro_semanas_sel:
         df_temp = df_temp[df_temp["SEMANA_DIM"].isin(filtro_semanas_sel)]
 
     polizas_existentes = sorted([k for k in df_temp["Codigo_Poliza"].unique() if k in MAPEO_POLIZAS])
     opciones_poliza = [f"{cod} - {MAPEO_POLIZAS[cod]}" for cod in polizas_existentes]
-    filtro_polizas_sel = st.sidebar.multiselect("📌 Pólizas:", opciones_poliza)
+    filtro_polizas_sel = st.sidebar.multiselect("Pólizas:", opciones_poliza)
     codigos_poliza_sel = [p.split(" - ")[0] for p in filtro_polizas_sel]
     if codigos_poliza_sel:
         df_temp = df_temp[df_temp["Codigo_Poliza"].isin(codigos_poliza_sel)]
 
     tipos_eventos = sorted(list(df_temp["Tipo_Orden"].unique()))
-    filtro_eventos_sel = st.sidebar.multiselect("📌 Tipo de Evento / Orden:", tipos_eventos)
+    filtro_eventos_sel = st.sidebar.multiselect("Tipo de Evento / Orden:", tipos_eventos)
     if filtro_eventos_sel:
         df_temp = df_temp[df_temp["Tipo_Orden"].isin(filtro_eventos_sel)]
 
     distritos = sorted(list(df_temp["Distrito"].unique()))
-    filtro_distritos = st.sidebar.multiselect("📍 Distrito / Zona:", distritos)
+    filtro_distritos = st.sidebar.multiselect("Distrito / Zona:", distritos)
     if filtro_distritos:
         df_temp = df_temp[df_temp["Distrito"].isin(filtro_distritos)]
 
     empresas = sorted(list(df_temp["Empresa"].unique()))
-    filtro_empresas = st.sidebar.multiselect("🏢 Proveedor / Empresa:", empresas)
+    filtro_empresas = st.sidebar.multiselect("Proveedor / Empresa:", empresas)
     if filtro_empresas:
         df_temp = df_temp[df_temp["Empresa"].isin(filtro_empresas)]
 
@@ -1882,27 +1888,34 @@ def main() -> None:
     # --------------------------------------------------------------------------
     # PESTAÑAS PRINCIPALES
     # --------------------------------------------------------------------------
-    
-    tab1, tab2, tab3, tab4 = st.tabs([
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 Pólizas & Cuadrillas",
         "🔄 Reincidencias Total",
         "🛠️ Cambios de equipo",
-        "🎧 Causa & Solución soporte"
+        "🎧 Causa & Solución soporte",
+        "☁️ Cargar a GitHub"
     ])
 
     with tab1:
-        renderizar_pestana_polizas_cuadrillas(df_folios, dimension_sel)
+      renderizar_pestana_polizas_cuadrillas(df_folios, dimension_sel)
 
     with tab2:
-        renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
+      renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
 
     with tab3:
-        st.markdown("### 🛠️ Cambios de equipo")
-        st.info("ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas cuando gustes construirlo.")
+      st.markdown("### 🛠️ Cambios de equipo")
+      st.info(
+          "ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas"
+          " cuando gustes construirlo."
+      )
 
     with tab4:
-        st.markdown("### 🎧 Causa & Solución soporte")
-        st.info("ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas cuando gustes construirlo.")
+      st.markdown("### 🎧 Causa & Solución soporte")
+      st.info(
+          "ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas"
+          " cuando gustes construirlo."
+      )
 
-if __name__ == "__main__":
-    main()
+    with tab5:
+      renderizar_modulo_carga_github()
