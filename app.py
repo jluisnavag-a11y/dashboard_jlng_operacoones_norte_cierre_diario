@@ -27,7 +27,7 @@ logger = logging.getLogger("ControlCuadrillas.Monolith")
 import gc
 
 # -----------------------------------------------------------------------------
-# 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA DESDE GITHUB (RAM ULTRA-LEAN)
+# 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA (REMOTO PARQUET + LOCAL + GITHUB API)
 # -----------------------------------------------------------------------------
 gh_cfg = st.secrets.get("github", {})
 GITHUB_USER = gh_cfg.get("user", "jluisnavag-a11y")
@@ -41,8 +41,8 @@ GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/cont
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}"
 
 
-def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
-    """Descarga e ingesta de archivos con gestión eficiente de memoria."""
+def descargar_y_procesar_archivo(nombre_archivo: str) -> Optional[pd.DataFrame]:
+    """Descarga e ingesta individual de archivos remotos en fallback."""
     try:
         resp = requests.get(f"{GITHUB_RAW_BASE}/{nombre_archivo}", headers=HEADERS, timeout=10)
         if resp.status_code == 200:
@@ -61,49 +61,95 @@ def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
                 return df_temp
     except Exception as e:
         if 'logger' in globals():
-            logger.error(f"Error procesando {nombre_archivo}: {e}")
+            logger.error(f"Error procesando remotos {nombre_archivo}: {e}")
     return None
 
 
-@st.cache_data(ttl=86400, show_spinner="Cargando datos optimizados desde GitHub...")
+@st.cache_data(ttl=86400, show_spinner="⚡ Cargando dataset...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
-    cols_base = ["FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"]
-    coleccion_dfs = []
+    cols_base = [
+        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
+        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
+        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+    ]
 
+    # -------------------------------------------------------------------------
+    # ESTRATEGIA 1: PARQUET CONSOLIDADO REMOTO (Si existe y está completo en GitHub)
+    # -------------------------------------------------------------------------
+    url_parquet_remoto = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
     try:
-        resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+        resp = requests.get(url_parquet_remoto, headers=HEADERS, timeout=15)
         if resp.status_code == 200:
-            archivos_github = resp.json()
-            
-            # 1. Priorizar Master Parquet si existe
-            consolidado = [
-                f["name"] for f in archivos_github 
-                if isinstance(f, dict) and f["name"].lower() in ("datos_consolidados.parquet", "historico_master.parquet")
-            ]
-            
-            if consolidado:
-                df_master = descargar_y_procesar_archivo(consolidado[0])
-                if df_master is not None and not df_master.empty:
-                    coleccion_dfs.append(df_master)
-            else:
-                # 2. Descargar únicamente los últimos 3 archivos recientes para evitar saturar RAM
-                todos_los_archivos = [
-                    f["name"] for f in archivos_github 
-                    if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
-                ]
-                lista_archivos = sorted(todos_los_archivos, reverse=True)[:3]
-                
-                if lista_archivos:
-                    with ThreadPoolExecutor(max_workers=3) as executor:
-                        resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
-                    coleccion_dfs.extend([df for df in resultados if df is not None and not df.empty])
+            df = pd.read_parquet(io.BytesIO(resp.content))
+            # Verificar que el Parquet tenga las transformaciones hechas
+            if not df.empty and "MES_DIM" in df.columns:
+                return df
     except Exception as e:
         if 'logger' in globals():
-            logger.error(f"Error conectando con GitHub API: {e}")
+            logger.warning(f"No se pudo descargar Parquet unificado remoto: {e}")
+
+    # -------------------------------------------------------------------------
+    # ESTRATEGIA 2: LECTURA EN DISCO LOCAL (Desarrollo local)
+    # -------------------------------------------------------------------------
+    archivo_parquet_local = os.path.join("datos_semanales", "datos_consolidados.parquet")
+    if os.path.exists(archivo_parquet_local):
+        try:
+            df_parquet = pd.read_parquet(archivo_parquet_local)
+            if not df_parquet.empty and "MES_DIM" in df_parquet.columns:
+                return df_parquet
+        except Exception as e:
+            if 'logger' in globals():
+                logger.warning(f"No se pudo leer Parquet local: {e}")
+
+    coleccion_dfs = []
+    ruta_carpeta = "datos_semanales"
+    if os.path.exists(ruta_carpeta):
+        archivos_locales = [
+            os.path.join(ruta_carpeta, f) 
+            for f in os.listdir(ruta_carpeta) 
+            if f.lower().endswith(('.csv', '.parquet')) and f != "datos_consolidados.parquet"
+        ]
+        for ruta in archivos_locales:
+            try:
+                nombre_f = os.path.basename(ruta)
+                if ruta.endswith('.parquet'):
+                    df_loc = pd.read_parquet(ruta)
+                else:
+                    df_loc = pd.read_csv(ruta, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
+                
+                if df_loc is not None and not df_loc.empty:
+                    df_loc["Archivo_Origen"] = nombre_f
+                    coleccion_dfs.append(df_loc)
+            except Exception as e:
+                if 'logger' in globals():
+                    logger.error(f"Error cargando archivo local {ruta}: {e}")
+
+    # -------------------------------------------------------------------------
+    # ESTRATEGIA 3: FALLBACK A GITHUB API POR LOTES
+    # -------------------------------------------------------------------------
+    if not coleccion_dfs:
+        try:
+            resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+            lista_archivos = [
+                f["name"] for f in resp.json() 
+                if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet")) and f["name"] != "datos_consolidados.parquet"
+            ] if resp.status_code == 200 else []
+        except Exception as e:
+            if 'logger' in globals():
+                logger.error(f"Error conectando con GitHub API: {e}")
+            lista_archivos = []
+
+        if lista_archivos:
+            with ThreadPoolExecutor(max_workers=25) as executor:
+                resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
+            coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
 
     if not coleccion_dfs:
         return pd.DataFrame(columns=cols_base)
 
+    # -------------------------------------------------------------------------
+    # TRANSFORMACIÓN Y UNIFICACIÓN DE DATOS (Crea MES_DIM, Pólizas, Fechas, etc.)
+    # -------------------------------------------------------------------------
     df = pd.concat(coleccion_dfs, ignore_index=True)
     coleccion_dfs.clear()
     gc.collect()
@@ -111,12 +157,12 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
-    # Helpers seguros de unificación
+    # Helpers de sanitización
     get_col = lambda alias: detectar_columna_por_patrones(cols, alias) if 'detectar_columna_por_patrones' in globals() else None
     sanit_fol = lambda s: s.apply(sanitizar_folio_identificador) if 'sanitizar_folio_identificador' in globals() else s
     sanit_txt = lambda s: s.apply(sanitizar_cadena_texto) if 'sanitizar_cadena_texto' in globals() else s
 
-    # Parseo de Fechas (Excel Serie / Mixto)
+    # Parseo de Fechas
     col_fecha = get_col(LISTA_ALIAS_CREACION if 'LISTA_ALIAS_CREACION' in globals() else [])
     if col_fecha and col_fecha in df.columns:
         s_clean = pd.to_numeric(df[col_fecha].astype(str).str.replace(",", ".", regex=False).str.strip(), errors="coerce")
@@ -124,7 +170,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     else:
         df["_datetime_parsed"] = pd.NaT
 
-    # Mapeo y Detección de Columnas Principales
+    # Columnas Principales
     c_os, c_cta, c_ot, c_tipo = get_col(LISTA_ALIAS_ORDEN if 'LISTA_ALIAS_ORDEN' in globals() else []), get_col(LISTA_ALIAS_CUENTA if 'LISTA_ALIAS_CUENTA' in globals() else []), get_col(LISTA_ALIAS_OT if 'LISTA_ALIAS_OT' in globals() else []), get_col(LISTA_ALIAS_TIPO if 'LISTA_ALIAS_TIPO' in globals() else [])
     c_usr, c_nom, c_prov, c_dist, c_cluster = get_col(LISTA_ALIAS_USUARIO if 'LISTA_ALIAS_USUARIO' in globals() else []), get_col(LISTA_ALIAS_NOMBRE if 'LISTA_ALIAS_NOMBRE' in globals() else []), get_col(LISTA_ALIAS_PROVEEDOR if 'LISTA_ALIAS_PROVEEDOR' in globals() else []), get_col(LISTA_ALIAS_DISTRITO if 'LISTA_ALIAS_DISTRITO' in globals() else []), get_col(LISTA_ALIAS_CLUSTER if 'LISTA_ALIAS_CLUSTER' in globals() else [])
 
@@ -174,6 +220,14 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
 
     if 'calcular_reincidencias_vectorizadas' in globals():
         df = calcular_reincidencias_vectorizadas(df)
+
+    # AUTO-GUARDADO: Si se procesaron CSVs, guarda el Parquet con TODAS sus columnas
+    try:
+        if os.path.exists("datos_semanales"):
+            df.to_parquet(archivo_parquet_local, index=False)
+    except Exception as e:
+        if 'logger' in globals():
+            logger.error(f"Error al guardar Parquet local: {e}")
 
     return df
 
@@ -693,7 +747,7 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
             orientation="h", yanchor="top", y=-0.22, xanchor="center", x=0.5,
             font=dict(size=11, color="#000000")
         ),
-        xaxis=dict(
+        xaxis=dict( 
             showgrid=False, linecolor=PALETA_COLOR["azul_marina"],
             tickfont=dict(color="#000000", size=11, weight="bold"),
             type='category',
@@ -892,175 +946,79 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
             pass
     return "|".join(info)
 
-# ------------------------------------------------------------------------------
-# MOTOR DE INGESTIÓN Y DESCARGA (OPTIMIZADO SIN SUPABASE)
-# ------------------------------------------------------------------------------
-@st.cache_data(ttl=86400, show_spinner="Cargando y procesando datos optimizados...")
-def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
-    coleccion_dfs = []
-    archivos_procesados = set()
-
-    # 1. Descarga principal desde GitHub API (Optimizado: Consolidado primero / Filtro inteligente)
-    try:
-        respuesta = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=5)
-        if respuesta.status_code == 200:
-            archivos_github = respuesta.json()
+# =========================================================================
+    # REFACTOR INGESTA: LECTURA LOCAL OPTIMIZADA O FALLBACK A GITHUB API
+    # =========================================================================
+    ruta_carpeta = "datos_semanales"
+    
+    # 1. EVALUACIÓN Y PROCESAMIENTO LOCAL (Prioridad para alto rendimiento)
+    if os.path.exists(ruta_carpeta):
+        archivos_csv = [
+            os.path.join(ruta_carpeta, f) 
+            for f in os.listdir(ruta_carpeta) 
+            if f.lower().endswith('.csv')
+        ]
+        
+        if archivos_csv:
+            # Lectura vectorizada de archivos locales
+            df_unificado = pd.concat(
+                [pd.read_csv(f, low_memory=False) for f in archivos_csv], 
+                ignore_index=True
+            )
             
-            # A) Prioridad Máxima: Buscar si existe un consolidado histórico master
-            consolidado_master = [
-                f["name"] for f in archivos_github 
-                if isinstance(f, dict) and f["name"].lower() in ("datos_consolidados.parquet", "historico_master.parquet")
-            ]
+            # Exportación eficiente en binario columnar (Parquet)
+            archivo_parquet = "datos_consolidados.parquet"
+            df_unificado.to_parquet(archivo_parquet, index=False)
+            print(f"¡Éxito! Se consolidaron {len(archivos_csv)} archivos en '{archivo_parquet}'.")
+            
+            # Agregar al pipeline de procesamiento principal
+            coleccion_dfs.append(df_unificado)
 
-            if consolidado_master:
-                # Si existe, hace 1 sola llamada HTTP y procesa todo en milisegundos
-                print(f"⚡ [OPT] Cargando archivo consolidado único: {consolidado_master[0]}")
-                df_master = descargar_y_procesar_archivo(consolidado_master[0])
-                if df_master is not None and not df_master.empty:
-                    coleccion_dfs.append(df_master)
-            else:
-                # B) Fallback: Filtrar y descargar SOLO los 6 archivos semanales más recientes
-                todos_los_archivos = [
-                    f["name"] for f in archivos_github 
-                    if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
-                    and f["name"].upper() not in archivos_procesados
-                ]
-                
-                # Ordenar descendentemente para traer lo último primero y cortar exceso de peticiones
-                lista_github = sorted(todos_los_archivos, reverse=True)[:6]
-                
-                if lista_github:
-                    print(f"📥 [OPT] Descargando únicamente {len(lista_github)} archivos recientes de {len(todos_los_archivos)} encontrados.")
-                    with ThreadPoolExecutor(max_workers=4) as executor:
-                        res_gh = list(executor.map(descargar_y_procesar_archivo, lista_github))
-                    coleccion_dfs.extend([d for d in res_gh if d is not None and not d.empty])
+    # 2. DESCARGA REMOTA (Ejecuta solo si NO se procesaron archivos locales)
+    if not coleccion_dfs and 'archivos_para_procesar' in locals() and archivos_para_procesar:
+        bloques = [(archivos_para_procesar[i::MAX_WORKERS], f"Worker-{i}") for i in range(MAX_WORKERS)]
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(_descargar_bloque, b[0], b[1]) for b in bloques if b[0]]
+            for f in as_completed(futures):
+                for df_item in f.result():
+                    if df_item is not None and not df_item.empty:
+                        coleccion_dfs.append(df_item)
 
-    except Exception as e:
-        if "logger" in globals():
-            logger.error(f"Error consultando GitHub API: {e}")
-
-    # 2. Fallback / Lectura local si existen archivos en disco
-    carpeta_origen = "datos_semanales"
-    if os.path.exists(carpeta_origen):
-        archivos_locales = sorted(
-            glob.glob(os.path.join(carpeta_origen, "*.csv")) + 
-            glob.glob(os.path.join(carpeta_origen, "*.xlsx"))
-        )
-        for ruta in archivos_locales:
-            nombre_local = os.path.basename(ruta).upper()
-            if nombre_local not in archivos_procesados and "_cargar_archivo_robusto" in globals():
-                df_c = _cargar_archivo_robusto(ruta)
-                if df_c is not None and not df_c.empty:
-                    df_c["Archivo_Origen"] = os.path.basename(ruta)
-                    coleccion_dfs.append(df_c)
-
+    # =========================================================================
+    # DEFINICIÓN DE ESTRUCTURA BASE
+    # =========================================================================
     cols_base = [
         "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
         "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
         "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
     ]
-
-    if not coleccion_dfs:
-        return pd.DataFrame(columns=cols_base)
-
-    df = pd.concat(coleccion_dfs, ignore_index=True)
-    df.columns = [str(col).strip() for col in df.columns]
-    cols = list(df.columns)
-
-    # Helpers seguros de mapeo
-    detect_col = lambda alias: detectar_columna_por_patrones(cols, alias) if 'detectar_columna_por_patrones' in globals() else None
-    sanit_fol = lambda s: s.apply(sanitizar_folio_identificador) if 'sanitizar_folio_identificador' in globals() else s
-    sanit_txt = lambda s: s.apply(sanitizar_cadena_texto) if 'sanitizar_cadena_texto' in globals() else s
-
-    # Normalización de Fecha
-    col_fecha = detect_col(LISTA_ALIAS_CREACION if 'LISTA_ALIAS_CREACION' in globals() else [])
-    if col_fecha and col_fecha in df.columns:
-        serie_fecha_clean = df[col_fecha].astype(str).str.replace(',', '.', regex=False).str.strip()
-        es_num = pd.to_numeric(serie_fecha_clean, errors='coerce')
-        fechas_excel = pd.to_datetime('1899-12-30') + pd.to_timedelta(es_num, unit='D', errors='coerce')
-        fechas_texto = pd.to_datetime(df[col_fecha], errors='coerce', dayfirst=True, format='mixed')
-        df["_datetime_parsed"] = fechas_excel.fillna(fechas_texto)
-    else:
-        df["_datetime_parsed"] = pd.NaT
-
-    # Mapeo de Identificadores y Columnas
-    col_os = detect_col(LISTA_ALIAS_ORDEN if 'LISTA_ALIAS_ORDEN' in globals() else [])
-    col_cta = detect_col(LISTA_ALIAS_CUENTA if 'LISTA_ALIAS_CUENTA' in globals() else [])
-    col_ot = detect_col(LISTA_ALIAS_OT if 'LISTA_ALIAS_OT' in globals() else [])
-    col_tipo = detect_col(LISTA_ALIAS_TIPO if 'LISTA_ALIAS_TIPO' in globals() else [])
-    col_usr = detect_col(LISTA_ALIAS_USUARIO if 'LISTA_ALIAS_USUARIO' in globals() else [])
-    col_nom = detect_col(LISTA_ALIAS_NOMBRE if 'LISTA_ALIAS_NOMBRE' in globals() else [])
-    col_prov = detect_col(LISTA_ALIAS_PROVEEDOR if 'LISTA_ALIAS_PROVEEDOR' in globals() else [])
-    col_dist = detect_col(LISTA_ALIAS_DISTRITO if 'LISTA_ALIAS_DISTRITO' in globals() else [])
-    col_cluster = detect_col(LISTA_ALIAS_CLUSTER if 'LISTA_ALIAS_CLUSTER' in globals() else [])
-
-    serie_os = sanit_fol(df[col_os]) if col_os else "SIN_OS"
-    serie_cta = sanit_fol(df[col_cta]) if col_cta else "SIN_CTA"
-    serie_ot = sanit_fol(df[col_ot]) if col_ot else "SIN_OT"
-    serie_tipo = sanit_txt(df[col_tipo]) if col_tipo else "EVENTO GENERAL"
-
-    df["FOLIO_KEY"] = serie_os.astype(str) + "_" + serie_cta.astype(str) + "_" + serie_ot.astype(str) + "_" + serie_tipo.astype(str)
-    df["Cuenta_Cliente"] = serie_cta.astype(str)
-
-    serie_u = sanit_txt(df[col_usr]) if col_usr else "SIN ESPECIFICAR"
-    serie_n = sanit_txt(df[col_nom]) if col_nom else "SIN ESPECIFICAR"
-
-    df["Usuario_Tecnico"] = np.where(
-        (serie_u != "SIN ESPECIFICAR") & (serie_n != "SIN ESPECIFICAR"),
-        serie_u + " | " + serie_n,
-        np.where(serie_n != "SIN ESPECIFICAR", serie_n, serie_u)
-    )
-
-    df["Empresa"] = sanit_txt(df[col_prov]) if col_prov else "SIN PROVEEDOR"
-    df["Distrito"] = sanit_txt(df[col_dist]) if col_dist else "DISTRITO GENERAL"
-    df["Tipo_Orden"] = serie_tipo
-
-    df["Cluster_Raw"] = sanit_txt(df[col_cluster]) if col_cluster else "SIN CLUSTER"
-    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"]) if 'normalizar_clusters_vectorizado' in globals() else df["Cluster_Raw"]
-
-    col_origen_pol = col_usr if col_usr else col_nom
-    if col_origen_pol and 'MAPEO_POLIZAS' in globals():
-        sub_cods = df[col_origen_pol].astype(str).str[3:5]
-        df["Codigo_Poliza"] = np.where(sub_cods.isin(MAPEO_POLIZAS.keys()), sub_cods, "")
-        df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("NO VALIDO")
-    else:
-        df["Codigo_Poliza"] = ""
-        df["Nombre_Poliza"] = "NO VALIDO"
-
-    # Dimensiones Temporales
-    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns and 'extraer_numero_semana_archivo' in globals() else pd.Series(0, index=df.index)
-    semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
-
-    df["Num_Semana_Archivo"] = np.where(
-        semanas_archivo > 0, 
-        semanas_archivo, 
-        pd.to_numeric(semanas_iso, errors="coerce").fillna(0).astype(int)
-    )
-
-    anio_base = ANIO_BASE_ESTRICTO if 'ANIO_BASE_ESTRICTO' in globals() else 2026
-    mapeo_meses = MAPEO_MESES_TEXTO if 'MAPEO_MESES_TEXTO' in globals() else {}
-
-    df["AÑO_DIM"] = str(anio_base)
-    df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
-    df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(mapeo_meses).fillna("ENERO")
-
-    dates_valid = df["_datetime_parsed"].dropna()
-    df["FECHA_TRUNCADA"] = f"01.01.{anio_base}"
-    if not dates_valid.empty:
-        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{anio_base}")
-
-    if 'calcular_reincidencias_vectorizadas' in globals():
-        df = calcular_reincidencias_vectorizadas(df)
-
-    return df
-
+    # =========================================================================
+    # DEFINICIÓN DE ESTRUCTURA BASE
+    # =========================================================================
+    cols_base = [
+        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
+        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
+        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+    ]
+    
+    # =========================================================================
+    # DEFINICIÓN DE ESTRUCTURA BASE
+    # =========================================================================
+    cols_base = [
+        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
+        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
+        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+    ]
+    
 # ==============================================================================
 # CSS DE ALTO IMPACTO (COMPATIBLE CON STREAMLIT CLOUD Y LOCALHOST)
 # ==============================================================================
 
 def inyectar_estilos_base_ui():
     """Inyecta CSS global forzado usando selectores nativos de Streamlit (.stTabs)
-    para evitar bloqueos por Shadow DOM o librerías dinámicas de React/BaseWeb.
+    para garantizar contraste en modo oscuro, corregir etiquetas invisibles y
+    estilizar componentes UI sin depender de librerías externas.
     """
     st.markdown("""
         <style>
@@ -1096,7 +1054,7 @@ def inyectar_estilos_base_ui():
             font-weight: 600 !important;
         }
 
-        /* 3. HOVER */
+        /* 3. HOVER EN TABS */
         div[data-testid="stTabs"] button[role="tab"]:hover {
             background-color: #334155 !important;
             border-color: #475569 !important;
@@ -1122,8 +1080,27 @@ def inyectar_estilos_base_ui():
             display: none !important;
         }
 
-        /* 5. FIX PARA TEXTAREA Y INPUTS EN MODO OSCURO */
-        div[data-testid="stTextArea"] textarea, div[data-testid="stTextInput"] input {
+        /* 5. FIX DE CONTRASTE PARA LABELS DE FILTROS Y CONTROLES (MULTISELECT, SELECTBOX) */
+        div[data-widget="stMultiSelect"] label,
+        div[data-widget="stSelectbox"] label,
+        div[data-widget="stTextInput"] label,
+        div[data-widget="stTextArea"] label,
+        div[data-baseweb="select"] label {
+            color: #f1f5f9 !important;
+            font-weight: 600 !important;
+            font-size: 13px !important;
+            letter-spacing: 0.3px !important;
+            margin-bottom: 4px !important;
+        }
+
+        /* 6. FIX DE VISIBILIDAD DE TÍTULOS Y TEXTO EN MÓDULOS DE REINCIDENCIAS */
+        .stMarkdown p, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3, .stMarkdown h4 {
+            color: #f8fafc !important;
+        }
+
+        /* 7. FIX PARA TEXTAREA Y INPUTS EN MODO OSCURO */
+        div[data-testid="stTextArea"] textarea, 
+        div[data-testid="stTextInput"] input {
             background-color: #0f172a !important;
             color: #f8fafc !important;
             border: 1px solid #334155 !important;
@@ -1131,9 +1108,18 @@ def inyectar_estilos_base_ui():
             font-family: monospace !important;
         }
         
-        div[data-testid="stTextArea"] textarea:focus, div[data-testid="stTextInput"] input:focus {
+        div[data-testid="stTextArea"] textarea:focus, 
+        div[data-testid="stTextInput"] input:focus {
             border-color: #38bdf8 !important;
             box-shadow: 0 0 0 1px #38bdf8 !important;
+        }
+
+        /* 8. CONTENEDOR INTERNO DE DESPLEGABLES (INPUT BOX) */
+        div[data-baseweb="select"] > div {
+            background-color: #0f172a !important;
+            border-color: #334155 !important;
+            color: #f8fafc !important;
+            border-radius: 8px !important;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -1326,53 +1312,108 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         csv_bytes = df_folios.to_csv(index=False).encode("utf-8")
         st.download_button("📄 Descargar Dataset (CSV)", csv_bytes, f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv")
 
-    # --------------------------------------------------------------------------
-    # SUBTAB 5: CARGAR DATOS (SUPABASE)
-    # --------------------------------------------------------------------------
-    with sub_tab5:
-        CLAVE_ACCESO_CARGA = "Totalplay1#Norte"
+# ==============================================================================
+# MÓDULO DE CARGA DIRECTA A GITHUB + BITÁCORA + DEDUPLICACIÓN
+# ==============================================================================
 
-        st.subheader("🚀 Cargar Nueva Semana a sistema local")
-
+def renderizar_modulo_carga_github():
+    st.markdown("### Cargar Nueva Semana a GitHub")
+    
+    col_nom, col_pwd = st.columns([2, 1])
+    with col_nom:
         nombre_archivo_input = st.text_input(
-            "Nombre del archivo CSV (ej. CIERRE DIARIO SEM 26 2026):", 
+            "Nombre del archivo CSV (ej. CIERRE DIARIO SEM 27 2026):", 
             value="CIERRE DIARIO SEM 27 2026"
         )
+    with col_pwd:
+        token_auth = st.text_input("Clave de autorización:", type="password")
 
-        contenido_csv_input = st.text_area(
-            "Pega el contenido copiado directamente desde Excel para subir el archivo CSV a la nube:",
-            height=250
-        )
+    contenido_txt = st.text_area(
+        "Pega el contenido copiado directamente desde Excel para subir el archivo CSV a la nube:",
+        height=180
+    )
 
-        clave_ingresada = st.text_input(
-            "🔒 Ingrese la clave de autorización para confirmar la subida:", 
-            type="password"
-        )
+    if st.button("Guardar y Subir a GitHub"):
+        # Validaciones de entrada
+        clave_correcta = st.secrets.get("UPLOAD_PASSWORD", "admin123")
+        if token_auth != clave_correcta:
+            st.error("Clave de autorización incorrecta.")
+            return
 
-        if st.button("🚀 Guardar y Subir", type="primary", width="stretch"):
-            if not nombre_archivo_input.strip() or not contenido_csv_input.strip():
-                st.warning("⚠️ Debe proporcionar tanto el nombre del archivo como el contenido CSV.")
-            elif clave_ingresada != CLAVE_ACCESO_CARGA:
-                st.error("❌ Clave de autorización incorrecta. No se realizaron cambios en sistema local.")
-            else:
-                try:
-                    with st.spinner("Procesando y subiendo datos a sistema local..."):
-                        nombre_f = nombre_archivo_input.strip()
-                        if not nombre_f.lower().endswith(".csv"):
-                            nombre_f += ".csv"
-                        
-                        bytes_data = contenido_csv_input.encode("utf-8")
-                        res = supabase.storage.from_("Totalplay_datos_semanales").upload(
-                            path=nombre_f,
-                            file=bytes_data,
-                            file_options={"upsert": "true", "content-type": "text/csv"}
-                        )
-                        st.cache_data.clear()
-                        st.success(f"✅ ¡Archivo '{nombre_f}' guardado y subido con éxito! El caché ha sido actualizado.")
-                        st.balloons()
-                except Exception as e:
-                    st.error(f"❌ Error al intentar subir el archivo a sistema local: {e}")
+        if not contenido_txt.strip():
+            st.error("El contenido a procesar no puede estar vacío.")
+            return
 
+        nombre_clean = nombre_archivo_input.strip()
+        nombre_csv = nombre_clean if nombre_clean.lower().endswith(".csv") else f"{nombre_clean}.csv"
+
+        # Parseo de CSV en memoria
+        try:
+            from io import StringIO
+            df_nuevo = pd.read_csv(StringIO(contenido_txt), sep=None, engine="python", dtype=str)
+        except Exception as e:
+            st.error(f"Error parseando la información ingresada: {e}")
+            return
+
+        total_filas_recibidas = len(df_nuevo)
+
+        # Descarga de Parquet actual para evaluación de duplicados
+        url_parquet = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
+        df_actual = pd.DataFrame()
+        try:
+            resp = requests.get(url_parquet, headers=HEADERS, timeout=15)
+            if resp.status_code == 200:
+                df_actual = pd.read_parquet(io.BytesIO(resp.content))
+        except Exception:
+            pass
+
+        # Concatenación y deduplicación por clave primaria
+        df_combinado = pd.concat([df_actual, df_nuevo], ignore_index=True) if not df_actual.empty else df_nuevo
+        if "FOLIO_KEY" in df_combinado.columns and "FECHA_TRUNCADA" in df_combinado.columns:
+            df_dedup = df_combinado.drop_duplicates(subset=["FOLIO_KEY", "FECHA_TRUNCADA"], keep="first")
+        else:
+            df_dedup = df_combinado.drop_duplicates(keep="first")
+
+        filas_nuevas_agregadas = len(df_dedup) - len(df_actual) if not df_actual.empty else len(df_dedup)
+        duplicados_omitidos = total_filas_recibidas - filas_nuevas_agregadas
+
+        # Envío del nuevo CSV a GitHub vía API
+        ruta_github_csv = f"datos_semanales/{nombre_csv}"
+        url_api_csv = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{ruta_github_csv}"
+
+        res_check = requests.get(url_api_csv, headers=HEADERS)
+        sha_csv = res_check.json().get("sha") if res_check.status_code == 200 else None
+
+        contenido_b64 = base64.b64encode(contenido_txt.encode("utf-8")).decode("utf-8")
+        payload_csv = {
+            "message": f"Añadir {nombre_csv} desde portal web",
+            "content": contenido_b64,
+            "branch": "main"
+        }
+        if sha_csv:
+            payload_csv["sha"] = sha_csv
+
+        r_csv = requests.put(url_api_csv, json=payload_csv, headers=HEADERS)
+
+        if r_csv.status_code in [200, 201]:
+            st.success(f"Archivo {nombre_csv} subido exitosamente a GitHub.")
+            st.info(f"Registros recibidos: {total_filas_recibidas:,} | Nuevos agregados: {filas_nuevas_agregadas:,} | Duplicados omitidos: {duplicados_omitidos:,}")
+            
+            # Renderizar Bitácora inmediata
+            bitacora_data = pd.DataFrame([{
+                "Nombre Archivo": nombre_csv,
+                "Total Registros": f"{total_filas_recibidas:,}",
+                "Registros Únicos": f"{filas_nuevas_agregadas:,}",
+                "Duplicados Omitidos": f"{duplicados_omitidos:,}",
+                "Fecha de Carga": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            }])
+            st.markdown("#### Bitácora de Ingestión")
+            st.dataframe(bitacora_data, hide_index=True, use_container_width=True)
+            
+            st.cache_data.clear()
+        else:
+            st.error(f"Error en la API de GitHub: {r_csv.text}")
+            
 
 @st.dialog("Detalle Ampliado de Reincidencia por Usuario", width="large")
 def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
