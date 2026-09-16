@@ -53,6 +53,7 @@ supabase = get_supabase_client()
 # -----------------------------------------------------------------------------
 import io
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 # Datos del repositorio público en GitHub
 GITHUB_USER = "jluisnavag-a11y"
@@ -65,17 +66,34 @@ GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/cont
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}"
 
 
-@st.cache_data(ttl=3600, show_spinner="Consultando datos directamente desde el repositorio de GitHub...")
-def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
-    coleccion_dfs = []
+def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
+    """Descarga individual ejecutada en hilo paralelo para maximizar velocidad."""
+    url_raw = f"{GITHUB_RAW_BASE}/{nombre_archivo}"
+    try:
+        if nombre_archivo.endswith(".parquet"):
+            df_temp = pd.read_parquet(url_raw)
+        else:
+            try:
+                df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
+            except Exception:
+                df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
 
+        if df_temp is not None and not df_temp.empty:
+            df_temp["Archivo_Origen"] = nombre_archivo
+            return df_temp
+    except Exception as e:
+        logger.error(f"Error al procesar {nombre_archivo} desde GitHub: {e}")
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner="Consultando datos en paralelo desde GitHub...")
+def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     try:
         # 1. Consultar la API pública de GitHub para obtener la lista de archivos
         respuesta = requests.get(GITHUB_API_URL, timeout=10)
         
         if respuesta.status_code == 200:
             archivos_github = respuesta.json()
-            # Filtrar únicamente archivos CSV o Parquet
             lista_archivos = [
                 f["name"] for f in archivos_github 
                 if isinstance(f, dict) and (f["name"].endswith(".csv") or f["name"].endswith(".parquet"))
@@ -89,7 +107,6 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         lista_archivos = []
 
     if not lista_archivos:
-        # Retornar estructura base en caso de no encontrar archivos
         cols_base = [
             "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
             "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
@@ -97,22 +114,11 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         ]
         return pd.DataFrame(columns=cols_base)
 
-    # 2. Descargar y procesar cada archivo directamente vía URL Raw
-    for nombre_archivo in lista_archivos:
-        url_raw = f"{GITHUB_RAW_BASE}/{nombre_archivo}"
-        try:
-            if nombre_archivo.endswith(".parquet"):
-                df_temp = pd.read_parquet(url_raw)
-            else:
-                try:
-                    df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
-                except Exception:
-                    df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
+    # 2. Descarga multihilo en paralelo (reducirá drásticamente el tiempo de 57s a pocos segundos)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
 
-            df_temp["Archivo_Origen"] = nombre_archivo
-            coleccion_dfs.append(df_temp)
-        except Exception as e:
-            logger.error(f"Error al procesar {nombre_archivo} desde GitHub: {e}")
+    coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
 
     if not coleccion_dfs:
         cols_base = [
@@ -204,6 +210,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     df = calcular_reincidencias_vectorizadas(df)
 
     return df
+
 # -----------------------------------------------------------------------------
 # 0.3. EJECUCIÓN CONTINUA DEL DASHBOARD
 # -----------------------------------------------------------------------------
