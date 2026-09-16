@@ -40,7 +40,7 @@ GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO
 
 
 def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
-    """Descarga optimizada con soporte Parquet/CSV e inspección de errores."""
+    """Descarga optimizada con liberación inmediata de memoria (RAM eficiente)."""
     try:
         resp = requests.get(f"{GITHUB_RAW_BASE}/{nombre_archivo}", headers=HEADERS, timeout=10)
         if resp.status_code == 200:
@@ -49,13 +49,16 @@ def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
                 df_temp = pd.read_parquet(bytes_data)
             else:
                 try:
-                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
+                    df_temp = pd.read_csv(bytes_data, low_memory=True, dtype=str, encoding="utf-8", on_bad_lines="skip")
                 except Exception:
                     bytes_data.seek(0)
-                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
+                    df_temp = pd.read_csv(bytes_data, low_memory=True, dtype=str, encoding="latin1", on_bad_lines="skip")
 
             if df_temp is not None and not df_temp.empty:
                 df_temp["Archivo_Origen"] = nombre_archivo
+                # Downcast para optimizar consumo de RAM
+                for col in df_temp.select_dtypes(include=['object']).columns:
+                    df_temp[col] = df_temp[col].astype("category")
                 return df_temp
     except Exception as e:
         if 'logger' in globals():
