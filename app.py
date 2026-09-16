@@ -3,12 +3,21 @@
 # Archivo: app.py | Versión: 14.1.0-LIGHT-ENGINE (Ingestión GitHub Directa)
 # ==============================================================================
 
-import os, re, io, glob, logging, requests
+import os
+import re
+import io
+import glob
+import logging
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(page_title="Control Operativo Cuadrillas 2026", layout="wide")
