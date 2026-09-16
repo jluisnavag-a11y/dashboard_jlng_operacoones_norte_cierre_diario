@@ -58,28 +58,47 @@ def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
                 df_temp["Archivo_Origen"] = nombre_archivo
                 return df_temp
     except Exception as e:
-        logger.error(f"Error procesando {nombre_archivo}: {e}")
+        if 'logger' in globals():
+            logger.error(f"Error procesando {nombre_archivo}: {e}")
     return None
 
 
 @st.cache_data(ttl=86400, show_spinner="Cargando datos optimizados desde GitHub...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     cols_base = ["FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"]
-    
+    coleccion_dfs = []
+
     try:
         resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
-        lista_archivos = [f["name"] for f in resp.json() if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))] if resp.status_code == 200 else []
+        if resp.status_code == 200:
+            archivos_github = resp.json()
+            
+            # 1. Estrategia Consolidada: Priorizar archivo master Parquet único
+            consolidado = [
+                f["name"] for f in archivos_github 
+                if isinstance(f, dict) and f["name"].lower() in ("datos_consolidados.parquet", "historico_master.parquet")
+            ]
+            
+            if consolidado:
+                df_master = descargar_y_procesar_archivo(consolidado[0])
+                if df_master is not None and not df_master.empty:
+                    coleccion_dfs.append(df_master)
+            else:
+                # 2. Estrategia Semanal: Limitar descargas a los 4 archivos más recientes
+                todos_los_archivos = [
+                    f["name"] for f in archivos_github 
+                    if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
+                ]
+                lista_archivos = sorted(todos_los_archivos, reverse=True)[:4]
+                
+                if lista_archivos:
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
+                    coleccion_dfs.extend([df for df in resultados if df is not None and not df.empty])
     except Exception as e:
-        logger.error(f"Error conectando con GitHub API: {e}")
-        lista_archivos = []
+        if 'logger' in globals():
+            logger.error(f"Error conectando con GitHub API: {e}")
 
-    if not lista_archivos:
-        return pd.DataFrame(columns=cols_base)
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
-
-    coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
     if not coleccion_dfs:
         return pd.DataFrame(columns=cols_base)
 
@@ -876,20 +895,41 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     coleccion_dfs = []
     archivos_procesados = set()
 
-    # 1. Descarga principal desde GitHub API
+    # 1. Descarga principal desde GitHub API (Optimizado: Consolidado primero / Filtro inteligente)
     try:
-        respuesta = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+        respuesta = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=5)
         if respuesta.status_code == 200:
             archivos_github = respuesta.json()
-            lista_github = [
+            
+            # A) Prioridad Máxima: Buscar si existe un consolidado histórico master
+            consolidado_master = [
                 f["name"] for f in archivos_github 
-                if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
-                and f["name"].upper() not in archivos_procesados
+                if isinstance(f, dict) and f["name"].lower() in ("datos_consolidados.parquet", "historico_master.parquet")
             ]
-            if lista_github:
-                with ThreadPoolExecutor(max_workers=4) as executor:
-                    res_gh = list(executor.map(descargar_y_procesar_archivo, lista_github))
-                coleccion_dfs.extend([d for d in res_gh if d is not None and not d.empty])
+
+            if consolidado_master:
+                # Si existe, hace 1 sola llamada HTTP y procesa todo en milisegundos
+                print(f"⚡ [OPT] Cargando archivo consolidado único: {consolidado_master[0]}")
+                df_master = descargar_y_procesar_archivo(consolidado_master[0])
+                if df_master is not None and not df_master.empty:
+                    coleccion_dfs.append(df_master)
+            else:
+                # B) Fallback: Filtrar y descargar SOLO los 6 archivos semanales más recientes
+                todos_los_archivos = [
+                    f["name"] for f in archivos_github 
+                    if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
+                    and f["name"].upper() not in archivos_procesados
+                ]
+                
+                # Ordenar descendentemente para traer lo último primero y cortar exceso de peticiones
+                lista_github = sorted(todos_los_archivos, reverse=True)[:6]
+                
+                if lista_github:
+                    print(f"📥 [OPT] Descargando únicamente {len(lista_github)} archivos recientes de {len(todos_los_archivos)} encontrados.")
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        res_gh = list(executor.map(descargar_y_procesar_archivo, lista_github))
+                    coleccion_dfs.extend([d for d in res_gh if d is not None and not d.empty])
+
     except Exception as e:
         if "logger" in globals():
             logger.error(f"Error consultando GitHub API: {e}")
