@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 st.set_page_config(page_title="Control Operativo Cuadrillas 2026", layout="wide")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("ControlCuadrillas.Monolith")
+logger = logging.getLogger("ControlCuadrillas.Monolith")    
 
 # -----------------------------------------------------------------------------
 # 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA DESDE GITHUB
@@ -869,28 +869,21 @@ def obtener_hash_archivos_carpeta(carpeta: str) -> str:
     return "|".join(info)
 
 # ------------------------------------------------------------------------------
-# NUEVO (Descarga multihilo con motor C de alta velocidad):
+# MOTOR DE INGESTIÓN Y DESCARGA (OPTIMIZADO SIN SUPABASE)
 # ------------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="Descargando datos de la nube...")
 @st.cache_data(ttl=86400, show_spinner="Cargando y procesando datos optimizados...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     coleccion_dfs = []
     archivos_procesados = set()
 
-    # 1. Intentar descarga desde sistema local
-    dfs_nube, archivos_procesados_nube = obtener_archivos_supabase(hash_archivos)
-    if dfs_nube:
-        coleccion_dfs.extend(dfs_nube)
-        archivos_procesados.update(archivos_procesados_nube)
-
-    # 2. Descarga complementaria desde GitHub API
+    # 1. Descarga principal desde GitHub API
     try:
         respuesta = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
         if respuesta.status_code == 200:
             archivos_github = respuesta.json()
             lista_github = [
                 f["name"] for f in archivos_github 
-                if isinstance(f, dict) and (f["name"].endswith(".csv") or f["name"].endswith(".parquet"))
+                if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
                 and f["name"].upper() not in archivos_procesados
             ]
             if lista_github:
@@ -898,34 +891,44 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
                     res_gh = list(executor.map(descargar_y_procesar_archivo, lista_github))
                 coleccion_dfs.extend([d for d in res_gh if d is not None and not d.empty])
     except Exception as e:
-        logger.error(f"Error consultando GitHub API: {e}")
+        if "logger" in globals():
+            logger.error(f"Error consultando GitHub API: {e}")
 
-    # 3. Fallback/Lectura local si existen archivos
+    # 2. Fallback / Lectura local si existen archivos en disco
     carpeta_origen = "datos_semanales"
     if os.path.exists(carpeta_origen):
-        archivos_locales = sorted(glob.glob(os.path.join(carpeta_origen, "*.csv")) + glob.glob(os.path.join(carpeta_origen, "*.xlsx")))
+        archivos_locales = sorted(
+            glob.glob(os.path.join(carpeta_origen, "*.csv")) + 
+            glob.glob(os.path.join(carpeta_origen, "*.xlsx"))
+        )
         for ruta in archivos_locales:
             nombre_local = os.path.basename(ruta).upper()
-            if nombre_local not in archivos_procesados:
+            if nombre_local not in archivos_procesados and "_cargar_archivo_robusto" in globals():
                 df_c = _cargar_archivo_robusto(ruta)
                 if df_c is not None and not df_c.empty:
                     df_c["Archivo_Origen"] = os.path.basename(ruta)
                     coleccion_dfs.append(df_c)
 
+    cols_base = [
+        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
+        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
+        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+    ]
+
     if not coleccion_dfs:
-        cols_base = [
-            "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
-            "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
-            "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
-        ]
         return pd.DataFrame(columns=cols_base)
 
     df = pd.concat(coleccion_dfs, ignore_index=True)
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
+    # Helpers seguros de mapeo
+    detect_col = lambda alias: detectar_columna_por_patrones(cols, alias) if 'detectar_columna_por_patrones' in globals() else None
+    sanit_fol = lambda s: s.apply(sanitizar_folio_identificador) if 'sanitizar_folio_identificador' in globals() else s
+    sanit_txt = lambda s: s.apply(sanitizar_cadena_texto) if 'sanitizar_cadena_texto' in globals() else s
+
     # Normalización de Fecha
-    col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
+    col_fecha = detect_col(LISTA_ALIAS_CREACION if 'LISTA_ALIAS_CREACION' in globals() else [])
     if col_fecha and col_fecha in df.columns:
         serie_fecha_clean = df[col_fecha].astype(str).str.replace(',', '.', regex=False).str.strip()
         es_num = pd.to_numeric(serie_fecha_clean, errors='coerce')
@@ -936,26 +939,26 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         df["_datetime_parsed"] = pd.NaT
 
     # Mapeo de Identificadores y Columnas
-    col_os = detectar_columna_por_patrones(cols, LISTA_ALIAS_ORDEN)
-    col_cta = detectar_columna_por_patrones(cols, LISTA_ALIAS_CUENTA)
-    col_ot = detectar_columna_por_patrones(cols, LISTA_ALIAS_OT)
-    col_tipo = detectar_columna_por_patrones(cols, LISTA_ALIAS_TIPO)
-    col_usr = detectar_columna_por_patrones(cols, LISTA_ALIAS_USUARIO)
-    col_nom = detectar_columna_por_patrones(cols, LISTA_ALIAS_NOMBRE)
-    col_prov = detectar_columna_por_patrones(cols, LISTA_ALIAS_PROVEEDOR)
-    col_dist = detectar_columna_por_patrones(cols, LISTA_ALIAS_DISTRITO)
-    col_cluster = detectar_columna_por_patrones(cols, LISTA_ALIAS_CLUSTER)
+    col_os = detect_col(LISTA_ALIAS_ORDEN if 'LISTA_ALIAS_ORDEN' in globals() else [])
+    col_cta = detect_col(LISTA_ALIAS_CUENTA if 'LISTA_ALIAS_CUENTA' in globals() else [])
+    col_ot = detect_col(LISTA_ALIAS_OT if 'LISTA_ALIAS_OT' in globals() else [])
+    col_tipo = detect_col(LISTA_ALIAS_TIPO if 'LISTA_ALIAS_TIPO' in globals() else [])
+    col_usr = detect_col(LISTA_ALIAS_USUARIO if 'LISTA_ALIAS_USUARIO' in globals() else [])
+    col_nom = detect_col(LISTA_ALIAS_NOMBRE if 'LISTA_ALIAS_NOMBRE' in globals() else [])
+    col_prov = detect_col(LISTA_ALIAS_PROVEEDOR if 'LISTA_ALIAS_PROVEEDOR' in globals() else [])
+    col_dist = detect_col(LISTA_ALIAS_DISTRITO if 'LISTA_ALIAS_DISTRITO' in globals() else [])
+    col_cluster = detect_col(LISTA_ALIAS_CLUSTER if 'LISTA_ALIAS_CLUSTER' in globals() else [])
 
-    serie_os = df[col_os].apply(sanitizar_folio_identificador) if col_os else "SIN_OS"
-    serie_cta = df[col_cta].apply(sanitizar_folio_identificador) if col_cta else "SIN_CTA"
-    serie_ot = df[col_ot].apply(sanitizar_folio_identificador) if col_ot else "SIN_OT"
-    serie_tipo = df[col_tipo].apply(sanitizar_cadena_texto) if col_tipo else "EVENTO GENERAL"
+    serie_os = sanit_fol(df[col_os]) if col_os else "SIN_OS"
+    serie_cta = sanit_fol(df[col_cta]) if col_cta else "SIN_CTA"
+    serie_ot = sanit_fol(df[col_ot]) if col_ot else "SIN_OT"
+    serie_tipo = sanit_txt(df[col_tipo]) if col_tipo else "EVENTO GENERAL"
 
     df["FOLIO_KEY"] = serie_os.astype(str) + "_" + serie_cta.astype(str) + "_" + serie_ot.astype(str) + "_" + serie_tipo.astype(str)
     df["Cuenta_Cliente"] = serie_cta.astype(str)
 
-    serie_u = df[col_usr].apply(sanitizar_cadena_texto) if col_usr else "SIN ESPECIFICAR"
-    serie_n = df[col_nom].apply(sanitizar_cadena_texto) if col_nom else "SIN ESPECIFICAR"
+    serie_u = sanit_txt(df[col_usr]) if col_usr else "SIN ESPECIFICAR"
+    serie_n = sanit_txt(df[col_nom]) if col_nom else "SIN ESPECIFICAR"
 
     df["Usuario_Tecnico"] = np.where(
         (serie_u != "SIN ESPECIFICAR") & (serie_n != "SIN ESPECIFICAR"),
@@ -963,15 +966,15 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         np.where(serie_n != "SIN ESPECIFICAR", serie_n, serie_u)
     )
 
-    df["Empresa"] = df[col_prov].apply(sanitizar_cadena_texto) if col_prov else "SIN PROVEEDOR"
-    df["Distrito"] = df[col_dist].apply(sanitizar_cadena_texto) if col_dist else "DISTRITO GENERAL"
+    df["Empresa"] = sanit_txt(df[col_prov]) if col_prov else "SIN PROVEEDOR"
+    df["Distrito"] = sanit_txt(df[col_dist]) if col_dist else "DISTRITO GENERAL"
     df["Tipo_Orden"] = serie_tipo
 
-    df["Cluster_Raw"] = df[col_cluster].apply(sanitizar_cadena_texto) if col_cluster else "SIN CLUSTER"
-    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
+    df["Cluster_Raw"] = sanit_txt(df[col_cluster]) if col_cluster else "SIN CLUSTER"
+    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"]) if 'normalizar_clusters_vectorizado' in globals() else df["Cluster_Raw"]
 
     col_origen_pol = col_usr if col_usr else col_nom
-    if col_origen_pol:
+    if col_origen_pol and 'MAPEO_POLIZAS' in globals():
         sub_cods = df[col_origen_pol].astype(str).str[3:5]
         df["Codigo_Poliza"] = np.where(sub_cods.isin(MAPEO_POLIZAS.keys()), sub_cods, "")
         df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("NO VALIDO")
@@ -980,7 +983,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         df["Nombre_Poliza"] = "NO VALIDO"
 
     # Dimensiones Temporales
-    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(0, index=df.index)
+    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns and 'extraer_numero_semana_archivo' in globals() else pd.Series(0, index=df.index)
     semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
 
     df["Num_Semana_Archivo"] = np.where(
@@ -989,16 +992,21 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         pd.to_numeric(semanas_iso, errors="coerce").fillna(0).astype(int)
     )
 
-    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
+    anio_base = ANIO_BASE_ESTRICTO if 'ANIO_BASE_ESTRICTO' in globals() else 2026
+    mapeo_meses = MAPEO_MESES_TEXTO if 'MAPEO_MESES_TEXTO' in globals() else {}
+
+    df["AÑO_DIM"] = str(anio_base)
     df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
-    df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO)
+    df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(mapeo_meses).fillna("ENERO")
 
     dates_valid = df["_datetime_parsed"].dropna()
-    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
+    df["FECHA_TRUNCADA"] = f"01.01.{anio_base}"
     if not dates_valid.empty:
-        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
+        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{anio_base}")
 
-    df = calcular_reincidencias_vectorizadas(df)
+    if 'calcular_reincidencias_vectorizadas' in globals():
+        df = calcular_reincidencias_vectorizadas(df)
+
     return df
 
 # ==============================================================================
@@ -1043,7 +1051,7 @@ def inyectar_estilos_base_ui():
             font-weight: 600 !important;
         }
 
-        /* 3. HOVER (CUANDO EL MOUSE PASA POR ENCIMA) */
+        /* 3. HOVER */
         div[data-testid="stTabs"] button[role="tab"]:hover {
             background-color: #334155 !important;
             border-color: #475569 !important;
@@ -1052,7 +1060,7 @@ def inyectar_estilos_base_ui():
             color: #f8fafc !important;
         }
 
-        /* 4. PESTAÑA ACTIVA (SELECCIONADA) */
+        /* 4. PESTAÑA ACTIVA */
         div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
             background-color: #0284c7 !important;
             border-color: #38bdf8 !important;
@@ -1064,7 +1072,7 @@ def inyectar_estilos_base_ui():
             font-weight: 700 !important;
         }
 
-        /* ELIMINAR LÍNEA INFERIOR ROJA/AZUL NATIVA DE STREAMLIT */
+        /* ELIMINAR LÍNEA INFERIOR NATIVA DE STREAMLIT */
         div[data-testid="stTabs"] div[data-baseweb="tab-highlight"] {
             display: none !important;
         }
@@ -1084,7 +1092,6 @@ def inyectar_estilos_base_ui():
         }
         </style>
     """, unsafe_allow_html=True)
-
 
 # ==============================================================================
 # 7. VISTAS Y SECCIONES (OPTIMIZACIÓN VECTORIZADA DE ALTO RENDIMIENTO)
