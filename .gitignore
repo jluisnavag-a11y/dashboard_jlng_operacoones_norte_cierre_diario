@@ -1,1 +1,2 @@
 .streamlit/secrets.tomldatos_semanales/*.csv
+.streamlit/secrets.toml
