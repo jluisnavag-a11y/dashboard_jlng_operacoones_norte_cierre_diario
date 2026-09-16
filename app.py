@@ -49,48 +49,56 @@ def get_supabase_client() -> Optional[Client]:
 supabase = get_supabase_client()
 
 # -----------------------------------------------------------------------------
-# 0.2. MOTOR DE CONSULTA Y LECTURA DIRECTA DESDE GITHUB (PÚBLICO)
+# 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA DESDE GITHUB
 # -----------------------------------------------------------------------------
 import io
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
-# Datos del repositorio público en GitHub
-GITHUB_USER = "jluisnavag-a11y"
-GITHUB_REPO = "dashboard_jlng_operacoones_norte_cierre_diario"
-GITHUB_BRANCH = "main"
-GITHUB_FOLDER = "datos_semanales"
+# Lectura segura desde Secrets o Fallback público
+GITHUB_USER = st.secrets.get("github", {}).get("user", "jluisnavag-a11y")
+GITHUB_REPO = st.secrets.get("github", {}).get("repo", "dashboard_jlng_operacoones_norte_cierre_diario")
+GITHUB_BRANCH = st.secrets.get("github", {}).get("branch", "main")
+GITHUB_FOLDER = st.secrets.get("github", {}).get("folder", "datos_semanales")
+GITHUB_TOKEN = st.secrets.get("github", {}).get("token", "")
 
-# URLs de la API y Descarga Directa (Raw)
+# Encabezados con autenticación para evitar el Rate Limit de GitHub
+HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_FOLDER}?ref={GITHUB_BRANCH}"
 GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}"
 
 
 def descargar_y_procesar_archivo(nombre_archivo: str) -> pd.DataFrame:
-    """Descarga individual ejecutada en hilo paralelo para maximizar velocidad."""
+    """Descarga optimizada con soporte de sesión e inspección de errores."""
     url_raw = f"{GITHUB_RAW_BASE}/{nombre_archivo}"
     try:
-        if nombre_archivo.endswith(".parquet"):
-            df_temp = pd.read_parquet(url_raw)
-        else:
-            try:
-                df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
-            except Exception:
-                df_temp = pd.read_csv(url_raw, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
+        resp = requests.get(url_raw, headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            bytes_data = io.BytesIO(resp.content)
+            if nombre_archivo.endswith(".parquet"):
+                df_temp = pd.read_parquet(bytes_data)
+            else:
+                try:
+                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
+                except Exception:
+                    bytes_data.seek(0)
+                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
 
-        if df_temp is not None and not df_temp.empty:
-            df_temp["Archivo_Origen"] = nombre_archivo
-            return df_temp
+            if df_temp is not None and not df_temp.empty:
+                df_temp["Archivo_Origen"] = nombre_archivo
+                return df_temp
+        else:
+            logger.warning(f"Respuesta HTTP {resp.status_code} al descargar {nombre_archivo}")
     except Exception as e:
-        logger.error(f"Error al procesar {nombre_archivo} desde GitHub: {e}")
+        logger.error(f"Error procesando {nombre_archivo}: {e}")
     return None
 
 
-@st.cache_data(ttl=3600, show_spinner="Consultando datos en paralelo desde GitHub...")
+@st.cache_data(ttl=86400, show_spinner="Cargando datos optimizados desde GitHub...")
 def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     try:
-        # 1. Consultar la API pública de GitHub para obtener la lista de archivos
-        respuesta = requests.get(GITHUB_API_URL, timeout=10)
+        respuesta = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
         
         if respuesta.status_code == 200:
             archivos_github = respuesta.json()
@@ -99,7 +107,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
                 if isinstance(f, dict) and (f["name"].endswith(".csv") or f["name"].endswith(".parquet"))
             ]
         else:
-            logger.warning(f"No se pudo consultar la API de GitHub (Status Code: {respuesta.status_code}).")
+            logger.warning(f"Error en API GitHub ({respuesta.status_code}). Verifica Token o permisos.")
             lista_archivos = []
 
     except Exception as e:
@@ -114,8 +122,8 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         ]
         return pd.DataFrame(columns=cols_base)
 
-    # 2. Descarga multihilo en paralelo (reducirá drásticamente el tiempo de 57s a pocos segundos)
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # Concurrencia moderada (max_workers=4) para no saturar las conexiones de red
+    with ThreadPoolExecutor(max_workers=4) as executor:
         resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
 
     coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
@@ -188,7 +196,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         df["Codigo_Poliza"] = ""
         df["Nombre_Poliza"] = "NO VALIDO"
 
-    # Extracción y Dimensiones Temporales Robusta (Prioridad: Nombre del archivo)
+    # Extracción y Dimensiones Temporales Robusta
     semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(0, index=df.index)
     semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
 
