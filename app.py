@@ -53,91 +53,179 @@ supabase = get_supabase_client()
 CACHE_DIR = Path("/tmp/supabase_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-def _procesar_y_guardar_local(nombre_archivo, _supabase_client):
-    """Descarga y convierte a Parquet manejando cualquier codificación o corrupción de CSV"""
-    archivo_parquet = CACHE_DIR / f"{Path(nombre_archivo).stem}.parquet"
-    
-    # Si el archivo Parquet existe pero está vacío o corrupto, lo borramos para reintentar
-    if archivo_parquet.exists():
-        if archivo_parquet.stat().st_size > 0:
-            return archivo_parquet
-        else:
-            archivo_parquet.unlink()
+@st.cache_data(ttl=3600, show_spinner="Comprobando datos en Supabase Storage...")
+def obtener_archivos_supabase(hash_archivos: str = ""):
+    if not supabase:
+        st.error("No hay un cliente de Supabase inicializado.")
+        return [], set()
 
     try:
-        data_bytes = _supabase_client.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
+        # Obtener lista completa de archivos en el bucket de Supabase
+        archivos = supabase.storage.from_("Totalplay_datos_semanales").list(
+            path="", 
+            options={"limit": 1000, "offset": 0, "sortBy": {"column": "name", "order": "asc"}}
+        )
         
-        # Intento 1: Carga estándar omitiendo líneas malas
-        try:
-            df_temp = pd.read_csv(
-                io.BytesIO(data_bytes), 
-                low_memory=False, 
-                on_bad_lines='skip',
-                encoding='utf-8'
-            )
-        except Exception:
-            # Intento 2: Carga para archivos de Excel/Latinoamérica (latin1, auto-separador)
-            df_temp = pd.read_csv(
-                io.BytesIO(data_bytes), 
-                low_memory=False, 
-                on_bad_lines='skip', 
-                encoding='latin1',
-                sep=None, 
-                engine='python'
-            )
+        csv_files = [f['name'] for f in archivos if isinstance(f, dict) and f.get('name', '').endswith('.csv')]
+        
+        # Sincronización de caché local: Eliminar archivos Parquet de la computadora que ya no estén en Supabase
+        nombres_base_nube = {Path(name).stem for name in csv_files}
+        for archivo_local in CACHE_DIR.glob("*.parquet"):
+            if archivo_local.stem not in nombres_base_nube:
+                try:
+                    archivo_local.unlink()
+                except Exception:
+                    pass
 
-        # Guardar en Parquet binario
-        df_temp.to_parquet(archivo_parquet, compression="snappy")
-        return archivo_parquet
-        
+        if not csv_files:
+            st.info("El bucket de Supabase está vacío. Carga nuevos archivos CSV en la pestaña 'Cargar Datos (Supabase)' o en la consola para iniciar.")
+            return [], set()
+
+        def descargar_individual(nombre_archivo):
+            archivo_parquet = CACHE_DIR / f"{Path(nombre_archivo).stem}.parquet"
+            
+            # Usar caché local solo si el archivo existe en la nube
+            if archivo_parquet.exists() and archivo_parquet.stat().st_size > 0:
+                try:
+                    df_cached = pd.read_parquet(archivo_parquet)
+                    return df_cached, nombre_archivo.upper()
+                except Exception:
+                    archivo_parquet.unlink()
+
+            try:
+                res = supabase.storage.from_("Totalplay_datos_semanales").download(nombre_archivo)
+                try:
+                    df_temp = pd.read_csv(io.BytesIO(res), low_memory=False, dtype=str, encoding='utf-8', on_bad_lines='skip')
+                except Exception:
+                    df_temp = pd.read_csv(io.BytesIO(res), low_memory=False, dtype=str, encoding='latin1', on_bad_lines='skip')
+
+                if df_temp is not None and not df_temp.empty:
+                    df_temp["Archivo_Origen"] = nombre_archivo
+                    df_temp.to_parquet(archivo_parquet, compression="snappy")
+                    return df_temp, nombre_archivo.upper()
+            except Exception as e_desc:
+                logger.error(f"Error descargando {nombre_archivo}: {e_desc}")
+            return None, None
+
+        coleccion_dfs = []
+        archivos_procesados = set()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            resultados = list(executor.map(descargar_individual, csv_files))
+
+        for df_res, nom_res in resultados:
+            if df_res is not None:
+                coleccion_dfs.append(df_res)
+                archivos_procesados.add(nom_res)
+
+        return coleccion_dfs, archivos_procesados
+
     except Exception as e:
-        logger.error(f"Error procesando {nombre_archivo}: {e}")
-        return None
+        st.error(f"Error al conectar con Supabase Storage: {e}")
+        return [], set()
+
+
+@st.cache_data(ttl=3600, show_spinner="Procesando datos estrictamente desde Supabase Storage...")
+def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
+    coleccion_dfs = []
+
+    # 1. Descargar EXCLUSIVAMENTE los archivos que existen en Supabase Storage
+    dfs_nube, _ = obtener_archivos_supabase(hash_archivos)
+    if dfs_nube:
+        coleccion_dfs.extend(dfs_nube)
+
+    if not coleccion_dfs:
+        return pd.DataFrame()
+
+    df = pd.concat(coleccion_dfs, ignore_index=True)
+    df.columns = [str(col).strip() for col in df.columns]
+    cols = list(df.columns)
+
+    # Normalización de Fecha compatible con Números Serie de Excel (ej: 46203.45024 o 46203,45024)
+    col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
+    if col_fecha and col_fecha in df.columns:
+        serie_fecha_clean = df[col_fecha].astype(str).str.replace(',', '.', regex=False).str.strip()
+        es_num = pd.to_numeric(serie_fecha_clean, errors='coerce')
+        
+        fechas_excel = pd.to_datetime('1899-12-30') + pd.to_timedelta(es_num, unit='D', errors='coerce')
+        fechas_texto = pd.to_datetime(df[col_fecha], errors='coerce', dayfirst=True, format='mixed')
+        df["_datetime_parsed"] = fechas_excel.fillna(fechas_texto)
+    else:
+        df["_datetime_parsed"] = pd.NaT
+
+    # Detección y normalización de columnas principales
+    col_os = detectar_columna_por_patrones(cols, LISTA_ALIAS_ORDEN)
+    col_cta = detectar_columna_por_patrones(cols, LISTA_ALIAS_CUENTA)
+    col_ot = detectar_columna_por_patrones(cols, LISTA_ALIAS_OT)
+    col_tipo = detectar_columna_por_patrones(cols, LISTA_ALIAS_TIPO)
+    col_usr = detectar_columna_por_patrones(cols, LISTA_ALIAS_USUARIO)
+    col_nom = detectar_columna_por_patrones(cols, LISTA_ALIAS_NOMBRE)
+    col_prov = detectar_columna_por_patrones(cols, LISTA_ALIAS_PROVEEDOR)
+    col_dist = detectar_columna_por_patrones(cols, LISTA_ALIAS_DISTRITO)
+    col_cluster = detectar_columna_por_patrones(cols, LISTA_ALIAS_CLUSTER)
+        
+    serie_os = df[col_os].apply(sanitizar_folio_identificador) if col_os else "SIN_OS"
+    serie_cta = df[col_cta].apply(sanitizar_folio_identificador) if col_cta else "SIN_CTA"
+    serie_ot = df[col_ot].apply(sanitizar_folio_identificador) if col_ot else "SIN_OT"
+    serie_tipo = df[col_tipo].apply(sanitizar_cadena_texto) if col_tipo else "EVENTO GENERAL"
+
+    df["FOLIO_KEY"] = serie_os.astype(str) + "_" + serie_cta.astype(str) + "_" + serie_ot.astype(str) + "_" + serie_tipo.astype(str)
+    df["Cuenta_Cliente"] = serie_cta.astype(str)
     
+    serie_u = df[col_usr].apply(sanitizar_cadena_texto) if col_usr else "SIN ESPECIFICAR"
+    serie_n = df[col_nom].apply(sanitizar_cadena_texto) if col_nom else "SIN ESPECIFICAR"
+    
+    df["Usuario_Tecnico"] = np.where(
+        (serie_u != "SIN ESPECIFICAR") & (serie_n != "SIN ESPECIFICAR"),
+        serie_u + " | " + serie_n,
+        np.where(serie_n != "SIN ESPECIFICAR", serie_n, serie_u)
+    )
 
-@st.cache_data(ttl=3600, show_spinner="Cargando motor de datos dinámico La Baja...")
-def cargar_dataset_dinamico(_supabase_client):
-    """
-    1. Lista dinámicamente TODOS los CSVs del bucket (sean 3 o 300).
-    2. Procesa los archivos faltantes en paralelo.
-    3. Consolida y retorna el DataFrame general sin sobrecargar CPU.
-    """
-    if not _supabase_client:
-        return pd.DataFrame()
+    df["Empresa"] = df[col_prov].apply(sanitizar_cadena_texto) if col_prov else "SIN PROVEEDOR"
+    df["Distrito"] = df[col_dist].apply(sanitizar_cadena_texto) if col_dist else "DISTRITO GENERAL"
+    df["Tipo_Orden"] = serie_tipo
 
-    # Obtener lista completa de archivos en tiempo real desde Supabase Storage
-    archivos_bucket = _supabase_client.storage.from_("Totalplay_datos_semanales").list()
-    archivos_csv = [item['name'] for item in archivos_bucket if item['name'].endswith('.csv')]
+    df["Cluster_Raw"] = df[col_cluster].apply(sanitizar_cadena_texto) if col_cluster else "SIN CLUSTER"
+    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
 
-    if not archivos_csv:
-        logger.warning("No se encontraron archivos .csv en el bucket de Supabase.")
-        return pd.DataFrame()
+    col_origen_pol = col_usr if col_usr else col_nom
+    if col_origen_pol:
+        sub_cods = df[col_origen_pol].astype(str).str[3:5]
+        df["Codigo_Poliza"] = np.where(sub_cods.isin(MAPEO_POLIZAS.keys()), sub_cods, "")
+        df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("NO VALIDO")
+    else:
+        df["Codigo_Poliza"] = ""
+        df["Nombre_Poliza"] = "NO VALIDO"
 
-    # Carga paralela por hilos
-    archivos_parquet = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [
-            executor.submit(_procesar_y_guardar_local, archivo, _supabase_client)
-            for archivo in archivos_csv
-        ]
-        for future in futures:
-            res = future.result()
-            if res is not None:
-                archivos_parquet.append(res)
+    # Extracción y Dimensiones Temporales Robusta (Prioridad: Nombre del archivo)
+    semanas_archivo = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(0, index=df.index)
+    semanas_iso = df["_datetime_parsed"].dt.isocalendar().week
 
-    if not archivos_parquet:
-        return pd.DataFrame()
+    df["Num_Semana_Archivo"] = np.where(
+        semanas_archivo > 0, 
+        semanas_archivo, 
+        pd.to_numeric(semanas_iso, errors="coerce").fillna(0).astype(int)
+    )
 
-    # Lectura ultrarrápida de binarios Parquet a memoria RAM
-    dfs = [pd.read_parquet(p) for p in archivos_parquet]
-    df_consolidado = pd.concat(dfs, ignore_index=True)
-    return df_consolidado
+    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
+    df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Semana {int(x)}" if x > 0 else "SIN_FECHA")
+    df["MES_DIM"] = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO)
+    
+    dates_valid = df["_datetime_parsed"].dropna()
+    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
+    if not dates_valid.empty:
+        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
+
+    df = calcular_reincidencias_vectorizadas(df)
+
+    return df
 
 # -----------------------------------------------------------------------------
 # 0.3. EJECUCIÓN CONTINUA DEL DASHBOARD
 # -----------------------------------------------------------------------------
 # Sustituye la llamada a la antigua función por esta variable general:
-df = cargar_dataset_dinamico(supabase)
+
+
 
 # ==============================================================================
 # 1. CONSTANTES GLOBALES Y DICCIONARIOS DE NEGOCIO
@@ -892,15 +980,16 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     coleccion_dfs = []
     archivos_procesados = set()
 
-    # 1. Descargar archivos de Supabase usando el hash dinámico
+    # 1. Descargar archivos de Supabase usando el hash dinámico para refresco automático
     dfs_nube, archivos_procesados_nube = obtener_archivos_supabase(hash_archivos)
-    coleccion_dfs.extend(dfs_nube)
-    archivos_procesados.update(archivos_procesados_nube)
+    if dfs_nube:
+        coleccion_dfs.extend(dfs_nube)
+        archivos_procesados.update(archivos_procesados_nube)
 
     # 2. Cargar de la carpeta local (solo los que aún no estén en Supabase)
     carpeta_origen = "datos_semanales"
     if os.path.exists(carpeta_origen):
-        archivos_locales = sorted(glob.glob(os.path.join(carpeta_origen, "*.csv")))
+        archivos_locales = sorted(glob.glob(os.path.join(carpeta_origen, "*.csv")) + glob.glob(os.path.join(carpeta_origen, "*.xlsx")))
         for ruta in archivos_locales:
             nombre_local = os.path.basename(ruta).upper()
             if nombre_local not in archivos_procesados:
@@ -910,16 +999,25 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
                     coleccion_dfs.append(df_c)
 
     if not coleccion_dfs:
-        return pd.DataFrame()
+        # Crea la estructura mínima vacía para que el flujo y las pestañas no se rompan
+        cols_base = [
+            "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
+            "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
+            "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+        ]
+        return pd.DataFrame(columns=cols_base)
 
     df = pd.concat(coleccion_dfs, ignore_index=True)
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
-    # Normalización de Fecha compatible con Números Serie de Excel (ej: 46203.45024)
+    # Normalización de Fecha compatible con Números Serie de Excel (ej: 46203.45024 o 46203,45024)
     col_fecha = detectar_columna_por_patrones(cols, LISTA_ALIAS_CREACION)
     if col_fecha and col_fecha in df.columns:
-        es_num = pd.to_numeric(df[col_fecha], errors='coerce')
+        # Reemplazar comas por puntos en strings antes de convertir a numérico float
+        serie_fecha_clean = df[col_fecha].astype(str).str.replace(',', '.', regex=False).str.strip()
+        es_num = pd.to_numeric(serie_fecha_clean, errors='coerce')
+        
         fechas_excel = pd.to_datetime('1899-12-30') + pd.to_timedelta(es_num, unit='D', errors='coerce')
         fechas_texto = pd.to_datetime(df[col_fecha], errors='coerce', dayfirst=True, format='mixed')
         df["_datetime_parsed"] = fechas_excel.fillna(fechas_texto)
