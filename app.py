@@ -1,14 +1,15 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 14.1.0-LIGHT-ENGINE (Ingestión GitHub Directa)
+# Archivo: app.py | Versión: 14.2.0-PEGADO-CARPETAS
 # ==============================================================================
 
 import os
 import re
 import io
-import glob
 import logging
 import base64
+import csv
+from urllib.parse import quote
 import requests
 import numpy as np
 import pandas as pd
@@ -21,7 +22,12 @@ from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
-st.set_page_config(page_title="Control Operativo Cuadrillas 2026", layout="wide")
+st.set_page_config(
+    page_title="Control Operativo Cuadrillas 2026",
+    page_icon="🛠️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("ControlCuadrillas.Monolith")    
 
@@ -30,7 +36,10 @@ import gc
 # -----------------------------------------------------------------------------
 # 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA (REMOTO PARQUET + LOCAL + GITHUB API)
 # -----------------------------------------------------------------------------
-gh_cfg = st.secrets.get("github", {})
+try:
+    gh_cfg = st.secrets.get("github", {})
+except FileNotFoundError:
+    gh_cfg = {}
 GITHUB_USER = gh_cfg.get("user", "jluisnavag-a11y")
 GITHUB_REPO = gh_cfg.get("repo", "dashboard_jlng_operacoones_norte_cierre_diario")
 GITHUB_BRANCH = gh_cfg.get("branch", "main")
@@ -66,95 +75,19 @@ def descargar_y_procesar_archivo(nombre_archivo: str) -> Optional[pd.DataFrame]:
     return None
 
 
-@st.cache_data(ttl=86400, show_spinner="⚡ Cargando dataset...")
-def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
-    cols_base = [
-        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
-        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
-        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
-    ]
+def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica TODAS las transformaciones de negocio (fechas de creación y término, folios,
+    pólizas, dimensiones temporales, reincidencias) sobre un DataFrame crudo ya concatenado.
 
-    # -------------------------------------------------------------------------
-    # ESTRATEGIA 1: PARQUET CONSOLIDADO REMOTO (Si existe y está completo en GitHub)
-    # -------------------------------------------------------------------------
-    url_parquet_remoto = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
-    try:
-        resp = requests.get(url_parquet_remoto, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            df = pd.read_parquet(io.BytesIO(resp.content))
-            # Verificar que el Parquet tenga las transformaciones hechas
-            if not df.empty and "MES_DIM" in df.columns:
-                return df
-    except Exception as e:
-        if 'logger' in globals():
-            logger.warning(f"No se pudo descargar Parquet unificado remoto: {e}")
+    Se reutiliza tanto en la ingestión completa (ejecutar_pipeline_ingestion_datos) como en
+    la regeneración incremental del Parquet consolidado tras una carga manual, para que la
+    lógica de negocio viva en un único lugar (antes estaba duplicada en varias funciones).
+    """
+    if df is None or df.empty:
+        return df
 
-    # -------------------------------------------------------------------------
-    # ESTRATEGIA 2: LECTURA EN DISCO LOCAL (Desarrollo local)
-    # -------------------------------------------------------------------------
-    archivo_parquet_local = os.path.join("datos_semanales", "datos_consolidados.parquet")
-    if os.path.exists(archivo_parquet_local):
-        try:
-            df_parquet = pd.read_parquet(archivo_parquet_local)
-            if not df_parquet.empty and "MES_DIM" in df_parquet.columns:
-                return df_parquet
-        except Exception as e:
-            if 'logger' in globals():
-                logger.warning(f"No se pudo leer Parquet local: {e}")
-
-    coleccion_dfs = []
-    ruta_carpeta = "datos_semanales"
-    if os.path.exists(ruta_carpeta):
-        archivos_locales = [
-            os.path.join(ruta_carpeta, f) 
-            for f in os.listdir(ruta_carpeta) 
-            if f.lower().endswith(('.csv', '.parquet')) and f != "datos_consolidados.parquet"
-        ]
-        for ruta in archivos_locales:
-            try:
-                nombre_f = os.path.basename(ruta)
-                if ruta.endswith('.parquet'):
-                    df_loc = pd.read_parquet(ruta)
-                else:
-                    df_loc = pd.read_csv(ruta, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
-                
-                if df_loc is not None and not df_loc.empty:
-                    df_loc["Archivo_Origen"] = nombre_f
-                    coleccion_dfs.append(df_loc)
-            except Exception as e:
-                if 'logger' in globals():
-                    logger.error(f"Error cargando archivo local {ruta}: {e}")
-
-    # -------------------------------------------------------------------------
-    # ESTRATEGIA 3: FALLBACK A GITHUB API POR LOTES
-    # -------------------------------------------------------------------------
-    if not coleccion_dfs:
-        try:
-            resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
-            lista_archivos = [
-                f["name"] for f in resp.json() 
-                if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet")) and f["name"] != "datos_consolidados.parquet"
-            ] if resp.status_code == 200 else []
-        except Exception as e:
-            if 'logger' in globals():
-                logger.error(f"Error conectando con GitHub API: {e}")
-            lista_archivos = []
-
-        if lista_archivos:
-            with ThreadPoolExecutor(max_workers=25) as executor:
-                resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
-            coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
-
-    if not coleccion_dfs:
-        return pd.DataFrame(columns=cols_base)
-
-    # -------------------------------------------------------------------------
-    # TRANSFORMACIÓN Y UNIFICACIÓN DE DATOS (Crea MES_DIM, Pólizas, Fechas, etc.)
-    # -------------------------------------------------------------------------
-    df = pd.concat(coleccion_dfs, ignore_index=True)
-    coleccion_dfs.clear()
-    gc.collect()
-
+    df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
     cols = list(df.columns)
 
@@ -163,13 +96,26 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     sanit_fol = lambda s: s.apply(sanitizar_folio_identificador) if 'sanitizar_folio_identificador' in globals() else s
     sanit_txt = lambda s: s.apply(sanitizar_cadena_texto) if 'sanitizar_cadena_texto' in globals() else s
 
-    # Parseo de Fechas
+    # ---------------------------------------------------------------------
+    # Parseo robusto de fechas (Excel serial + texto). Cubre "Fecha creacion FFM"
+    # (obligatoria para las dimensiones temporales) y "Fecha termino" (nueva).
+    # ---------------------------------------------------------------------
     col_fecha = get_col(LISTA_ALIAS_CREACION if 'LISTA_ALIAS_CREACION' in globals() else [])
-    if col_fecha and col_fecha in df.columns:
-        s_clean = pd.to_numeric(df[col_fecha].astype(str).str.replace(",", ".", regex=False).str.strip(), errors="coerce")
-        df["_datetime_parsed"] = (pd.to_datetime("1899-12-30") + pd.to_timedelta(s_clean, unit="D", errors="coerce")).fillna(pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True, format="mixed"))
+    if col_fecha and col_fecha in df.columns and 'parsear_columna_fecha_robusta' in globals():
+        df["_datetime_parsed"] = parsear_columna_fecha_robusta(df[col_fecha])
     else:
         df["_datetime_parsed"] = pd.NaT
+
+    col_fecha_fin = get_col(LISTA_ALIAS_TERMINO if 'LISTA_ALIAS_TERMINO' in globals() else [])
+    if col_fecha_fin and col_fecha_fin in df.columns and 'parsear_columna_fecha_robusta' in globals():
+        df["_datetime_termino"] = parsear_columna_fecha_robusta(df[col_fecha_fin])
+    else:
+        df["_datetime_termino"] = pd.NaT
+
+    # Tiempo de resolución (horas) entre creación y término. Se descartan deltas
+    # negativos (datos mal capturados: término antes que creación).
+    delta_horas = (df["_datetime_termino"] - df["_datetime_parsed"]).dt.total_seconds() / 3600.0
+    df["Tiempo_Resolucion_Horas"] = delta_horas.where(delta_horas >= 0)
 
     # Columnas Principales
     c_os, c_cta, c_ot, c_tipo = get_col(LISTA_ALIAS_ORDEN if 'LISTA_ALIAS_ORDEN' in globals() else []), get_col(LISTA_ALIAS_CUENTA if 'LISTA_ALIAS_CUENTA' in globals() else []), get_col(LISTA_ALIAS_OT if 'LISTA_ALIAS_OT' in globals() else []), get_col(LISTA_ALIAS_TIPO if 'LISTA_ALIAS_TIPO' in globals() else [])
@@ -222,14 +168,69 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     if 'calcular_reincidencias_vectorizadas' in globals():
         df = calcular_reincidencias_vectorizadas(df)
 
-    # AUTO-GUARDADO: Si se procesaron CSVs, guarda el Parquet con TODAS sus columnas
+    return df
+
+
+@st.cache_data(ttl=86400, show_spinner="⚡ Cargando dataset...")
+def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
+    """
+    Fuente única de datos: GitHub. Sin dependencia de disco local.
+
+    1) Ruta rápida: descarga 'datos_consolidados.parquet' ya transformado (2-5 seg).
+    2) Fallback: si no existe o está desactualizado, descarga todos los CSV/Parquet
+       semanales en paralelo desde GitHub y aplica transformar_dataset_completo().
+    """
+    cols_base = [
+        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa",
+        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza",
+        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
+    ]
+
+    # -------------------------------------------------------------------------
+    # RUTA RÁPIDA: PARQUET CONSOLIDADO EN GITHUB (única fuente persistente)
+    # -------------------------------------------------------------------------
+    url_parquet_remoto = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
     try:
-        if os.path.exists("datos_semanales"):
-            df.to_parquet(archivo_parquet_local, index=False)
+        resp = requests.get(url_parquet_remoto, headers=HEADERS, timeout=15)
+        if resp.status_code == 200:
+            df = pd.read_parquet(io.BytesIO(resp.content))
+            if not df.empty and "MES_DIM" in df.columns:
+                return df
     except Exception as e:
         if 'logger' in globals():
-            logger.error(f"Error al guardar Parquet local: {e}")
+            logger.warning(f"No se pudo descargar Parquet unificado remoto: {e}")
 
+    # -------------------------------------------------------------------------
+    # FALLBACK: DESCARGA COMPLETA DESDE GITHUB API (solo si no hay parquet válido)
+    # -------------------------------------------------------------------------
+    coleccion_dfs = []
+    try:
+        resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+        lista_archivos = [
+            f["name"] for f in resp.json()
+            if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet")) and f["name"] != "datos_consolidados.parquet"
+        ] if resp.status_code == 200 else []
+    except Exception as e:
+        if 'logger' in globals():
+            logger.error(f"Error conectando con GitHub API: {e}")
+        lista_archivos = []
+
+    if lista_archivos:
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
+        coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
+
+    if not coleccion_dfs:
+        return pd.DataFrame(columns=cols_base)
+
+    # -------------------------------------------------------------------------
+    # TRANSFORMACIÓN Y UNIFICACIÓN DE DATOS (Crea MES_DIM, Pólizas, Fechas, etc.)
+    # -------------------------------------------------------------------------
+    df = pd.concat(coleccion_dfs, ignore_index=True)
+    coleccion_dfs.clear()
+    gc.collect()
+
+    df = transformar_dataset_completo(df)
     return df
 
 # -----------------------------------------------------------------------------
@@ -246,7 +247,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
 ANIO_BASE_ESTRICTO: int = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str = "TOTALPLAY / OPERACIONES - REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str = "13.4.0-FORCE-REFRESH"
+VERSION_SISTEMA: str = "14.2.0-PEGADO-CARPETAS"
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -278,6 +279,7 @@ LISTA_ORDENADA_MESES: List[str] = [
 ]
 
 LISTA_ALIAS_CREACION: List[str] = ["creacion", "creación", "created", "fecha_creacion", "created_at", "f_creacion"]
+LISTA_ALIAS_TERMINO: List[str] = ["termino", "término", "fecha termino", "fecha_termino", "f_termino", "fecha fin", "fecha_fin", "fecha cierre", "closed_at", "end_date", "finalizacion", "finalización"]
 LISTA_ALIAS_GENERICOS: List[str] = ["fecha", "dia", "día", "date", "f_proceso", "fecha_ejecucion"]
 LISTA_ALIAS_USUARIO: List[str] = ["usuario instalador", "usuario_instalador", "instalador", "usuario", "usr", "id_usuario", "tech_id"]
 LISTA_ALIAS_NOMBRE: List[str] = ["nombre tecnico", "nombre técnico", "nombre_tecnico", "tecnico", "técnico", "nombre", "tech_name"]
@@ -349,192 +351,6 @@ class MetricasResumenKPI:
     eventos_r3: int
     eventos_mt: int
 
-# ==============================================================================
-# 3. ESTILOS CSS UNIFICADOS (MODO CLARO CONTROLADO CON BORDES ENTERPRISE)
-# ==============================================================================
-
-def inyectar_estilos_css_enterprise() -> None:
-    css_custom = f"""
-    <style>
-    @import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap");
-
-    html, body, [class*="css"], .stApp {{
-        font-family: "Plus Jakarta Sans", -apple-system, sans-serif !important;
-        background-color: #F8FAFC !important;
-        color: #000000 !important;
-    }}
-
-    [data-testid="stSidebar"] {{
-        background-color: {PALETA_COLOR["azul_noche"]} !important;
-        min-width: 320px !important;
-    }}
-    [data-testid="stSidebar"] * {{
-        color: #FFFFFF !important;
-    }}
-
-    .main-header-enterprise {{
-        background: linear-gradient(135deg, {PALETA_COLOR["azul_noche"]} 0%, {PALETA_COLOR["azul_marina"]} 100%);
-        padding: 24px 30px;
-        border-radius: 14px;
-        border-bottom: 4px solid {PALETA_COLOR["turquesa_cyan"]};
-        color: #FFFFFF !important;
-        margin-bottom: 20px;
-        box-shadow: 0 8px 20px -5px rgba(11, 25, 44, 0.4);
-    }}
-
-    .main-header-enterprise h1 {{
-        font-weight: 800 !important;
-        color: #FFFFFF !important;
-        margin: 0;
-        font-size: 22px;
-        letter-spacing: 0.5px;
-    }}
-
-    .main-header-enterprise p {{
-        color: {PALETA_COLOR["turquesa_cyan"]} !important;
-        margin: 4px 0 0 0;
-        font-size: 13px;
-        font-weight: 700;
-    }}
-
-    .kpi-wrapper-grid {{
-        display: grid;
-        grid-template-columns: repeat(5, 1fr);
-        gap: 14px;
-        margin-bottom: 20px;
-    }}
-
-    .kpi-card-enterprise {{
-        background: #FFFFFF !important;
-        border: 2px solid {PALETA_COLOR["azul_marina"]} !important;
-        border-radius: 12px;
-        padding: 16px 14px;
-        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.06);
-        position: relative;
-    }}
-
-    .kpi-card-enterprise::before {{
-        content: "";
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 5px;
-        background: {PALETA_COLOR["turquesa_cyan"]};
-        border-top-left-radius: 10px;
-        border-top-right-radius: 10px;
-    }}
-
-    .kpi-card-title {{
-        font-weight: 800 !important;
-        color: {PALETA_COLOR["azul_marina"]} !important;
-        font-size: 11px !important;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: 6px;
-    }}
-
-    .kpi-card-value {{
-        font-weight: 900 !important;
-        color: #000000 !important;
-        font-size: 26px !important;
-        line-height: 1.1;
-    }}
-
-    .kpi-card-subtitle {{
-        font-size: 10px !important;
-        color: #475569 !important;
-        margin-top: 4px;
-        font-weight: 700 !important;
-    }}
-
-    .stTabs [data-baseweb="tab-list"] {{
-        gap: 6px;
-        background-color: {PALETA_COLOR["azul_marina"]};
-        padding: 6px;
-        border-radius: 10px;
-    }}
-
-    .stTabs [data-baseweb="tab"] {{
-        height: 42px;
-        background-color: transparent;
-        border-radius: 6px;
-        color: #FFFFFF !important;
-        font-weight: 700;
-        font-size: 13px;
-    }}
-
-    .stTabs [aria-selected="true"] {{
-        background-color: {PALETA_COLOR["turquesa_cyan"]} !important;
-        color: {PALETA_COLOR["azul_noche"]} !important;
-        font-weight: 800 !important;
-    }}
-
-    /* FORZAR ESTILO HOMOGÉNEO Y CLARO EN TODAS LAS TABLAS DATAFRAME */
-    div[data-testid="stDataFrame"], div[aria-label="st.dataframe"] {{
-        background-color: #FFFFFF !important;
-        border: 2px solid {PALETA_COLOR["azul_marina"]} !important;
-        border-radius: 12px !important;
-        padding: 4px !important;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.05) !important;
-    }}
-
-    div[data-testid="stDataFrame"] iframe {{
-        background-color: #FFFFFF !important;
-    }}
-
-    .matrix-title-card {{
-        background-color: #FFFFFF;
-        border-left: 5px solid {PALETA_COLOR["naranja_desierto"]};
-        border-top: 1px solid #E2E8F0;
-        border-right: 1px solid #E2E8F0;
-        border-bottom: 1px solid #E2E8F0;
-        padding: 12px 16px;
-        border-radius: 6px;
-        margin-top: 15px;
-        margin-bottom: 12px;
-       box-shadow: 0 2px 5px rgba(0,0,0,0.03);
-    }}
-
-    /* Botones secundarios homologados (Limpiar Caché y CSV) */
-    div.stButton > button[kind="secondary"], 
-    div.stButton > button:not([kind="primary"]),
-    div.stDownloadButton > button {{
-        background-color: #FFFFFF !important;
-        color: #1E293B !important;
-        border: 1px solid #CBD5E1 !important;
-        border-radius: 8px !important;
-        font-weight: 600 !important;
-        box-shadow: 0px 2px 4px rgba(0,0,0,0.05) !important;
-    }}
-
-    div.stButton > button[kind="secondary"]:hover, 
-    div.stButton > button:not([kind="primary"]):hover,
-    div.stDownloadButton > button:hover {{
-        background-color: #F8FAFC !important;
-        border-color: #94A3B8 !important;
-        color: #0F172A !important;
-    }}
-    /* Botón de Cargar Archivo (st.file_uploader) */
-        [data-testid="stFileUploader"] section button,
-        [data-testid="stFileUploader"] label button {{
-            background-color: #FFFFFF !important;
-            color: #1E293B !important;
-            border: 1px solid #CBD5E1 !important;
-            border-radius: 8px !important;
-            font-weight: 600 !important;
-            box-shadow: 0px 2px 4px rgba(0,0,0,0.05) !important;
-        }}
-
-        [data-testid="stFileUploader"] section button:hover,
-        [data-testid="stFileUploader"] label button:hover {{
-            background-color: #F8FAFC !important;
-            border-color: #94A3B8 !important;
-            color: #0F172A !important;
-        }}
-    </style>
-    """
-    st.markdown(css_custom, unsafe_allow_html=True)
 
 # ==============================================================================
 # 4. FUNCIONES AUXILIARES DE TRANSFORMACIÓN Y LIMPIEZA
@@ -903,124 +719,11 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def _cargar_archivo_robusto(ruta: str) -> Optional[pd.DataFrame]:
-    nombre = os.path.basename(ruta)
-    df_temp = None
-
-    if ruta.lower().endswith(".csv"):
-        encodings = ["utf-8-sig", "utf-8", "latin1", "cp1252"]
-        separadores = [",", ";", "\t"]
-
-        for enc in encodings:
-            for sep in separadores:
-                try:
-                    df_temp = pd.read_csv(ruta, encoding=enc, sep=sep, low_memory=False)
-                    if df_temp is not None and not df_temp.empty and len(df_temp.columns) > 1:
-                        break
-                except Exception:
-                    continue
-            if df_temp is not None and not df_temp.empty and len(df_temp.columns) > 1:
-                break
-    else:
-        try:
-            df_temp = pd.read_excel(ruta)
-        except Exception as e:
-            logger.error(f"Error cargando Excel {nombre}: {e}")
-
-    if df_temp is not None and not df_temp.empty:
-        df_temp["Archivo_Origen"] = nombre
-        return df_temp
-    
-    return None
-
-def obtener_hash_archivos_carpeta(carpeta: str) -> str:
-    """Genera una firma única en tiempo real basada en archivos y sus fechas de modificación."""
-    if not os.path.exists(carpeta):
-        return "sin_carpeta"
-    archivos = sorted(glob.glob(os.path.join(carpeta, "*.csv")) + glob.glob(os.path.join(carpeta, "*.xlsx")))
-    info = []
-    for f in archivos:
-        try:
-            stat = os.stat(f)
-            info.append(f"{f}:{stat.st_mtime}:{stat.st_size}")
-        except Exception:
-            pass
-    return "|".join(info)
-
-# =========================================================================
-    # REFACTOR INGESTA: LECTURA LOCAL OPTIMIZADA O FALLBACK A GITHUB API
-    # =========================================================================
-    ruta_carpeta = "datos_semanales"
-    
-    # 1. EVALUACIÓN Y PROCESAMIENTO LOCAL (Prioridad para alto rendimiento)
-    if os.path.exists(ruta_carpeta):
-        archivos_csv = [
-            os.path.join(ruta_carpeta, f) 
-            for f in os.listdir(ruta_carpeta) 
-            if f.lower().endswith('.csv')
-        ]
-        
-        if archivos_csv:
-            # Lectura vectorizada de archivos locales
-            df_unificado = pd.concat(
-                [pd.read_csv(f, low_memory=False) for f in archivos_csv], 
-                ignore_index=True
-            )
-            
-            # Exportación eficiente en binario columnar (Parquet)
-            archivo_parquet = "datos_consolidados.parquet"
-            df_unificado.to_parquet(archivo_parquet, index=False)
-            print(f"¡Éxito! Se consolidaron {len(archivos_csv)} archivos en '{archivo_parquet}'.")
-            
-            # Agregar al pipeline de procesamiento principal
-            coleccion_dfs.append(df_unificado)
-
-    # 2. DESCARGA REMOTA (Ejecuta solo si NO se procesaron archivos locales)
-    if not coleccion_dfs and 'archivos_para_procesar' in locals() and archivos_para_procesar:
-        bloques = [(archivos_para_procesar[i::MAX_WORKERS], f"Worker-{i}") for i in range(MAX_WORKERS)]
-        
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(_descargar_bloque, b[0], b[1]) for b in bloques if b[0]]
-            for f in as_completed(futures):
-                for df_item in f.result():
-                    if df_item is not None and not df_item.empty:
-                        coleccion_dfs.append(df_item)
-
-    # =========================================================================
-    # DEFINICIÓN DE ESTRUCTURA BASE
-    # =========================================================================
-    cols_base = [
-        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
-        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
-        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
-    ]
-    # =========================================================================
-    # DEFINICIÓN DE ESTRUCTURA BASE
-    # =========================================================================
-    cols_base = [
-        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
-        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
-        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
-    ]
-    
-    # =========================================================================
-    # DEFINICIÓN DE ESTRUCTURA BASE
-    # =========================================================================
-    cols_base = [
-        "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa", 
-        "Distrito", "Tipo_Orden", "Cluster_Base", "Nombre_Poliza", 
-        "Num_Semana_Archivo", "SEMANA_DIM", "FECHA_TRUNCADA"
-    ]
-    
 # ==============================================================================
 # CSS DE ALTO IMPACTO (COMPATIBLE CON STREAMLIT CLOUD Y LOCALHOST)
 # ==============================================================================
 
-def inyectar_estilos_base_ui():
-    """Inyecta CSS global forzado usando selectores nativos de Streamlit (.stTabs)
-    para garantizar contraste en modo oscuro, corregir etiquetas invisibles y
-    estilizar componentes UI sin depender de librerías externas.
-    """
+def inyectar_estilos_base_ui() -> None:
     st.markdown("""
         <style>
         /* 1. CONTENEDOR PRINCIPAL DE LAS PESTAÑAS (TABS) */
@@ -1095,7 +798,11 @@ def inyectar_estilos_base_ui():
         }
 
         /* 6. FIX DE VISIBILIDAD DE TÍTULOS Y TEXTO EN MÓDULOS DE REINCIDENCIAS */
-        .stMarkdown p, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3, .stMarkdown h4 {
+        div[data-testid="stTabs"] .stMarkdown p,
+        div[data-testid="stTabs"] .stMarkdown h1,
+        div[data-testid="stTabs"] .stMarkdown h2,
+        div[data-testid="stTabs"] .stMarkdown h3,
+        div[data-testid="stTabs"] .stMarkdown h4 {
             color: #f8fafc !important;
         }
 
@@ -1140,6 +847,10 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         "📥 Descarga de Reportes",
         "📂 Cargar Datos Localmente"
     ])
+
+    # Mostrar la captura antes de procesar los gráficos de las otras pestañas.
+    with sub_tab5:
+        st.button("📋 Abrir caja de pegado a todo el ancho", on_click=abrir_captura_completa, key="abrir_captura_ancha")
 
     # --------------------------------------------------------------------------
     # SUBTAB 1: EVOLUCIÓN & PRODUCTIVIDAD
@@ -1312,114 +1023,415 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel
         st.markdown("### 📥 Descarga de Reportes")
         csv_bytes = df_folios.to_csv(index=False).encode("utf-8")
         st.download_button("📄 Descargar Dataset (CSV)", csv_bytes, f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv")
-
+        
 # ==============================================================================
-# MÓDULO DE CARGA DIRECTA A GITHUB + BITÁCORA + DEDUPLICACIÓN (REPOSITORIO PRIVADO)
+# MÓDULO DE CARGA DIRECTA A GITHUB (ÚNICA FUENTE DE VERDAD, SIN DISCO LOCAL)
 # ==============================================================================
+# Todas las funciones de esta sección leen y escriben ÚNICAMENTE contra la API
+# de GitHub. No hay lectura ni escritura de disco local: cada carga deja al
+# repositorio como el estado completo y definitivo del sistema.
+# ------------------------------------------------------------------------------
 
-def renderizar_modulo_carga_github():
-    st.markdown("### ☁️ Cargar Nueva Semana a GitHub (Repositorio Privado)")
-    
-    col_nom, col_pwd = st.columns([2, 1])
-    with col_nom:
-        nombre_archivo_input = st.text_input(
-            "Nombre del archivo CSV (ej. CIERRE DIARIO SEM 27 2026):", 
-            value="CIERRE DIARIO SEM 27 2026"
-        )
-    with col_pwd:
-        token_auth = st.text_input("Clave de autorización del portal:", type="password")
+def _headers_github_contenido() -> Dict[str, str]:
+    """Headers estándar para llamadas a la API de contenidos/objetos de GitHub."""
+    h = dict(HEADERS)
+    h["Accept"] = "application/vnd.github.v3+json"
+    return h
 
-    contenido_txt = st.text_area(
-        "Pega el contenido copiado directamente desde Excel para subir el archivo CSV a la nube:",
-        height=180
-    )
 
-    if st.button("🚀 Guardar y Subir a GitHub", type="primary"):
-        # 1. Validaciones de entrada y token
-        clave_correcta = st.secrets.get("UPLOAD_PASSWORD", "admin123")
-        if token_auth != clave_correcta:
-            st.error("❌ Clave de autorización incorrecta.")
-            return
+@st.cache_data(ttl=180, show_spinner=False)
+def listar_archivos_semanales_github() -> List[str]:
+    """Lista los archivos CSV existentes en la carpeta configurada del repositorio."""
+    try:
+        resp = requests.get(GITHUB_API_URL, headers=_headers_github_contenido(), timeout=15)
+        if resp.status_code == 200:
+            return sorted([
+                f["name"] for f in resp.json()
+                if isinstance(f, dict) and f["name"].lower().endswith(".csv")
+            ])
+    except Exception as e:
+        logger.error(f"Error listando archivos en GitHub: {e}")
+    return []
 
-        if not contenido_txt.strip():
-            st.error("⚠️ El contenido a procesar no puede estar vacío.")
-            return
 
-        if not GITHUB_TOKEN:
-            st.error("⚠️ No se ha detectado el token de GitHub en .streamlit/secrets.toml")
-            return
+def _push_contenido_api(ruta_relativa: str, contenido_bytes: bytes, mensaje: str) -> Tuple[bool, str]:
+    """
+    Sube/actualiza un archivo PEQUEÑO (<1MB) usando la API de Contenidos de GitHub.
+    Adecuado para los CSV semanales individuales.
+    """
+    try:
+        url_api = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{ruta_relativa}"
+        res_check = requests.get(f"{url_api}?ref={GITHUB_BRANCH}", headers=_headers_github_contenido(), timeout=15)
+        sha_actual = res_check.json().get("sha") if res_check.status_code == 200 else None
 
-        nombre_clean = nombre_archivo_input.strip()
-        nombre_csv = nombre_clean if nombre_clean.lower().endswith(".csv") else f"{nombre_clean}.csv"
-
-        # 2. Parseo de CSV en memoria
-        try:
-            from io import StringIO
-            df_nuevo = pd.read_csv(StringIO(contenido_txt), sep=None, engine="python", dtype=str)
-        except Exception as e:
-            st.error(f"Error parseando la información ingresada: {e}")
-            return
-
-        total_filas_recibidas = len(df_nuevo)
-
-        # 3. Descarga de Parquet actual con autenticación
-        url_parquet = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
-        df_actual = pd.DataFrame()
-        try:
-            resp = requests.get(url_parquet, headers=HEADERS, timeout=15)
-            if resp.status_code == 200:
-                df_actual = pd.read_parquet(io.BytesIO(resp.content))
-        except Exception as e:
-            logger.warning(f"No se pudo consultar Parquet remoto previo: {e}")
-
-        # 4. Concatenación y deduplicación por clave primaria
-        df_combinado = pd.concat([df_actual, df_nuevo], ignore_index=True) if not df_actual.empty else df_nuevo
-        if "FOLIO_KEY" in df_combinado.columns and "FECHA_TRUNCADA" in df_combinado.columns:
-            df_dedup = df_combinado.drop_duplicates(subset=["FOLIO_KEY", "FECHA_TRUNCADA"], keep="first")
-        else:
-            df_dedup = df_combinado.drop_duplicates(keep="first")
-
-        filas_nuevas_agregadas = len(df_dedup) - len(df_actual) if not df_actual.empty else len(df_dedup)
-        duplicados_omitidos = total_filas_recibidas - filas_nuevas_agregadas
-
-        # 5. Envío vía REST API usando la carpeta y rama dinámicas
-        ruta_github_csv = f"{GITHUB_FOLDER}/{nombre_csv}"
-        url_api_csv = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{ruta_github_csv}"
-
-        # Obtener el SHA si el archivo ya existe en la rama de destino
-        res_check = requests.get(f"{url_api_csv}?ref={GITHUB_BRANCH}", headers=HEADERS)
-        sha_csv = res_check.json().get("sha") if res_check.status_code == 200 else None
-
-        contenido_b64 = base64.b64encode(contenido_txt.encode("utf-8")).decode("utf-8")
-        payload_csv = {
-            "message": f"Añadir/Actualizar {nombre_csv} desde portal web",
-            "content": contenido_b64,
+        payload = {
+            "message": mensaje,
+            "content": base64.b64encode(contenido_bytes).decode("utf-8"),
             "branch": GITHUB_BRANCH
         }
-        if sha_csv:
-            payload_csv["sha"] = sha_csv
+        if sha_actual:
+            payload["sha"] = sha_actual
 
-        r_csv = requests.put(url_api_csv, json=payload_csv, headers=HEADERS)
+        r = requests.put(url_api, json=payload, headers=_headers_github_contenido(), timeout=30)
+        if r.status_code in (200, 201):
+            return True, "OK"
+        return False, f"HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
 
-        if r_csv.status_code in [200, 201]:
-            st.success(f"✅ Archivo **{nombre_csv}** subido exitosamente a GitHub ({GITHUB_USER}/{GITHUB_REPO}).")
-            st.info(f"📊 Registros recibidos: {total_filas_recibidas:,} | Nuevos agregados: {filas_nuevas_agregadas:,} | Duplicados omitidos: {duplicados_omitidos:,}")
-            
-            # Bitácora inmediata
-            bitacora_data = pd.DataFrame([{
-                "Nombre Archivo": nombre_csv,
-                "Total Registros": f"{total_filas_recibidas:,}",
-                "Registros Únicos": f"{filas_nuevas_agregadas:,}",
-                "Duplicados Omitidos": f"{duplicados_omitidos:,}",
-                "Fecha de Carga": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-            }])
-            st.markdown("#### Bitácora de Ingestión")
-            st.dataframe(bitacora_data, hide_index=True, use_container_width=True)
-            
-            st.cache_data.clear()
+
+def _push_blob_git_data_api(ruta_relativa: str, contenido_bytes: bytes, mensaje: str) -> Tuple[bool, str]:
+    """
+    Sube/actualiza un archivo de CUALQUIER TAMAÑO (hasta ~100MB) usando la Git Data API
+    (blob + tree + commit + actualización de referencia de rama). Es necesario para
+    'datos_consolidados.parquet': la API de Contenidos simple está limitada a ~1MB y un
+    consolidado de varias semanas de operación la supera con facilidad.
+    """
+    base_url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}"
+    headers = _headers_github_contenido()
+    try:
+        # 1. Crear el blob con el contenido binario
+        r_blob = requests.post(
+            f"{base_url}/git/blobs",
+            json={"content": base64.b64encode(contenido_bytes).decode("utf-8"), "encoding": "base64"},
+            headers=headers, timeout=60
+        )
+        if r_blob.status_code not in (200, 201):
+            return False, f"Error creando blob: {r_blob.text[:300]}"
+        sha_blob = r_blob.json()["sha"]
+
+        # 2. Referencia y commit actuales de la rama
+        r_ref = requests.get(f"{base_url}/git/ref/heads/{GITHUB_BRANCH}", headers=headers, timeout=20)
+        if r_ref.status_code != 200:
+            return False, f"Error obteniendo referencia de rama: {r_ref.text[:300]}"
+        sha_commit_actual = r_ref.json()["object"]["sha"]
+
+        r_commit = requests.get(f"{base_url}/git/commits/{sha_commit_actual}", headers=headers, timeout=20)
+        if r_commit.status_code != 200:
+            return False, f"Error obteniendo commit actual: {r_commit.text[:300]}"
+        sha_tree_actual = r_commit.json()["tree"]["sha"]
+
+        # 3. Nuevo árbol con el archivo actualizado
+        r_tree = requests.post(
+            f"{base_url}/git/trees",
+            json={"base_tree": sha_tree_actual, "tree": [{
+                "path": ruta_relativa, "mode": "100644", "type": "blob", "sha": sha_blob
+            }]},
+            headers=headers, timeout=30
+        )
+        if r_tree.status_code not in (200, 201):
+            return False, f"Error creando árbol: {r_tree.text[:300]}"
+        sha_tree_nuevo = r_tree.json()["sha"]
+
+        # 4. Nuevo commit
+        r_new_commit = requests.post(
+            f"{base_url}/git/commits",
+            json={"message": mensaje, "tree": sha_tree_nuevo, "parents": [sha_commit_actual]},
+            headers=headers, timeout=30
+        )
+        if r_new_commit.status_code not in (200, 201):
+            return False, f"Error creando commit: {r_new_commit.text[:300]}"
+        sha_new_commit = r_new_commit.json()["sha"]
+
+        # 5. Mover la rama al nuevo commit
+        r_update_ref = requests.patch(
+            f"{base_url}/git/refs/heads/{GITHUB_BRANCH}",
+            json={"sha": sha_new_commit}, headers=headers, timeout=20
+        )
+        if r_update_ref.status_code in (200, 201):
+            return True, "OK"
+        return False, f"Error actualizando rama: {r_update_ref.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=3)
+def interpretar_csv_pegado(texto: str, separador: str = "Automático") -> pd.DataFrame:
+    """Procesa el texto del portapapeles; conserva identificadores y celdas vacías."""
+    texto = texto.lstrip("\ufeff").strip("\r\n")
+    if not texto.strip():
+        raise ValueError("Pega los encabezados y al menos una fila de datos.")
+    delimitadores = {"Coma (,)": ",", "Punto y coma (;)": ";", "Tabulación (Excel)": "\t"}
+    sep = delimitadores.get(separador)
+    if sep is None:
+        try:
+            sep = csv.Sniffer().sniff(texto[:65536], delimiters=",;\t").delimiter
+        except csv.Error:
+            raise ValueError("No se detectó el separador. Selecciona coma, punto y coma o tabulación.")
+    lector = csv.reader(io.StringIO(texto), delimiter=sep, strict=True)
+    encabezados = next(lector)
+    encabezados = [c.strip() for c in encabezados]
+    if len(encabezados) < 2 or any(not c for c in encabezados) or len(set(encabezados)) != len(encabezados):
+        raise ValueError("Los encabezados deben ser únicos, sin celdas vacías y con al menos dos columnas.")
+    filas = 0
+    for fila in lector:
+        if not fila:
+            continue
+        if len(fila) != len(encabezados):
+            raise ValueError(f"La línea {lector.line_num} tiene {len(fila)} columnas; se esperaban {len(encabezados)}.")
+        filas += 1
+    if not filas:
+        raise ValueError("El texto solo contiene encabezados; faltan los registros.")
+    df = pd.read_csv(io.StringIO(texto), sep=sep, dtype=str, keep_default_na=False)
+    df.columns = encabezados
+    return df
+
+
+def _parsear_texto_pegado(contenido_txt: str) -> Optional[pd.DataFrame]:
+    try:
+        return interpretar_csv_pegado(contenido_txt)
+    except (ValueError, csv.Error, pd.errors.ParserError):
+        return None
+
+
+def leer_bytes_github(ruta: str) -> bytes:
+    """Lee la revisión actual por SHA, sin depender de la caché del dominio raw."""
+    meta = requests.get(url_contenido_github(ruta), params={"ref": GITHUB_BRANCH}, headers=_headers_github_contenido(), timeout=25)
+    meta.raise_for_status()
+    sha = meta.json()["sha"]
+    res = requests.get(f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/git/blobs/{sha}",
+        headers={**_headers_github_contenido(), "Accept": "application/vnd.github.raw+json"}, timeout=45)
+    res.raise_for_status()
+    return res.content
+
+
+def _regenerar_parquet_consolidado(nombre_csv_afectado: str, df_raw_final_archivo: pd.DataFrame) -> pd.DataFrame:
+    """Conserva el histórico; si falta el consolidado, reconstruye todas las fuentes."""
+    inventario_repositorio_github.clear()
+    inventario = inventario_repositorio_github()
+    prefijo = f"{GITHUB_FOLDER.strip('/')}/" if GITHUB_FOLDER.strip('/') else ""
+    ruta_consolidado = prefijo + "datos_consolidados.parquet"
+    nuevo = df_raw_final_archivo.copy()
+    nuevo["Archivo_Origen"] = nombre_csv_afectado
+    if ruta_consolidado in inventario:
+        anterior = pd.read_parquet(io.BytesIO(leer_bytes_github(ruta_consolidado)))
+        if "Archivo_Origen" not in anterior.columns:
+            raise ValueError("No se puede identificar el histórico en el consolidado actual.")
+        anterior = anterior[anterior["Archivo_Origen"] != nombre_csv_afectado]
+        return pd.concat([anterior, transformar_dataset_completo(nuevo)], ignore_index=True)
+    fuentes = [nuevo]
+    for ruta, tipo in inventario.items():
+        nombre = ruta[len(prefijo):] if ruta.startswith(prefijo) else ""
+        if tipo != "blob" or not nombre or "/" in nombre or nombre in (nombre_csv_afectado, "datos_consolidados.parquet"):
+            continue
+        if not nombre.lower().endswith((".csv", ".parquet")):
+            continue
+        contenido = leer_bytes_github(ruta)
+        if nombre.lower().endswith(".parquet"):
+            df = pd.read_parquet(io.BytesIO(contenido))
         else:
-            st.error(f"❌ Error API GitHub ({r_csv.status_code}): {r_csv.text}")
-            
+            try:
+                texto = contenido.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                texto = contenido.decode("latin1")
+            df = interpretar_csv_pegado(texto)
+        df["Archivo_Origen"] = nombre
+        fuentes.append(df)
+    return transformar_dataset_completo(pd.concat(fuentes, ignore_index=True))
+
+
+def validar_ruta_carpeta(ruta: str) -> str:
+    ruta = ruta.strip()
+    if not ruta or ruta.startswith("/") or "\\" in ruta:
+        raise ValueError("Escribe una ruta relativa, por ejemplo datos_semanales/2026.")
+    if any(p in ("", ".", "..", ".git") for p in ruta.split("/")) or any(ord(c) < 32 for c in ruta):
+        raise ValueError("La carpeta contiene segmentos vacíos o caracteres no válidos.")
+    return ruta
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def inventario_repositorio_github() -> Dict[str, str]:
+    """Rutas y tipos reales del repositorio, incluidas las subcarpetas."""
+    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/git/trees/{quote(GITHUB_BRANCH, safe='')}"
+    resp = requests.get(url, params={"recursive": "1"}, headers=_headers_github_contenido(), timeout=25)
+    resp.raise_for_status()
+    datos = resp.json()
+    if datos.get("truncated"):
+        raise ValueError("GitHub devolvió un listado incompleto. No se puede seleccionar un destino con este listado.")
+    if not isinstance(datos.get("tree"), list):
+        raise ValueError("GitHub no devolvió el listado de carpetas.")
+    return {item["path"]: item["type"] for item in datos["tree"]}
+
+
+def url_contenido_github(ruta: str) -> str:
+    return f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{quote(ruta, safe='/')}"
+
+
+def guardar_csv_en_carpeta(ruta: str, df: pd.DataFrame, agregar: bool) -> pd.DataFrame:
+    """Lee y guarda sobre la misma revisión; no sobrescribe destinos nuevos existentes."""
+    url = url_contenido_github(ruta)
+    res = requests.get(url, params={"ref": GITHUB_BRANCH}, headers=_headers_github_contenido(), timeout=25)
+    sha = None
+    final = df.copy()
+    if agregar:
+        res.raise_for_status()
+        metadata = res.json()
+        if metadata.get("type") != "file":
+            raise ValueError("El destino no es un archivo CSV.")
+        sha = metadata["sha"]
+        # Leer por blob SHA garantiza que el contenido corresponda a la revisión leída.
+        raw = requests.get(
+            f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/git/blobs/{sha}",
+            headers={**_headers_github_contenido(), "Accept": "application/vnd.github.raw+json"}, timeout=45,
+        )
+        raw.raise_for_status()
+        try:
+            texto = raw.content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            texto = raw.content.decode("latin1")
+        previo = interpretar_csv_pegado(texto)
+        if set(previo.columns) != set(df.columns):
+            raise ValueError("Las columnas pegadas no coinciden con las del archivo elegido. No se guardaron cambios.")
+        final = pd.concat([previo, df[previo.columns]], ignore_index=True)
+        aliases = [LISTA_ALIAS_ORDEN, LISTA_ALIAS_CUENTA, LISTA_ALIAS_OT, LISTA_ALIAS_TIPO]
+        claves = [detectar_columna_por_patrones(list(final.columns), alias) for alias in aliases]
+        if all(claves) and final[claves].apply(lambda c: c.str.strip().ne("")).all().all():
+            final = final.drop_duplicates(subset=claves, keep="last")
+        else:
+            # Sin clave completa solo se eliminan filas idénticas.
+            final = final.drop_duplicates(keep="last")
+    elif res.status_code == 200:
+        raise ValueError("Ya existe un archivo con ese nombre. Selecciona actualizar o escribe otro nombre.")
+    elif res.status_code != 404:
+        res.raise_for_status()
+    payload = {
+        "message": f"Actualizar captura CSV: {ruta}",
+        "content": base64.b64encode(final.to_csv(index=False).encode("utf-8-sig")).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+    resultado = requests.put(url, json=payload, headers=_headers_github_contenido(), timeout=60)
+    if resultado.status_code == 409:
+        raise ValueError("El archivo cambió durante la carga. Actualiza el listado y vuelve a intentarlo.")
+    resultado.raise_for_status()
+    return final
+
+
+def abrir_captura_completa():
+    st.session_state["seccion_principal"] = "📝 Capturar / actualizar datos"
+
+
+def renderizar_modulo_carga_github():
+    st.markdown("### 📋 Pegar información y guardar en GitHub")
+    st.caption(f"Versión {VERSION_SISTEMA} · Repositorio: {GITHUB_USER}/{GITHUB_REPO} · Rama: {GITHUB_BRANCH}")
+    if st.session_state.get("resultado_captura"):
+        st.success(st.session_state["resultado_captura"])
+    # Sin columnas ni pestañas envolventes: ocupa todo el ancho del área principal.
+    contenido_txt = st.text_area(
+        "Pega aquí el CSV completo o las celdas copiadas desde Excel, incluidos los encabezados",
+        height=380, key="contenido_txt_carga_v2",
+        placeholder='Cuenta,OS,OT,Tipo,Fecha creacion FFM\n00123,0009,002,Soporte,16/09/2026',
+        help="Usa Ctrl+V o Cmd+V. Se guardan los datos como CSV; colores, fuentes y estilos del portapapeles no se almacenan.",
+    )
+    separador = st.selectbox("Separador del texto", ["Automático", "Coma (,)", "Punto y coma (;)", "Tabulación (Excel)"], key="separador_captura")
+    df_preview = None
+    if contenido_txt.strip():
+        try:
+            df_preview = interpretar_csv_pegado(contenido_txt, separador)
+        except Exception as exc:
+            st.error(f"Revisa el texto pegado: {exc}")
+    if df_preview is not None:
+        st.caption(f"Vista previa: {len(df_preview):,} registros · {len(df_preview.columns)} columnas")
+        st.dataframe(df_preview.head(20), width="stretch", hide_index=True)
+
+    st.markdown("#### Carpeta de destino")
+    if st.button("🔄 Actualizar listado de carpetas", key="actualizar_carpetas"):
+        inventario_repositorio_github.clear()
+    inventario = None
+    try:
+        inventario = inventario_repositorio_github()
+    except Exception:
+        st.error("No se pudo consultar el repositorio. Revisa la conexión, la rama y el token de GitHub; después actualiza el listado.")
+
+    carpeta = None
+    nombre_csv = None
+    agregar = False
+    if inventario is not None:
+        carpetas = [""] + sorted(r for r, tipo in inventario.items() if tipo == "tree")
+        accion_carpeta = st.radio("Destino", ["Usar carpeta existente", "Crear carpeta nueva"], horizontal=True, key="accion_carpeta")
+        if accion_carpeta == "Usar carpeta existente":
+            carpeta = st.selectbox("Carpetas del repositorio", carpetas,
+                index=carpetas.index(GITHUB_FOLDER) if GITHUB_FOLDER in carpetas else 0,
+                format_func=lambda p: p or "/ (raíz del repositorio)", key="carpeta_existente")
+        else:
+            padre = st.selectbox("Crear dentro de", carpetas,
+                format_func=lambda p: p or "/ (raíz del repositorio)", key="carpeta_padre")
+            nueva = st.text_input("Nombre de la nueva carpeta", key="carpeta_nueva", placeholder="cierres_2026/semana_38")
+            if nueva.strip():
+                try:
+                    ruta_nueva = validar_ruta_carpeta(nueva)
+                    propuesta = f"{padre}/{ruta_nueva}" if padre else ruta_nueva
+                    if propuesta in inventario:
+                        raise ValueError("Esa ruta ya existe. Elígela como carpeta existente o usa otro nombre.")
+                    partes = propuesta.split("/")
+                    if any(inventario.get("/".join(partes[:i])) not in (None, "tree") for i in range(1, len(partes))):
+                        raise ValueError("Una parte de la ruta corresponde a un archivo, no a una carpeta.")
+                    carpeta = propuesta
+                except ValueError as exc:
+                    st.error(str(exc))
+            st.caption("La carpeta nueva se creará al guardar el primer CSV.")
+        if carpeta is not None:
+            prefijo = f"{carpeta}/" if carpeta else ""
+            archivos = sorted(r[len(prefijo):] for r, tipo in inventario.items()
+                if tipo == "blob" and r.startswith(prefijo) and "/" not in r[len(prefijo):] and r.lower().endswith(".csv"))
+            modos = ["Crear un CSV nuevo"] + (["Actualizar un CSV existente"] if archivos else [])
+            modo = st.radio("Archivo de destino", modos, horizontal=True, key=f"modo_csv:{carpeta}")
+            agregar = modo == "Actualizar un CSV existente"
+            if agregar:
+                nombre_csv = st.selectbox("CSV que recibirá las actualizaciones", archivos, key=f"csv_existente:{carpeta}")
+                st.caption("Se conservan los registros anteriores y se actualizan las coincidencias por OS, Cuenta, OT y Tipo.")
+            else:
+                nombre = st.text_input("Nombre del CSV", key="nombre_csv_captura", placeholder="CIERRE DIARIO SEM 38 2026.csv").strip()
+                if nombre:
+                    if "/" in nombre or "\\" in nombre or nombre in (".", "..") or any(ord(c) < 32 for c in nombre):
+                        st.error("Escribe solo el nombre del archivo; la carpeta se selecciona arriba.")
+                    else:
+                        candidato = nombre if nombre.lower().endswith(".csv") else f"{nombre}.csv"
+                        if prefijo + candidato in inventario:
+                            st.error("Ese nombre ya existe. Elige actualizar el CSV o escribe otro nombre.")
+                        else:
+                            nombre_csv = candidato
+    destino = f"{carpeta}/{nombre_csv}" if carpeta else nombre_csv
+    if carpeta is not None and nombre_csv:
+        st.info(f"Se guardará en: {GITHUB_REPO}/{destino}")
+        if carpeta != GITHUB_FOLDER.strip("/"):
+            st.caption(f"El dashboard actual consulta la carpeta {GITHUB_FOLDER}; este CSV se guardará en el destino que elegiste.")
+    clave = st.text_input("Clave de autorización del portal", type="password", key="token_auth_carga_v2")
+    puede_guardar = df_preview is not None and carpeta is not None and bool(nombre_csv)
+    if st.button("💾 Guardar CSV en la carpeta seleccionada", type="primary", disabled=not puede_guardar, key="guardar_captura"):
+        if not GITHUB_TOKEN:
+            st.error("Configura github.token en los secretos de Streamlit para guardar en el repositorio.")
+            return
+        if clave != st.secrets.get("UPLOAD_PASSWORD", "admin123"):
+            st.error("Clave de autorización incorrecta.")
+            return
+        with st.spinner("Guardando el CSV en la carpeta seleccionada..."):
+            try:
+                final = guardar_csv_en_carpeta(destino, df_preview, agregar)
+            except Exception as exc:
+                st.error(f"No se confirmó el guardado: {exc}")
+                return
+        mensaje = f"Guardado: {GITHUB_REPO}/{destino} · {len(final):,} registros en el CSV."
+        st.session_state["resultado_captura"] = mensaje
+        st.success(mensaje)
+        st.cache_data.clear()
+        # El consolidado pertenece únicamente a la carpeta configurada del dashboard.
+        if carpeta == GITHUB_FOLDER.strip("/"):
+            try:
+                consolidado = _regenerar_parquet_consolidado(nombre_csv, final)
+                if consolidado is None or consolidado.empty:
+                    raise ValueError("El consolidado no contiene datos válidos.")
+                buf = io.BytesIO()
+                consolidado.to_parquet(buf, index=False)
+                ruta_parquet = "/".join(p for p in (GITHUB_FOLDER.strip("/"), "datos_consolidados.parquet") if p)
+                ok, detalle = _push_blob_git_data_api(ruta_parquet, buf.getvalue(), f"Actualizar consolidado tras {nombre_csv}")
+                if not ok:
+                    raise ValueError(detalle)
+                st.success("También se actualizó el consolidado del dashboard.")
+            except Exception:
+                st.warning("El CSV sí quedó guardado, pero no se actualizó el consolidado. El dashboard puede seguir mostrando la versión anterior.")
+
 
 @st.dialog("Detalle Ampliado de Reincidencia por Usuario", width="large")
 def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
@@ -1635,129 +1647,217 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         st.info("No hay historial de cuentas con reincidencia para mostrar.")
 
 
-def guardar_y_reemplazar_semana_texto(nombre_semana: str, texto_datos: str) -> bool:
-    """Procesa el buffer en texto plano e interactúa con sistema local de manera atómica."""
-    try:
-        texto_limpio = texto_datos.strip()
-        if not texto_limpio:
-            st.error("El cuadro de texto está vacío.")
-            return False
+# ==============================================================================
+# 3. ESTILOS CSS UNIFICADOS (MODO CLARO CONTROLADO CON BORDES ENTERPRISE)
+# ==============================================================================
 
-        try:
-            df_nuevo = pd.read_csv(io.StringIO(texto_limpio), sep="\t", dtype=str)
-            if len(df_nuevo.columns) <= 1:
-                df_nuevo = pd.read_csv(io.StringIO(texto_limpio), sep=",", dtype=str)
-        except Exception as e_parse:
-            st.error(f"Error al interpretar la estructura de la tabla: {e_parse}")
-            return False
+def inyectar_estilos_css_enterprise() -> None:
+    # Verificación de seguridad para evitar fallos si no existe la paleta
+    paleta = globals().get("PALETA_COLOR", {
+        "azul_noche": "#0B192C",
+        "azul_marina": "#1E3E62",
+        "turquesa_cyan": "#008080",
+        "naranja_desierto": "#FF6500"
+    })
 
-        df_nuevo.columns = df_nuevo.columns.astype(str).str.strip()
+    css_custom = f"""
+    <style>
+    @import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap");
 
-        nombre_semana_clean = nombre_semana.strip().upper()
-        df_nuevo["Num_Semana_Archivo"] = nombre_semana_clean
-        if "SEMANA" not in df_nuevo.columns:
-            df_nuevo["SEMANA"] = nombre_semana_clean
+    html, body, [class*="css"], .stApp {{
+        font-family: "Plus Jakarta Sans", -apple-system, sans-serif !important;
+        background-color: #F8FAFC !important;
+        color: #000000 !important;
+    }}
 
-        csv_buffer = io.StringIO()
-        df_nuevo.to_csv(csv_buffer, index=False, encoding="utf-8-sig")
-        bytes_datos = csv_buffer.getvalue().encode("utf-8-sig")
+    [data-testid="stSidebar"] {{
+        background-color: {paleta["azul_noche"]} !important;
+        min-width: 320px !important;
+    }}
+    [data-testid="stSidebar"] * {{
+        color: #FFFFFF !important;
+    }}
 
-        nombre_archivo = f"{nombre_semana_clean}.csv"
-        
-        if supabase:
-            supabase.storage.from_("Totalplay_datos_semanales").upload(
-                path=nombre_archivo,
-                file=bytes_datos,
-                file_options={"content-type": "text/csv; charset=utf-8", "upsert": "true"}
-            )
-            st.cache_data.clear()
-            return True
-        else:
-            st.error("No hay una conexión activa con sistema local.")
-            return False
+    .main-header-enterprise {{
+        background: linear-gradient(135deg, {paleta["azul_noche"]} 0%, {paleta["azul_marina"]} 100%);
+        padding: 24px 30px;
+        border-radius: 14px;
+        border-bottom: 4px solid {paleta["turquesa_cyan"]};
+        color: #FFFFFF !important;
+        margin-bottom: 20px;
+        box-shadow: 0 8px 20px -5px rgba(11, 25, 44, 0.4);
+    }}
 
-    except Exception as e:
-        st.error(f"Error crítico al subir la semana a sistema local: {e}")
-        return False
+    .main-header-enterprise h1 {{
+        font-weight: 800 !important;
+        color: #FFFFFF !important;
+        margin: 0;
+        font-size: 22px;
+        letter-spacing: 0.5px;
+    }}
+
+    .main-header-enterprise p {{
+        color: {paleta["turquesa_cyan"]} !important;
+        margin: 4px 0 0 0;
+        font-size: 13px;
+        font-weight: 700;
+    }}
+
+    .kpi-wrapper-grid {{
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 14px;
+        margin-bottom: 20px;
+    }}
+
+    .kpi-card-enterprise {{
+        background: #FFFFFF !important;
+        border: 2px solid {paleta["azul_marina"]} !important;
+        border-radius: 12px;
+        padding: 16px 14px;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.06);
+        position: relative;
+    }}
+
+    .kpi-card-enterprise::before {{
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 5px;
+        background: {paleta["turquesa_cyan"]};
+        border-top-left-radius: 10px;
+        border-top-right-radius: 10px;
+    }}
+
+    .kpi-card-title {{
+        font-weight: 800 !important;
+        color: {paleta["azul_marina"]} !important;
+        font-size: 11px !important;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 6px;
+    }}
+
+    .kpi-card-value {{
+        font-weight: 900 !important;
+        color: #000000 !important;
+        font-size: 26px !important;
+        line-height: 1.1;
+    }}
+
+    .kpi-card-subtitle {{
+        font-size: 10px !important;
+        color: #475569 !important;
+        margin-top: 4px;
+        font-weight: 700 !important;
+    }}
+
+    /* CONTENEDOR GENERAL DE PESTAÑAS */
+    .stTabs [data-baseweb="tab-list"] {{
+        gap: 6px;
+        background-color: {paleta["azul_marina"]} !important;
+        padding: 6px;
+        border-radius: 10px;
+    }}
+
+    /* BOTONES DE PESTAÑA INACTIVOS */
+    .stTabs [data-baseweb="tab"] {{
+        height: 42px;
+        background-color: transparent !important;
+        border-radius: 6px;
+        color: #FFFFFF !important;
+        font-weight: 700;
+        font-size: 13px;
+        border: none !important;
+    }}
+
+    /* BOTÓN DE PESTAÑA SELECCIONADO (ACTIVO - CORREGIDO COLOR TURQUESA) */
+    .stTabs [aria-selected="true"] {{
+        background-color: {paleta["azul_noche"]} !important;
+        color: #FFFFFF !important;
+        border-bottom: 3px solid {paleta["turquesa_cyan"]} !important;
+        font-weight: 800 !important;
+    }}
+
+    /* SUB-TABS INTERNOS */
+    div[data-baseweb="tab-list"] button[aria-selected="true"] {{
+        background-color: {paleta["azul_noche"]} !important;
+        color: #FFFFFF !important;
+    }}
+
+    /* TABLAS DATAFRAME */
+    div[data-testid="stDataFrame"], div[aria-label="st.dataframe"] {{
+        background-color: #FFFFFF !important;
+        border: 2px solid {paleta["azul_marina"]} !important;
+        border-radius: 12px !important;
+        padding: 4px !important;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.05) !important;
+    }}
+
+    div[data-testid="stDataFrame"] iframe {{
+        background-color: #FFFFFF !important;
+    }}
+
+    .matrix-title-card {{
+        background-color: #FFFFFF;
+        border-left: 5px solid {paleta["naranja_desierto"]};
+        border-top: 1px solid #E2E8F0;
+        border-right: 1px solid #E2E8F0;
+        border-bottom: 1px solid #E2E8F0;
+        padding: 12px 16px;
+        border-radius: 6px;
+        margin-top: 15px;
+        margin-bottom: 12px;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.03);
+    }}
+
+    /* BOTONES SECUNDARIOS Y UPLOADERS */
+    div.stButton > button[kind="secondary"], 
+    div.stButton > button:not([kind="primary"]),
+    div.stDownloadButton > button,
+    [data-testid="stFileUploader"] section button,
+    [data-testid="stFileUploader"] label button {{
+        background-color: #FFFFFF !important;
+        color: #1E293B !important;
+        border: 1px solid #CBD5E1 !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        box-shadow: 0px 2px 4px rgba(0,0,0,0.05) !important;
+    }}
+
+    div.stButton > button[kind="secondary"]:hover, 
+    div.stButton > button:not([kind="primary"]):hover,
+    div.stDownloadButton > button:hover,
+    [data-testid="stFileUploader"] section button:hover,
+    [data-testid="stFileUploader"] label button:hover {{
+        background-color: #F8FAFC !important;
+        border-color: #94A3B8 !important;
+        color: #0F172A !important;
+    }}
+    </style>
+    """
+    st.markdown(css_custom, unsafe_allow_html=True)
+    
 # ==============================================================================
 # 8. NAVEGACIÓN PRINCIPAL
 # ==============================================================================
 
 def main() -> None:
-    st.set_page_config(
-        page_title=f"{NOMBRE_SISTEMA} v{VERSION_SISTEMA}",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded"
+    seccion = st.sidebar.radio(
+        "Menú principal",
+        ["📊 Consultar dashboard", "📝 Capturar / actualizar datos"],
+        index=1, key="seccion_principal",
     )
+
+    inyectar_estilos_css_enterprise()
+    inyectar_estilos_base_ui()
 
     # --------------------------------------------------------------------------
     # ESTILO FORZADO PARA PESTAÑAS (TABS) - VISIBILIDAD TOTAL EN CUALQUIER TEMA
     # --------------------------------------------------------------------------
-    st.markdown("""
-        <style>
-        /* Contenedor principal de la barra de pestañas */
-        div[data-baseweb="tab-list"] {
-            background-color: #0d1117 !important;
-            padding: 8px !important;
-            border-radius: 12px !important;
-            border: 1px solid #1e293b !important;
-            gap: 8px !important;
-        }
-
-        /* Pestañas inactivas (Estilo botón oscuro con borde sutil) */
-        button[data-baseweb="tab"] {
-            background-color: #161b22 !important;
-            border: 1px solid #30363d !important;
-            border-radius: 8px !important;
-            padding: 10px 18px !important;
-            white-space: nowrap !important;
-            position: relative !important;
-            transition: all 0.2s ease-in-out !important;
-        }
-
-        /* Texto de pestañas inactivas */
-        button[data-baseweb="tab"] p, 
-        button[data-baseweb="tab"] span {
-            color: #9198a1 !important;
-            font-weight: 600 !important;
-        }
-
-        /* Hover al pasar el ratón */
-        button[data-baseweb="tab"]:hover {
-            background-color: #21262d !important;
-            border-color: #38bdf8 !important;
-        }
-
-        /* Pestaña ACTIVA con la BARRA AZUL destacada */
-        button[data-baseweb="tab"][aria-selected="true"] {
-            background-color: #1e293b !important;
-            border: 2px solid #0284c7 !important;
-            box-shadow: 0px 0px 10px rgba(2, 132, 199, 0.4) !important;
-        }
-
-        /* Barra Azul superior en la pestaña activa */
-        button[data-baseweb="tab"][aria-selected="true"]::before {
-            content: "" !important;
-            position: absolute !important;
-            top: 0 !important;
-            left: 0 !important;
-            right: 0 !important;
-            height: 4px !important;
-            background-color: #38bdf8 !important;
-            border-radius: 8px 8px 0 0 !important;
-        }
-
-        /* Texto de la pestaña activa */
-        button[data-baseweb="tab"][aria-selected="true"] p,
-        button[data-baseweb="tab"][aria-selected="true"] span {
-            color: #38bdf8 !important;
-            font-weight: 700 !important;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    inyectar_estilos_css_enterprise()
+    
 
     # ENCABEZADO PRINCIPAL CON BOTONES DE ACTUALIZACIÓN DERECHA
     col_hdr_left, col_hdr_right = st.columns([0.70, 0.30])
@@ -1807,22 +1907,25 @@ def main() -> None:
 
         btn_c1, btn_c2 = st.columns(2)
         with btn_c1:
-            if st.button("🔄 Recargar", use_container_width="stretch", type="primary"):
+            if st.button("🔄 Recargar", use_container_width=True, type="primary"):
                 st.cache_data.clear()
                 st.rerun()
         with btn_c2:
-            if st.button("🧹 Limpiar Caché", use_container_width="stretch", type="secondary"):
+            if st.button("🧹 Limpiar Caché", use_container_width=True, type="secondary"):
                 st.cache_data.clear()
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 st.rerun()
 
-    # OBTENER FIRMA DINÁMICA DE LOS ARCHIVOS
-    hash_actual = obtener_hash_archivos_carpeta("datos_semanales")
-    df_raw = ejecutar_pipeline_ingestion_datos(hash_actual)
+    if seccion == "📝 Capturar / actualizar datos":
+        renderizar_modulo_carga_github()
+        return
+
+    df_raw = ejecutar_pipeline_ingestion_datos()
 
     if df_raw.empty:
-        st.error("⚠️ No hay datos disponibles para procesar en sistema local o en la carpeta 'datos_semanales'. Verifique las conexiones y archivos.")
+        st.error("⚠️ No hay datos disponibles en el repositorio de GitHub. Verifica el token, el repositorio y que existan archivos en la carpeta configurada.")
+        st.info("Abre '📝 Capturar / actualizar datos' en el menú lateral para pegar los registros e iniciar la carga.")
         return
 
     # --------------------------------------------------------------------------
@@ -1889,33 +1992,27 @@ def main() -> None:
     # PESTAÑAS PRINCIPALES
     # --------------------------------------------------------------------------
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Pólizas & Cuadrillas",
         "🔄 Reincidencias Total",
         "🛠️ Cambios de equipo",
-        "🎧 Causa & Solución soporte",
-        "☁️ Cargar a GitHub"
+        "🎧 Causa & Solución soporte"
     ])
 
     with tab1:
-      renderizar_pestana_polizas_cuadrillas(df_folios, dimension_sel)
+        renderizar_pestana_polizas_cuadrillas(df_folios, dimension_sel)
 
     with tab2:
-      renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
+        renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
 
     with tab3:
-      st.markdown("### 🛠️ Cambios de equipo")
-      st.info(
-          "ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas"
-          " cuando gustes construirlo."
-      )
+        st.markdown("### 🛠️ Cambios de equipo")
+        st.info("ℹ️ PROXIMAMENTE.")
 
     with tab4:
-      st.markdown("### 🎧 Causa & Solución soporte")
-      st.info(
-          "ℹ️ Módulo pendiente de configuración. Indica las reglas requeridas"
-          " cuando gustes construirlo."
-      )
+        st.markdown("### 🎧 Causa & Solución soporte")
+        st.info("ℹ️ PROXIMAMENTE.")
 
-    with tab5:
-      renderizar_modulo_carga_github()
+
+if __name__ == "__main__":
+    main()
