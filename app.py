@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 14.3.2-REPARAR-CONSOLIDADO
+# Archivo: app.py | Versión: 14.2.3-CONTRASTE-BOTONES
 # ==============================================================================
 
 import os
@@ -10,7 +10,6 @@ import logging
 import base64
 import csv
 import hashlib
-import inspect
 from urllib.parse import quote
 import requests
 import numpy as np
@@ -34,7 +33,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("ControlCuadrillas.Monolith")    
 
 import gc
-import time
 
 # -----------------------------------------------------------------------------
 # 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA (REMOTO PARQUET + LOCAL + GITHUB API)
@@ -57,17 +55,21 @@ GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO
 def descargar_y_procesar_archivo(nombre_archivo: str) -> Optional[pd.DataFrame]:
     """Descarga e ingesta individual de archivos remotos en fallback."""
     try:
-        contenido = leer_bytes_github(f"{GITHUB_FOLDER.strip('/')}/{nombre_archivo}")
-        if nombre_archivo.endswith(".parquet"):
-            df_temp = pd.read_parquet(io.BytesIO(contenido))
-        else:
-            try:
-                texto = contenido.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                texto = contenido.decode("latin1")
-            df_temp = interpretar_csv_pegado(texto)
-        df_temp["Archivo_Origen"] = str(nombre_archivo)
-        return df_temp
+        resp = requests.get(f"{GITHUB_RAW_BASE}/{nombre_archivo}", headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            bytes_data = io.BytesIO(resp.content)
+            if nombre_archivo.endswith(".parquet"):
+                df_temp = pd.read_parquet(bytes_data)
+            else:
+                try:
+                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
+                except Exception:
+                    bytes_data.seek(0)
+                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
+
+            if df_temp is not None and not df_temp.empty:
+                df_temp["Archivo_Origen"] = str(nombre_archivo)
+                return df_temp
     except Exception as e:
         if 'logger' in globals():
             logger.error(f"Error procesando remotos {nombre_archivo}: {e}")
@@ -171,13 +173,13 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner="⚡ Cargando dataset...")
-def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool = False) -> pd.DataFrame:
+def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     """
     Fuente única de datos: GitHub. Sin dependencia de disco local.
 
-    1) Ruta rápida: descarga 'datos_consolidados.parquet' ya transformado.
-    2) Solo con reconstruir=True: descarga los archivos semanales y transforma.
-       Los fallos del consolidado se muestran sin reconstruir automáticamente.
+    1) Ruta rápida: descarga 'datos_consolidados.parquet' ya transformado (2-5 seg).
+    2) Fallback: si no existe o está desactualizado, descarga todos los CSV/Parquet
+       semanales en paralelo desde GitHub y aplica transformar_dataset_completo().
     """
     cols_base = [
         "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa",
@@ -188,40 +190,23 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool
     # -------------------------------------------------------------------------
     # RUTA RÁPIDA: PARQUET CONSOLIDADO EN GITHUB (única fuente persistente)
     # -------------------------------------------------------------------------
-    inicio = time.perf_counter()
-    ruta = f"{GITHUB_FOLDER}/datos_consolidados.parquet"
+    url_parquet_remoto = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
     try:
-        # Contents + blob por SHA evita depender de una copia RAW de la rama.
-        contenido = leer_bytes_github(ruta)
-        descarga = time.perf_counter() - inicio
-        df = pd.read_parquet(io.BytesIO(contenido))
-        requeridas = set(cols_base + ["MES_DIM", "AÑO_DIM"])
-        if df.empty or not requeridas.issubset(df.columns):
-            faltantes = sorted(requeridas - set(df.columns))
-            raise ValueError(f"El Parquet tiene {len(df):,} filas, pero no está preparado para el dashboard. Faltan: {', '.join(faltantes)}. Reconstruye desde los archivos semanales.")
-        df.attrs["carga"] = {"fuente": "Parquet GitHub", "descarga_s": round(descarga, 2),
-                             "lectura_s": round(time.perf_counter() - inicio - descarga, 2),
-                             "filas": len(df)}
-        logger.info("Carga de datos: %s", df.attrs["carga"])
-        return df
-    except Exception as exc:
-        logger.warning("Consolidado no disponible (%s)", type(exc).__name__)
-        if not reconstruir:
-            if isinstance(exc, ValueError):
-                detalle = str(exc)
-            elif isinstance(exc, requests.HTTPError):
-                detalle = f"GitHub respondió HTTP {exc.response.status_code}. Revisa acceso, ruta y límites de la API."
-            elif isinstance(exc, requests.Timeout):
-                detalle = "Se agotó el tiempo de descarga de GitHub."
-            else:
-                detalle = f"Fallo de lectura: {type(exc).__name__}. Consulta los registros de la aplicación."
-            raise RuntimeError(detalle) from exc
+        resp = requests.get(url_parquet_remoto, headers=HEADERS, timeout=15)
+        if resp.status_code == 200:
+            df = pd.read_parquet(io.BytesIO(resp.content))
+            if not df.empty and "MES_DIM" in df.columns:
+                return df
+    except Exception as e:
+        if 'logger' in globals():
+            logger.warning(f"No se pudo descargar Parquet unificado remoto: {e}")
 
-    st.warning("Reconstrucción solicitada: se descargarán y procesarán los archivos semanales.")
+    # -------------------------------------------------------------------------
+    # FALLBACK: DESCARGA COMPLETA DESDE GITHUB API (solo si no hay parquet válido)
+    # -------------------------------------------------------------------------
     coleccion_dfs = []
     try:
         resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
         lista_archivos = [
             f["name"] for f in resp.json()
             if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet")) and f["name"] != "datos_consolidados.parquet"
@@ -229,13 +214,11 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool
     except Exception as e:
         if 'logger' in globals():
             logger.error(f"Error conectando con GitHub API: {e}")
-        raise RuntimeError("No se pudo listar el histórico de GitHub; no se reconstruyó el consolidado.") from e
+        lista_archivos = []
 
     if lista_archivos:
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=25) as executor:
             resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
-        if any(df is None for df in resultados):
-            raise RuntimeError("Falló la descarga de uno o más archivos; no se mostrará un histórico incompleto.")
         coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
 
     if not coleccion_dfs:
@@ -265,7 +248,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool
 ANIO_BASE_ESTRICTO: int = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str = "TOTALPLAY / OPERACIONES - REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str = "14.3.2-REPARAR-CONSOLIDADO"
+VERSION_SISTEMA: str = "14.2.3-CONTRASTE-BOTONES"
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -664,34 +647,73 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
     # Ordenar por Cuenta y Cronología
     df_valid = df[mask_cta_valida].sort_values(by=["Cuenta_Cliente", "_SEM_TEMP", "_INDEX_ORIGINAL"]).copy()
 
-    # Desplazar solo las columnas necesarias dentro de cada cuenta.
-    columnas_previas = list(dict.fromkeys([col_tech, col_empresa, col_causa, col_tipo, "_SEM_TEMP"]))
-    grupos = df_valid.groupby("Cuenta_Cliente", sort=False)
-    anteriores = grupos[columnas_previas].shift(1)
-    soporte = df_valid["Tipo_Orden"].map(es_evento_soporte)
-    elegibles = soporte & grupos.cumcount().gt(0)
-    actual = df_valid.loc[elegibles]
-    previo = anteriores.loc[elegibles]
-    if not actual.empty:
-        resultados = pd.DataFrame(index=actual.index)
-        resultados["FOLIO_KEY"] = actual["FOLIO_KEY"]
-        for origen, destino, defecto in [
-            (col_tech, "Usuario_Origen_Reincidencia", "SIN ESPECIFICAR"),
-            (col_empresa, "Empresa_Origen_Reincidencia", "SIN EMPRESA"),
-        ]:
-            valores = previo[origen].astype(str)
-            resultados[destino] = valores.mask(valores.str.upper().isin(["NAN", "NONE", "", "N/A", "NULL"]), defecto)
-        resultados["Semana_Origen_Reincidencia"] = previo["_SEM_TEMP"]
-        resultados["Causa_Origen"] = previo[col_causa].map(lambda x: str(x) if pd.notna(x) else "N/A")
-        resultados["TIPO_2"] = [obtener_valor_tipo2(c, t) for c, t in zip(previo[col_causa], previo[col_tipo])]
-        resultados["Falla_Nueva"] = actual[col_falla]
-        # Conservar la regla anterior: último resultado por folio, aplicado a sus duplicados.
-        resultados = resultados.drop_duplicates("FOLIO_KEY", keep="last").set_index("FOLIO_KEY")
-        mask_rein = df["FOLIO_KEY"].isin(resultados.index)
+    dict_reincidencias = {}
+
+    # Lógica de reincidencia (Evento N-1)
+    for cuenta, g in df_valid.groupby("Cuenta_Cliente"):
+        registros = g.to_dict("records")
+        n = len(registros)
+        if n < 2:
+            continue
+
+        for i in range(1, n):
+            reg_actual = registros[i]
+            tipo_actual = reg_actual.get("Tipo_Orden", reg_actual.get("TIPO", ""))
+
+            # Si la visita actual es un SOPORTE -> Reincidencia
+            if es_evento_soporte(tipo_actual):
+                reg_prev = registros[i - 1]  # Evento inmediatamente anterior (visita n-1)
+                
+                tech_prev = str(reg_prev.get(col_tech, "SIN ESPECIFICAR"))
+                if tech_prev.upper() in ["NAN", "NONE", "", "N/A", "NULL"]:
+                    tech_prev = "SIN ESPECIFICAR"
+
+                emp_prev = str(reg_prev.get(col_empresa, "SIN EMPRESA"))
+                if emp_prev.upper() in ["NAN", "NONE", "", "N/A", "NULL"]:
+                    emp_prev = "SIN EMPRESA"
+
+                # Generar TIPO_2 resolviendo el fallback si la causa es NA/None
+                causa_raw = reg_prev.get(col_causa)
+                tipo_raw = reg_prev.get(col_tipo)
+                tipo_2_val = obtener_valor_tipo2(causa_raw, tipo_raw)
+                falla_val = reg_actual.get(col_falla, "N/A")
+
+                key_actual = reg_actual.get("FOLIO_KEY")
+                dict_reincidencias[key_actual] = {
+                    "Usuario_Origen": tech_prev,
+                    "Empresa_Origen": emp_prev,
+                    "Semana_Origen": reg_prev.get("_SEM_TEMP", np.nan),
+                    "Causa_Origen": str(causa_raw) if pd.notna(causa_raw) else "N/A",
+                    "TIPO_2": tipo_2_val,
+                    "Falla_Nueva": falla_val
+                }
+
+    # Asignar resultados al DataFrame principal
+    if dict_reincidencias:
+        keys_rein = set(dict_reincidencias.keys())
+        mask_rein = df["FOLIO_KEY"].isin(keys_rein)
+
         df.loc[mask_rein, "ES_REINCIDENCIA"] = "SI"
         df.loc[mask_rein, "CONTEO_PREVIO_8_SEM"] = 1
-        for columna in resultados.columns:
-            df.loc[mask_rein, columna] = df.loc[mask_rein, "FOLIO_KEY"].map(resultados[columna])
+
+        df.loc[mask_rein, "Usuario_Origen_Reincidencia"] = df.loc[mask_rein, "FOLIO_KEY"].map(
+            lambda k: dict_reincidencias[k]["Usuario_Origen"] if k in dict_reincidencias else "N/A"
+        )
+        df.loc[mask_rein, "Empresa_Origen_Reincidencia"] = df.loc[mask_rein, "FOLIO_KEY"].map(
+            lambda k: dict_reincidencias[k]["Empresa_Origen"] if k in dict_reincidencias else "N/A"
+        )
+        df.loc[mask_rein, "Semana_Origen_Reincidencia"] = df.loc[mask_rein, "FOLIO_KEY"].map(
+            lambda k: dict_reincidencias[k]["Semana_Origen"] if k in dict_reincidencias else np.nan
+        )
+        df.loc[mask_rein, "Causa_Origen"] = df.loc[mask_rein, "FOLIO_KEY"].map(
+            lambda k: dict_reincidencias[k]["Causa_Origen"] if k in dict_reincidencias else "N/A"
+        )
+        df.loc[mask_rein, "TIPO_2"] = df.loc[mask_rein, "FOLIO_KEY"].map(
+            lambda k: dict_reincidencias[k]["TIPO_2"] if k in dict_reincidencias else "N/A"
+        )
+        df.loc[mask_rein, "Falla_Nueva"] = df.loc[mask_rein, "FOLIO_KEY"].map(
+            lambda k: dict_reincidencias[k]["Falla_Nueva"] if k in dict_reincidencias else "N/A"
+        )
 
     # Limpiar auxiliares
     df.drop(columns=["_INDEX_ORIGINAL", "_SEM_TEMP"], errors="ignore", inplace=True)
@@ -815,211 +837,193 @@ def inyectar_estilos_base_ui() -> None:
 # 7. VISTAS Y SECCIONES (OPTIMIZACIÓN VECTORIZADA DE ALTO RENDIMIENTO)
 # ==============================================================================
 
-def crear_pestanas_bajo_demanda(etiquetas: List[str], clave: str):
-    """Calcula solo la sección activa; admite versiones anteriores de Streamlit."""
-    if "on_change" in inspect.signature(st.tabs).parameters:
-        tabs = st.tabs(etiquetas, key=clave, on_change="rerun")
-        return tabs, [bool(tab.open) for tab in tabs]
-    seleccion = st.radio("Sección a consultar", etiquetas, horizontal=True, key=clave)
-    return [st.container() for _ in etiquetas], [e == seleccion for e in etiquetas]
-
-
 def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel: str) -> None:
     inyectar_estilos_base_ui()
+    kpis = extraer_metricas_kpi_totales(df_folios)
 
-    subtabs, visibles_sub = crear_pestanas_bajo_demanda([
+    sub_tab1, sub_tab2, sub_tab3, sub_tab4, sub_tab5 = st.tabs([
         "📈 Evolución & Productividad",
         "📊 Desglose por Pólizas",
         "🏆 Ranking de Cuadrillas / Técnicos",
         "📥 Descarga de Reportes",
         "📂 Cargar Datos Localmente"
-    ], "pestana_polizas")
-    sub_tab1, sub_tab2, sub_tab3, sub_tab4, sub_tab5 = subtabs
+    ])
 
     # Mostrar la captura antes de procesar los gráficos de las otras pestañas.
-    if visibles_sub[4]:
-        with sub_tab5:
-            st.button("📋 Abrir caja de pegado a todo el ancho", on_click=abrir_captura_completa, key="abrir_captura_ancha")
+    with sub_tab5:
+        st.button("📋 Abrir caja de pegado a todo el ancho", on_click=abrir_captura_completa, key="abrir_captura_ancha")
 
     # --------------------------------------------------------------------------
     # SUBTAB 1: EVOLUCIÓN & PRODUCTIVIDAD
     # --------------------------------------------------------------------------
-    if visibles_sub[0]:
-        with sub_tab1:
-            mask_grafico = df_folios[dimension_sel].notnull() & (~df_folios[dimension_sel].astype(str).str.lower().isin(["nan", "none", "null", ""]))
-            df_folios_grafico = df_folios[mask_grafico]
+    with sub_tab1:
+        mask_grafico = df_folios[dimension_sel].notnull() & (~df_folios[dimension_sel].astype(str).str.lower().isin(["nan", "none", "null", ""]))
+        df_folios_grafico = df_folios[mask_grafico]
         
-            fig_evolucion = generar_figura_evolucion_temporal(df_folios_grafico, dimension_sel)
-            st.plotly_chart(fig_evolucion, width="stretch", key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
+        fig_evolucion = generar_figura_evolucion_temporal(df_folios_grafico, dimension_sel)
+        st.plotly_chart(fig_evolucion, width="stretch", key="grafico_evolucion_temporal_polizas", config={'displayModeBar': False})
 
-            nom_dim_label = {
-                "FECHA_TRUNCADA": "Día",
-                "SEMANA_DIM": "Semana",
-                "MES_DIM": "Mes",
-                "AÑO_DIM": "Año"
-            }.get(dimension_sel, "Período")
+        nom_dim_label = {
+            "FECHA_TRUNCADA": "Día",
+            "SEMANA_DIM": "Semana",
+            "MES_DIM": "Mes",
+            "AÑO_DIM": "Año"
+        }.get(dimension_sel, "Período")
 
-            st.markdown(f"""
-            <div class="matrix-title-card" style="background:#1e293b; padding:12px; border-radius:8px; margin-bottom:12px; border:1px solid #334155;">
-                <b style="color:#f8fafc; font-size:15px;">👥 CUADRILLAS/TÉCNICOS FIRMADOS POR {nom_dim_label.upper()} Y PROVEEDOR</b>
-                <p style="color:#94a3b8; margin:2px 0 0 0; font-size:12px;">Conteo de usuarios técnicos únicos con actividad registrada por período.</p>
-            </div>
-            """, unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="matrix-title-card" style="background:#1e293b; padding:12px; border-radius:8px; margin-bottom:12px; border:1px solid #334155;">
+            <b style="color:#f8fafc; font-size:15px;">👥 CUADRILLAS/TÉCNICOS FIRMADOS POR {nom_dim_label.upper()} Y PROVEEDOR</b>
+            <p style="color:#94a3b8; margin:2px 0 0 0; font-size:12px;">Conteo de usuarios técnicos únicos con actividad registrada por período.</p>
+        </div>
+        """, unsafe_allow_html=True)
 
-            if not df_folios.empty:
-                df_matriz = pd.pivot_table(
-                    df_folios,
-                    index="Empresa",
-                    columns=dimension_sel,
-                    values="Usuario_Tecnico",
-                    aggfunc="nunique",
-                    fill_value=0
+        if not df_folios.empty:
+            df_matriz = pd.pivot_table(
+                df_folios,
+                index="Empresa",
+                columns=dimension_sel,
+                values="Usuario_Tecnico",
+                aggfunc="nunique",
+                fill_value=0
+            )
+            cols_raw = list(df_matriz.columns)
+
+            if dimension_sel == "FECHA_TRUNCADA":
+                cols_ordenadas = sorted(
+                    cols_raw,
+                    key=lambda x: pd.to_datetime(x, format="%d.%m.%Y", errors="coerce")
+                    if pd.notna(pd.to_datetime(x, format="%d.%m.%Y", errors="coerce")) else str(x)
                 )
-                cols_raw = list(df_matriz.columns)
+            elif dimension_sel == "MES_DIM":
+                cols_ordenadas = [m for m in LISTA_ORDENADA_MESES if m in cols_raw]
+            else:
+                def extraer_numero(texto):
+                    nums = re.findall(r'\d+', str(texto))
+                    return int(nums[0]) if nums else 99999
+                cols_validas = [c for c in cols_raw if str(c).lower() not in ["nan", "none", "null", ""]]
+                cols_ordenadas = sorted(cols_validas, key=extraer_numero)
 
-                if dimension_sel == "FECHA_TRUNCADA":
-                    cols_ordenadas = sorted(
-                        cols_raw,
-                        key=lambda x: pd.to_datetime(x, format="%d.%m.%Y", errors="coerce")
-                        if pd.notna(pd.to_datetime(x, format="%d.%m.%Y", errors="coerce")) else str(x)
-                    )
-                elif dimension_sel == "MES_DIM":
-                    cols_ordenadas = [m for m in LISTA_ORDENADA_MESES if m in cols_raw]
-                else:
-                    def extraer_numero(texto):
-                        nums = re.findall(r'\d+', str(texto))
-                        return int(nums[0]) if nums else 99999
-                    cols_validas = [c for c in cols_raw if str(c).lower() not in ["nan", "none", "null", ""]]
-                    cols_ordenadas = sorted(cols_validas, key=extraer_numero)
+            df_matriz = df_matriz[cols_ordenadas]
+            df_matriz.columns = [
+                f"Semana {int(float(str(c).replace('Semana','').strip()))}" 
+                if "Semana" in str(c) and ".0" in str(c) else str(c) 
+                for c in df_matriz.columns
+            ]
+            cols_ordenadas_limpias = list(df_matriz.columns)
 
-                df_matriz = df_matriz[cols_ordenadas]
-                df_matriz.columns = [
-                    f"Semana {int(float(str(c).replace('Semana','').strip()))}" 
-                    if "Semana" in str(c) and ".0" in str(c) else str(c) 
-                    for c in df_matriz.columns
-                ]
-                cols_ordenadas_limpias = list(df_matriz.columns)
+            # Vectorización optimizada de arrays con NumPy
+            matriz_vals = df_matriz[cols_ordenadas_limpias].to_numpy()
+            df_matriz["TENDENCIA"] = matriz_vals.tolist()
+            df_matriz["PROMEDIO_PERIODO"] = np.round(matriz_vals.mean(axis=1), 1)
 
-                # Vectorización optimizada de arrays con NumPy
-                matriz_vals = df_matriz[cols_ordenadas_limpias].to_numpy()
-                df_matriz["TENDENCIA"] = matriz_vals.tolist()
-                df_matriz["PROMEDIO_PERIODO"] = np.round(matriz_vals.mean(axis=1), 1)
+            df_totales = df_folios.groupby(dimension_sel)["Usuario_Tecnico"].nunique()
+            fila_total_serie = df_totales.reindex(cols_ordenadas).fillna(0).astype(int)
 
-                df_totales = df_folios.groupby(dimension_sel)["Usuario_Tecnico"].nunique()
-                fila_total_serie = df_totales.reindex(cols_ordenadas).fillna(0).astype(int)
-
-                dict_total = dict(zip(cols_ordenadas_limpias, fila_total_serie.values))
-                dict_total["TENDENCIA"] = fila_total_serie.tolist()
-                dict_total["PROMEDIO_PERIODO"] = round(float(fila_total_serie.mean()), 1)
+            dict_total = dict(zip(cols_ordenadas_limpias, fila_total_serie.values))
+            dict_total["TENDENCIA"] = fila_total_serie.tolist()
+            dict_total["PROMEDIO_PERIODO"] = round(float(fila_total_serie.mean()), 1)
             
-                df_total = pd.DataFrame([dict_total], index=["TOTAL GENERAL"])
-                df_matriz = pd.concat([df_matriz, df_total])
+            df_total = pd.DataFrame([dict_total], index=["TOTAL GENERAL"])
+            df_matriz = pd.concat([df_matriz, df_total])
 
-                columnas_finales = ["TENDENCIA"] + cols_ordenadas_limpias + ["PROMEDIO_PERIODO"]
-                df_matriz_final = df_matriz[columnas_finales].reset_index().rename(columns={"index": "Empresa"})
+            columnas_finales = ["TENDENCIA"] + cols_ordenadas_limpias + ["PROMEDIO_PERIODO"]
+            df_matriz_final = df_matriz[columnas_finales].reset_index().rename(columns={"index": "Empresa"})
             
-                st.dataframe(
-                    df_matriz_final,
-                    column_config={
-                        "Empresa": st.column_config.Column("Empresa", width="medium", pinned=True),
-                        "TENDENCIA": st.column_config.LineChartColumn("Tendencia", width="small", y_min=0, pinned=True),
-                        "PROMEDIO_PERIODO": st.column_config.NumberColumn("PROMEDIO_PERIODO", format="%.1f")
-                    },
-                    width="stretch", hide_index=True, height=320
+            st.dataframe(
+                df_matriz_final,
+                column_config={
+                    "Empresa": st.column_config.Column("Empresa", width="medium", pinned=True),
+                    "TENDENCIA": st.column_config.LineChartColumn("Tendencia", width="small", y_min=0, pinned=True),
+                    "PROMEDIO_PERIODO": st.column_config.NumberColumn("PROMEDIO_PERIODO", format="%.1f")
+                },
+                width="stretch", hide_index=True, height=320
+            )
+            
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            with col1:
+                df_pol = df_folios.groupby(["Nombre_Poliza"], observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True)
+                fig_pol = px.bar(
+                    df_pol, x="Total_Eventos", y="Nombre_Poliza", orientation="h", text="Total_Eventos",
+                    title="<b>VOLUMEN TOTAL POR TIPO DE PÓLIZA</b>",
+                    color_discrete_sequence=[PALETA_COLOR["azul_marina"]]
                 )
-            
-                st.markdown("---")
-                col1, col2 = st.columns(2)
-                with col1:
-                    df_pol = df_folios.groupby(["Nombre_Poliza"], observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True)
-                    fig_pol = px.bar(
-                        df_pol, x="Total_Eventos", y="Nombre_Poliza", orientation="h", text="Total_Eventos",
-                        title="<b>VOLUMEN TOTAL POR TIPO DE PÓLIZA</b>",
-                        color_discrete_sequence=[PALETA_COLOR["azul_marina"]]
-                    )
-                    fig_pol.update_layout(
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                        font=dict(family="Plus Jakarta Sans", size=12, color="#E2E8F0"),
-                        title=dict(font=dict(color="#FFFFFF", size=14)),
-                        xaxis=dict(showgrid=True, gridcolor="#334155", tickfont=dict(color="#E2E8F0", size=11, weight="bold")),
-                        yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
-                    )
-                    fig_pol.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
-                    st.plotly_chart(fig_pol, width="stretch", config={'displayModeBar': False})
+                fig_pol.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="Plus Jakarta Sans", size=12, color="#E2E8F0"),
+                    title=dict(font=dict(color="#FFFFFF", size=14)),
+                    xaxis=dict(showgrid=True, gridcolor="#334155", tickfont=dict(color="#E2E8F0", size=11, weight="bold")),
+                    yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
+                )
+                fig_pol.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
+                st.plotly_chart(fig_pol, width="stretch", config={'displayModeBar': False})
 
-                with col2:
-                    df_eve = df_folios.groupby("Tipo_Orden", observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True).tail(10)
-                    fig_eve = px.bar(
-                        df_eve, x="Total_Eventos", y="Tipo_Orden", orientation="h", text="Total_Eventos",
-                        title="<b>TOP 10 TIPOS DE EVENTO / ORDEN</b>",
-                        color_discrete_sequence=[PALETA_COLOR["turquesa_cyan"]]
-                    )
-                    fig_eve.update_layout(
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                        font=dict(family="Plus Jakarta Sans", size=12, color="#E2E8F0"),
-                        title=dict(font=dict(color="#FFFFFF", size=14)),
-                        xaxis=dict(showgrid=True, gridcolor="#334155", tickfont=dict(color="#E2E8F0", size=11, weight="bold")),
-                        yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
-                    )
-                    fig_eve.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
-                    st.plotly_chart(fig_eve, width="stretch", config={'displayModeBar': False})
+            with col2:
+                df_eve = df_folios.groupby("Tipo_Orden", observed=True).size().reset_index(name="Total_Eventos").sort_values(by="Total_Eventos", ascending=True).tail(10)
+                fig_eve = px.bar(
+                    df_eve, x="Total_Eventos", y="Tipo_Orden", orientation="h", text="Total_Eventos",
+                    title="<b>TOP 10 TIPOS DE EVENTO / ORDEN</b>",
+                    color_discrete_sequence=[PALETA_COLOR["turquesa_cyan"]]
+                )
+                fig_eve.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="Plus Jakarta Sans", size=12, color="#E2E8F0"),
+                    title=dict(font=dict(color="#FFFFFF", size=14)),
+                    xaxis=dict(showgrid=True, gridcolor="#334155", tickfont=dict(color="#E2E8F0", size=11, weight="bold")),
+                    yaxis=dict(tickfont=dict(color="#E2E8F0", size=11, weight="bold"))
+                )
+                fig_eve.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=11, weight="bold"))
+                st.plotly_chart(fig_eve, width="stretch", config={'displayModeBar': False})
 
     # --------------------------------------------------------------------------
     # SUBTAB 2: DESGROSE POR PÓLIZAS
     # --------------------------------------------------------------------------
-    if visibles_sub[1]:
-        with sub_tab2:
-            st.markdown("### 📂 Resumen Operativo por Tipo de Póliza Catalogada")
-            if not df_folios.empty:
-                df_res_pol = (
-                    df_folios.groupby(["Codigo_Poliza", "Nombre_Poliza"], observed=True)
-                    .agg(
-                        Total_Eventos=("FOLIO_KEY", "count"),
-                        Tecnicos_Unicos=("Usuario_Tecnico", "nunique"),
-                        Dias_Operativos=("FECHA_TRUNCADA", "nunique")
-                    ).reset_index()
-                )
-                v_calc_prod = np.vectorize(calcular_indice_productividad_diaria)
-                df_res_pol["Productividad_Promedio"] = v_calc_prod(
-                    df_res_pol["Total_Eventos"].to_numpy(),
-                    df_res_pol["Tecnicos_Unicos"].to_numpy(),
-                    df_res_pol["Dias_Operativos"].to_numpy()
-                )
-                st.dataframe(df_res_pol, width="stretch", hide_index=True)
+    with sub_tab2:
+        st.markdown("### 📂 Resumen Operativo por Tipo de Póliza Catalogada")
+        if not df_folios.empty:
+            df_res_pol = (
+                df_folios.groupby(["Codigo_Poliza", "Nombre_Poliza"], observed=True)
+                .agg(
+                    Total_Eventos=("FOLIO_KEY", "count"),
+                    Tecnicos_Unicos=("Usuario_Tecnico", "nunique"),
+                    Dias_Operativos=("FECHA_TRUNCADA", "nunique")
+                ).reset_index()
+            )
+            v_calc_prod = np.vectorize(calcular_indice_productividad_diaria)
+            df_res_pol["Productividad_Promedio"] = v_calc_prod(
+                df_res_pol["Total_Eventos"].to_numpy(),
+                df_res_pol["Tecnicos_Unicos"].to_numpy(),
+                df_res_pol["Dias_Operativos"].to_numpy()
+            )
+            st.dataframe(df_res_pol, width="stretch", hide_index=True)
 
     # --------------------------------------------------------------------------
     # SUBTAB 3: RANKING DE CUADRILLAS / TÉCNICOS
     # --------------------------------------------------------------------------
-    if visibles_sub[2]:
-        with sub_tab3:
-            st.markdown("### 🏆 Ranking de Productividad por Cuadrilla / Técnico")
-            if not df_folios.empty:
-                df_rank = (
-                    df_folios.groupby(["Usuario_Tecnico", "Codigo_Poliza", "Nombre_Poliza", "Empresa"], observed=True)
-                    .agg(Eventos_Totales=("FOLIO_KEY", "count"), Dias_Activos=("FECHA_TRUNCADA", "nunique"))
-                    .reset_index()
-                )
-                v_calc_prod = np.vectorize(calcular_indice_productividad_diaria)
-                df_rank["Productividad_Diaria"] = v_calc_prod(
-                    df_rank["Eventos_Totales"].to_numpy(),
-                    1,
-                    df_rank["Dias_Activos"].to_numpy()
-                )
-                df_rank = df_rank.sort_values(by="Productividad_Diaria", ascending=False)
-                st.dataframe(df_rank, width="stretch", hide_index=True, height=400)
+    with sub_tab3:
+        st.markdown("### 🏆 Ranking de Productividad por Cuadrilla / Técnico")
+        if not df_folios.empty:
+            df_rank = (
+                df_folios.groupby(["Usuario_Tecnico", "Codigo_Poliza", "Nombre_Poliza", "Empresa"], observed=True)
+                .agg(Eventos_Totales=("FOLIO_KEY", "count"), Dias_Activos=("FECHA_TRUNCADA", "nunique"))
+                .reset_index()
+            )
+            v_calc_prod = np.vectorize(calcular_indice_productividad_diaria)
+            df_rank["Productividad_Diaria"] = v_calc_prod(
+                df_rank["Eventos_Totales"].to_numpy(),
+                1,
+                df_rank["Dias_Activos"].to_numpy()
+            )
+            df_rank = df_rank.sort_values(by="Productividad_Diaria", ascending=False)
+            st.dataframe(df_rank, width="stretch", hide_index=True, height=400)
 
     # --------------------------------------------------------------------------
     # SUBTAB 4: DESCARGA DE REPORTES
     # --------------------------------------------------------------------------
-    if visibles_sub[3]:
-        with sub_tab4:
-            st.markdown("### 📥 Descarga de Reportes")
-            st.caption(f"El reporte incluirá {len(df_folios):,} registros de los filtros actuales.")
-            if st.button("Preparar CSV para descargar", key="preparar_reporte_csv"):
-                with st.spinner("Preparando el reporte solicitado..."):
-                    csv_bytes = df_folios.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("📄 Descargar Dataset (CSV)", csv_bytes,
-                    f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv", on_click="ignore")
+    with sub_tab4:
+        st.markdown("### 📥 Descarga de Reportes")
+        csv_bytes = df_folios.to_csv(index=False).encode("utf-8")
+        st.download_button("📄 Descargar Dataset (CSV)", csv_bytes, f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv")
         
 # ==============================================================================
 # MÓDULO DE CARGA DIRECTA A GITHUB (ÚNICA FUENTE DE VERDAD, SIN DISCO LOCAL)
@@ -1540,7 +1544,6 @@ def _renderizar_formulario_carga_github():
         st.success(mensaje)
         st.link_button("Abrir el CSV guardado en GitHub", confirmado["url"])
         st.cache_data.clear()
-        st.session_state.pop("dataset_reconstruido", None)
         # El consolidado pertenece únicamente a la carpeta configurada del dashboard.
         if carpeta == GITHUB_FOLDER.strip("/"):
             try:
@@ -2034,7 +2037,6 @@ def main() -> None:
         with btn_c1:
             if st.button("🔄 Recargar", use_container_width=True, type="primary"):
                 st.cache_data.clear()
-                st.session_state.pop("dataset_reconstruido", None)
                 st.rerun()
         with btn_c2:
             if st.button("🧹 Limpiar Caché", use_container_width=True, type="secondary"):
@@ -2047,47 +2049,7 @@ def main() -> None:
         renderizar_modulo_carga_github()
         return
 
-    try:
-        df_raw = st.session_state.get("dataset_reconstruido")
-        if df_raw is None:
-            df_raw = ejecutar_pipeline_ingestion_datos()
-    except RuntimeError as exc:
-        st.error(str(exc))
-        st.caption("La descarga completa del histórico requiere esta acción explícita.")
-        if st.button("Reconstruir lectura desde archivos semanales"):
-            try:
-                df_raw = ejecutar_pipeline_ingestion_datos(reconstruir=True)
-                st.session_state["dataset_reconstruido"] = df_raw
-            except Exception as error:
-                st.error(str(error))
-                return
-        else:
-            return
-    if "dataset_reconstruido" in st.session_state:
-        st.info(f"Histórico reconstruido en esta sesión: {len(df_raw):,} filas. Guarda el consolidado para reutilizarlo al abrir la aplicación.")
-        clave_reparacion = st.text_input("Clave de autorización del portal", type="password", key="clave_reparacion")
-        if st.button("Guardar consolidado reparado en GitHub"):
-            if not GITHUB_TOKEN or clave_reparacion != st.secrets.get("UPLOAD_PASSWORD", "admin123"):
-                st.error("Revisa la clave del portal y la configuración del token.")
-            else:
-                with st.spinner("Guardando y verificando el consolidado..."):
-                    try:
-                        buf = io.BytesIO()
-                        df_raw.to_parquet(buf, index=False)
-                        ruta = f"{GITHUB_FOLDER.strip('/')}/datos_consolidados.parquet"
-                        ok, detalle = _push_blob_git_data_api(ruta, buf.getvalue(), "Reparar consolidado completo del dashboard")
-                        if not ok:
-                            raise RuntimeError("GitHub no confirmó la escritura del consolidado.")
-                        if leer_bytes_github(ruta) != buf.getvalue():
-                            raise RuntimeError("No se pudo verificar el consolidado guardado. Revisa GitHub antes de repetir.")
-                        st.cache_data.clear()
-                        st.session_state.pop("dataset_reconstruido", None)
-                        st.success("Consolidado guardado y verificado. La próxima lectura utilizará este archivo.")
-                    except Exception as exc:
-                        st.error(f"No se confirmó la reparación: {type(exc).__name__}. El histórico de esta sesión sigue disponible.")
-    carga = df_raw.attrs.get("carga")
-    if carga:
-        st.caption(f"{carga['filas']:,} registros · Descarga: {carga['descarga_s']} s · Lectura Parquet: {carga['lectura_s']} s (en caché al repetir)")
+    df_raw = ejecutar_pipeline_ingestion_datos()
 
     if df_raw.empty:
         st.error("⚠️ No hay datos disponibles en el repositorio de GitHub. Verifica el token, el repositorio y que existan archivos en la carpeta configurada.")
@@ -2113,7 +2075,7 @@ def main() -> None:
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🔍 Filtos Dinámicos")
 
-    df_temp = df_raw
+    df_temp = df_raw.copy()
 
     meses_disponibles = [m for m in LISTA_ORDENADA_MESES if m in df_temp["MES_DIM"].unique()]
     filtro_meses_sel = st.sidebar.multiselect("Mes:", meses_disponibles)
@@ -2158,31 +2120,26 @@ def main() -> None:
     # PESTAÑAS PRINCIPALES
     # --------------------------------------------------------------------------
 
-    tabs_principales, visibles_principales = crear_pestanas_bajo_demanda([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Pólizas & Cuadrillas",
         "🔄 Reincidencias Total",
         "🛠️ Cambios de equipo",
         "🎧 Causa & Solución soporte"
-    ], "pestana_dashboard")
-    tab1, tab2, tab3, tab4 = tabs_principales
+    ])
 
-    if visibles_principales[0]:
-        with tab1:
-            renderizar_pestana_polizas_cuadrillas(df_folios, dimension_sel)
+    with tab1:
+        renderizar_pestana_polizas_cuadrillas(df_folios, dimension_sel)
 
-    if visibles_principales[1]:
-        with tab2:
-            renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
+    with tab2:
+        renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
 
-    if visibles_principales[2]:
-        with tab3:
-            st.markdown("### 🛠️ Cambios de equipo")
-            st.info("ℹ️ PROXIMAMENTE.")
+    with tab3:
+        st.markdown("### 🛠️ Cambios de equipo")
+        st.info("ℹ️ PROXIMAMENTE.")
 
-    if visibles_principales[3]:
-        with tab4:
-            st.markdown("### 🎧 Causa & Solución soporte")
-            st.info("ℹ️ PROXIMAMENTE.")
+    with tab4:
+        st.markdown("### 🎧 Causa & Solución soporte")
+        st.info("ℹ️ PROXIMAMENTE.")
 
 
 if __name__ == "__main__":
