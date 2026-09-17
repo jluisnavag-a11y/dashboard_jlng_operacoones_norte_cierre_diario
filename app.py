@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 14.2.1-TEXTO-NEGRO
+# Archivo: app.py | Versión: 14.2.2-CONTRASTE-Y-CONFIRMACION
 # ==============================================================================
 
 import os
@@ -9,6 +9,7 @@ import io
 import logging
 import base64
 import csv
+import hashlib
 from urllib.parse import quote
 import requests
 import numpy as np
@@ -247,7 +248,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
 ANIO_BASE_ESTRICTO: int = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str = "TOTALPLAY / OPERACIONES - REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str = "14.2.1-TEXTO-NEGRO"
+VERSION_SISTEMA: str = "14.2.2-CONTRASTE-Y-CONFIRMACION"
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -1294,9 +1295,10 @@ def guardar_csv_en_carpeta(ruta: str, df: pd.DataFrame, agregar: bool) -> pd.Dat
         raise ValueError("Ya existe un archivo con ese nombre. Selecciona actualizar o escribe otro nombre.")
     elif res.status_code != 404:
         res.raise_for_status()
+    contenido_csv = final.to_csv(index=False).encode("utf-8-sig")
     payload = {
         "message": f"Actualizar captura CSV: {ruta}",
-        "content": base64.b64encode(final.to_csv(index=False).encode("utf-8-sig")).decode("ascii"),
+        "content": base64.b64encode(contenido_csv).decode("ascii"),
         "branch": GITHUB_BRANCH,
     }
     if sha:
@@ -1305,6 +1307,26 @@ def guardar_csv_en_carpeta(ruta: str, df: pd.DataFrame, agregar: bool) -> pd.Dat
     if resultado.status_code == 409:
         raise ValueError("El archivo cambió durante la carga. Actualiza el listado y vuelve a intentarlo.")
     resultado.raise_for_status()
+    # Confirmar la ruta y el contenido de la revisión escrita antes del mensaje verde.
+    try:
+        datos = resultado.json()
+        commit = datos["commit"]["sha"]
+        esperado = hashlib.sha1(b"blob " + str(len(contenido_csv)).encode("ascii") + b"\0" + contenido_csv).hexdigest()
+        if datos["content"]["sha"] != esperado or datos["content"]["path"] != ruta:
+            raise ValueError("La respuesta no coincide con el CSV enviado.")
+        comprobacion = requests.get(url, params={"ref": commit}, headers=_headers_github_contenido(), timeout=25)
+        comprobacion.raise_for_status()
+        confirmado = comprobacion.json()
+        if confirmado.get("sha") != esperado or confirmado.get("path") != ruta:
+            raise ValueError("No coincide la lectura del archivo guardado.")
+    except Exception as exc:
+        raise ValueError("GitHub aceptó la escritura, pero no se pudo verificar el archivo. Revisa la carpeta en GitHub antes de intentar guardarlo de nuevo.") from exc
+    final.attrs["guardado_github"] = {
+        "ruta": ruta,
+        "filas": len(final),
+        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "url": f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/blob/{commit}/{quote(ruta, safe='/')}",
+    }
     return final
 
 
@@ -1350,6 +1372,28 @@ def renderizar_modulo_carga_github():
         background-color: #e5e7eb !important;
         opacity: 0.65 !important;
     }
+    /* Cubrir también las capas internas de los selectores nativos de Streamlit. */
+    .st-key-formulario_carga [data-testid="stSelectbox"] div,
+    .st-key-formulario_carga [data-testid="stSelectbox"] input,
+    .st-key-formulario_carga [data-testid="stSelectbox"] button,
+    .st-key-formulario_carga [data-testid="stSelectbox"] select,
+    .st-key-formulario_carga [data-testid="stSelectbox"] [role="combobox"],
+    .st-key-formulario_carga [data-testid="stTextInput"] button {
+        background: #ffffff !important;
+        color: #000000 !important;
+        -webkit-text-fill-color: #000000 !important;
+    }
+    .st-key-formulario_carga [data-testid="stSelectbox"] svg,
+    .st-key-formulario_carga [data-testid="stTextInput"] button svg {
+        color: #000000 !important;
+        fill: #000000 !important;
+    }
+    body:has(.st-key-formulario_carga) [role="listbox"],
+    body:has(.st-key-formulario_carga) [role="listbox"] * {
+        background: #ffffff !important;
+        color: #000000 !important;
+        -webkit-text-fill-color: #000000 !important;
+    }
     /* Los menús desplegados se montan fuera del contenedor del formulario. */
     body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="listbox"],
     body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"] {
@@ -1371,8 +1415,10 @@ def renderizar_modulo_carga_github():
 def _renderizar_formulario_carga_github():
     st.markdown("### 📋 Pegar información y guardar en GitHub")
     st.caption(f"Versión {VERSION_SISTEMA} · Repositorio: {GITHUB_USER}/{GITHUB_REPO} · Rama: {GITHUB_BRANCH}")
-    if st.session_state.get("resultado_captura"):
-        st.success(st.session_state["resultado_captura"])
+    resultado_previo = st.session_state.get("resultado_captura")
+    if isinstance(resultado_previo, dict):
+        st.success(f"Último guardado verificado: {resultado_previo['ruta']} · {resultado_previo['filas']:,} registros · {resultado_previo['fecha']}")
+        st.link_button("Abrir el CSV guardado en GitHub", resultado_previo["url"])
     # Sin columnas ni pestañas envolventes: ocupa todo el ancho del área principal.
     contenido_txt = st.text_area(
         "Pega aquí el CSV completo o las celdas copiadas desde Excel, incluidos los encabezados",
@@ -1450,12 +1496,14 @@ def _renderizar_formulario_carga_github():
                             nombre_csv = candidato
     destino = f"{carpeta}/{nombre_csv}" if carpeta else nombre_csv
     if carpeta is not None and nombre_csv:
-        st.info(f"Se guardará en: {GITHUB_REPO}/{destino}")
+        st.info(f"Destino seleccionado: {GITHUB_REPO}/{destino}")
+        st.caption("Esta selección todavía no carga los datos. Pulsa el botón Guardar CSV y espera la confirmación verde.")
         if carpeta != GITHUB_FOLDER.strip("/"):
             st.caption(f"El dashboard actual consulta la carpeta {GITHUB_FOLDER}; este CSV se guardará en el destino que elegiste.")
     clave = st.text_input("Clave de autorización del portal", type="password", key="token_auth_carga_v2")
     puede_guardar = df_preview is not None and carpeta is not None and bool(nombre_csv)
     if st.button("💾 Guardar CSV en la carpeta seleccionada", type="primary", disabled=not puede_guardar, key="guardar_captura"):
+        st.session_state.pop("resultado_captura", None)
         if not GITHUB_TOKEN:
             st.error("Configura github.token en los secretos de Streamlit para guardar en el repositorio.")
             return
@@ -1468,9 +1516,11 @@ def _renderizar_formulario_carga_github():
             except Exception as exc:
                 st.error(f"No se confirmó el guardado: {exc}")
                 return
-        mensaje = f"Guardado: {GITHUB_REPO}/{destino} · {len(final):,} registros en el CSV."
-        st.session_state["resultado_captura"] = mensaje
+        mensaje = f"✅ Guardado y verificado en GitHub: {destino} · {len(final):,} registros en el CSV."
+        confirmado = final.attrs["guardado_github"]
+        st.session_state["resultado_captura"] = confirmado
         st.success(mensaje)
+        st.link_button("Abrir el CSV guardado en GitHub", confirmado["url"])
         st.cache_data.clear()
         # El consolidado pertenece únicamente a la carpeta configurada del dashboard.
         if carpeta == GITHUB_FOLDER.strip("/"):
