@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 14.2.0-PEGADO-CARPETAS
+# Archivo: app.py | Versión: 14.2.1-TEXTO-NEGRO
 # ==============================================================================
 
 import os
@@ -247,7 +247,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
 ANIO_BASE_ESTRICTO: int = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str = "TOTALPLAY / OPERACIONES - REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str = "14.2.0-PEGADO-CARPETAS"
+VERSION_SISTEMA: str = "14.2.1-TEXTO-NEGRO"
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -1313,6 +1313,62 @@ def abrir_captura_completa():
 
 
 def renderizar_modulo_carga_github():
+    # Contraste del formulario independiente del tema oscuro del dashboard.
+    st.markdown("""
+    <style>
+    .st-key-formulario_carga,
+    .st-key-formulario_carga * {
+        color: #000000 !important;
+    }
+    .st-key-formulario_carga [data-testid="stWidgetLabel"] *,
+    .st-key-formulario_carga [data-testid="stCaptionContainer"] * {
+        color: #000000 !important;
+        opacity: 1 !important;
+    }
+    .st-key-formulario_carga div[data-testid="stTextArea"] textarea,
+    .st-key-formulario_carga div[data-testid="stTextInput"] input,
+    .st-key-formulario_carga [data-baseweb="input"],
+    .st-key-formulario_carga [data-baseweb="base-input"],
+    .st-key-formulario_carga [data-baseweb="select"] > div,
+    .st-key-formulario_carga div.stButton > button {
+        background-color: #ffffff !important;
+        color: #000000 !important;
+        -webkit-text-fill-color: #000000 !important;
+        border-color: #64748b !important;
+        caret-color: #000000 !important;
+    }
+    .st-key-formulario_carga textarea::placeholder,
+    .st-key-formulario_carga input::placeholder {
+        color: #404040 !important;
+        -webkit-text-fill-color: #404040 !important;
+        opacity: 1 !important;
+    }
+    .st-key-formulario_carga div.stButton > button:hover {
+        background-color: #e2e8f0 !important;
+    }
+    .st-key-formulario_carga div.stButton > button:disabled {
+        background-color: #e5e7eb !important;
+        opacity: 0.65 !important;
+    }
+    /* Los menús desplegados se montan fuera del contenedor del formulario. */
+    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="listbox"],
+    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"] {
+        background-color: #ffffff !important;
+        color: #000000 !important;
+    }
+    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"] * {
+        color: #000000 !important;
+    }
+    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"]:hover {
+        background-color: #e2e8f0 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    with st.container(key="formulario_carga"):
+        _renderizar_formulario_carga_github()
+
+
+def _renderizar_formulario_carga_github():
     st.markdown("### 📋 Pegar información y guardar en GitHub")
     st.caption(f"Versión {VERSION_SISTEMA} · Repositorio: {GITHUB_USER}/{GITHUB_REPO} · Rama: {GITHUB_BRANCH}")
     if st.session_state.get("resultado_captura"):
