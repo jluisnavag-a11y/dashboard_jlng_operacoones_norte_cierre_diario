@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 14.3.1-INGESTA-CONTROLADA
+# Archivo: app.py | Versión: 14.3.2-REPARAR-CONSOLIDADO
 # ==============================================================================
 
 import os
@@ -57,21 +57,17 @@ GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO
 def descargar_y_procesar_archivo(nombre_archivo: str) -> Optional[pd.DataFrame]:
     """Descarga e ingesta individual de archivos remotos en fallback."""
     try:
-        resp = requests.get(f"{GITHUB_RAW_BASE}/{nombre_archivo}", headers=HEADERS, timeout=10)
-        if resp.status_code == 200:
-            bytes_data = io.BytesIO(resp.content)
-            if nombre_archivo.endswith(".parquet"):
-                df_temp = pd.read_parquet(bytes_data)
-            else:
-                try:
-                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="utf-8", on_bad_lines="skip")
-                except Exception:
-                    bytes_data.seek(0)
-                    df_temp = pd.read_csv(bytes_data, low_memory=False, dtype=str, encoding="latin1", on_bad_lines="skip")
-
-            if df_temp is not None and not df_temp.empty:
-                df_temp["Archivo_Origen"] = str(nombre_archivo)
-                return df_temp
+        contenido = leer_bytes_github(f"{GITHUB_FOLDER.strip('/')}/{nombre_archivo}")
+        if nombre_archivo.endswith(".parquet"):
+            df_temp = pd.read_parquet(io.BytesIO(contenido))
+        else:
+            try:
+                texto = contenido.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                texto = contenido.decode("latin1")
+            df_temp = interpretar_csv_pegado(texto)
+        df_temp["Archivo_Origen"] = str(nombre_archivo)
+        return df_temp
     except Exception as e:
         if 'logger' in globals():
             logger.error(f"Error procesando remotos {nombre_archivo}: {e}")
@@ -201,7 +197,8 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool
         df = pd.read_parquet(io.BytesIO(contenido))
         requeridas = set(cols_base + ["MES_DIM", "AÑO_DIM"])
         if df.empty or not requeridas.issubset(df.columns):
-            raise ValueError("Consolidado vacío o sin las dimensiones requeridas")
+            faltantes = sorted(requeridas - set(df.columns))
+            raise ValueError(f"El Parquet tiene {len(df):,} filas, pero no está preparado para el dashboard. Faltan: {', '.join(faltantes)}. Reconstruye desde los archivos semanales.")
         df.attrs["carga"] = {"fuente": "Parquet GitHub", "descarga_s": round(descarga, 2),
                              "lectura_s": round(time.perf_counter() - inicio - descarga, 2),
                              "filas": len(df)}
@@ -210,12 +207,21 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool
     except Exception as exc:
         logger.warning("Consolidado no disponible (%s)", type(exc).__name__)
         if not reconstruir:
-            raise RuntimeError("No se pudo leer el consolidado Parquet. Revisa su existencia y los permisos de lectura; consulta los registros de la aplicación.") from exc
+            if isinstance(exc, ValueError):
+                detalle = str(exc)
+            elif isinstance(exc, requests.HTTPError):
+                detalle = f"GitHub respondió HTTP {exc.response.status_code}. Revisa acceso, ruta y límites de la API."
+            elif isinstance(exc, requests.Timeout):
+                detalle = "Se agotó el tiempo de descarga de GitHub."
+            else:
+                detalle = f"Fallo de lectura: {type(exc).__name__}. Consulta los registros de la aplicación."
+            raise RuntimeError(detalle) from exc
 
     st.warning("Reconstrucción solicitada: se descargarán y procesarán los archivos semanales.")
     coleccion_dfs = []
     try:
         resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
         lista_archivos = [
             f["name"] for f in resp.json()
             if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet")) and f["name"] != "datos_consolidados.parquet"
@@ -223,7 +229,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool
     except Exception as e:
         if 'logger' in globals():
             logger.error(f"Error conectando con GitHub API: {e}")
-        lista_archivos = []
+        raise RuntimeError("No se pudo listar el histórico de GitHub; no se reconstruyó el consolidado.") from e
 
     if lista_archivos:
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -259,7 +265,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool
 ANIO_BASE_ESTRICTO: int = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str = "TOTALPLAY / OPERACIONES - REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str = "14.3.1-INGESTA-CONTROLADA"
+VERSION_SISTEMA: str = "14.3.2-REPARAR-CONSOLIDADO"
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -2057,6 +2063,28 @@ def main() -> None:
                 return
         else:
             return
+    if "dataset_reconstruido" in st.session_state:
+        st.info(f"Histórico reconstruido en esta sesión: {len(df_raw):,} filas. Guarda el consolidado para reutilizarlo al abrir la aplicación.")
+        clave_reparacion = st.text_input("Clave de autorización del portal", type="password", key="clave_reparacion")
+        if st.button("Guardar consolidado reparado en GitHub"):
+            if not GITHUB_TOKEN or clave_reparacion != st.secrets.get("UPLOAD_PASSWORD", "admin123"):
+                st.error("Revisa la clave del portal y la configuración del token.")
+            else:
+                with st.spinner("Guardando y verificando el consolidado..."):
+                    try:
+                        buf = io.BytesIO()
+                        df_raw.to_parquet(buf, index=False)
+                        ruta = f"{GITHUB_FOLDER.strip('/')}/datos_consolidados.parquet"
+                        ok, detalle = _push_blob_git_data_api(ruta, buf.getvalue(), "Reparar consolidado completo del dashboard")
+                        if not ok:
+                            raise RuntimeError("GitHub no confirmó la escritura del consolidado.")
+                        if leer_bytes_github(ruta) != buf.getvalue():
+                            raise RuntimeError("No se pudo verificar el consolidado guardado. Revisa GitHub antes de repetir.")
+                        st.cache_data.clear()
+                        st.session_state.pop("dataset_reconstruido", None)
+                        st.success("Consolidado guardado y verificado. La próxima lectura utilizará este archivo.")
+                    except Exception as exc:
+                        st.error(f"No se confirmó la reparación: {type(exc).__name__}. El histórico de esta sesión sigue disponible.")
     carga = df_raw.attrs.get("carga")
     if carga:
         st.caption(f"{carga['filas']:,} registros · Descarga: {carga['descarga_s']} s · Lectura Parquet: {carga['lectura_s']} s (en caché al repetir)")
