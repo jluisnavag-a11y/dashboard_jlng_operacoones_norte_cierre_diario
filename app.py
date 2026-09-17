@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 14.3.0-CARGA-BAJO-DEMANDA
+# Archivo: app.py | Versión: 14.3.1-INGESTA-CONTROLADA
 # ==============================================================================
 
 import os
@@ -34,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("ControlCuadrillas.Monolith")    
 
 import gc
+import time
 
 # -----------------------------------------------------------------------------
 # 0.2. MOTOR DE CONSULTA Y LECTURA OPTIMIZADA (REMOTO PARQUET + LOCAL + GITHUB API)
@@ -174,13 +175,13 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner="⚡ Cargando dataset...")
-def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
+def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "", reconstruir: bool = False) -> pd.DataFrame:
     """
     Fuente única de datos: GitHub. Sin dependencia de disco local.
 
     1) Ruta rápida: descarga 'datos_consolidados.parquet' ya transformado.
-    2) Fallback: si no existe o está desactualizado, descarga todos los CSV/Parquet
-       semanales en paralelo desde GitHub y aplica transformar_dataset_completo().
+    2) Solo con reconstruir=True: descarga los archivos semanales y transforma.
+       Los fallos del consolidado se muestran sin reconstruir automáticamente.
     """
     cols_base = [
         "FOLIO_KEY", "Cuenta_Cliente", "Usuario_Tecnico", "Empresa",
@@ -191,21 +192,27 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
     # -------------------------------------------------------------------------
     # RUTA RÁPIDA: PARQUET CONSOLIDADO EN GITHUB (única fuente persistente)
     # -------------------------------------------------------------------------
-    url_parquet_remoto = f"{GITHUB_RAW_BASE}/datos_consolidados.parquet"
+    inicio = time.perf_counter()
+    ruta = f"{GITHUB_FOLDER}/datos_consolidados.parquet"
     try:
-        resp = requests.get(url_parquet_remoto, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            df = pd.read_parquet(io.BytesIO(resp.content))
-            if not df.empty and "MES_DIM" in df.columns:
-                return df
-    except Exception as e:
-        if 'logger' in globals():
-            logger.warning(f"No se pudo descargar Parquet unificado remoto: {e}")
+        # Contents + blob por SHA evita depender de una copia RAW de la rama.
+        contenido = leer_bytes_github(ruta)
+        descarga = time.perf_counter() - inicio
+        df = pd.read_parquet(io.BytesIO(contenido))
+        requeridas = set(cols_base + ["MES_DIM", "AÑO_DIM"])
+        if df.empty or not requeridas.issubset(df.columns):
+            raise ValueError("Consolidado vacío o sin las dimensiones requeridas")
+        df.attrs["carga"] = {"fuente": "Parquet GitHub", "descarga_s": round(descarga, 2),
+                             "lectura_s": round(time.perf_counter() - inicio - descarga, 2),
+                             "filas": len(df)}
+        logger.info("Carga de datos: %s", df.attrs["carga"])
+        return df
+    except Exception as exc:
+        logger.warning("Consolidado no disponible (%s)", type(exc).__name__)
+        if not reconstruir:
+            raise RuntimeError("No se pudo leer el consolidado Parquet. Revisa su existencia y los permisos de lectura; consulta los registros de la aplicación.") from exc
 
-    # -------------------------------------------------------------------------
-    # FALLBACK: DESCARGA COMPLETA DESDE GITHUB API (solo si no hay parquet válido)
-    # -------------------------------------------------------------------------
-    st.warning("No se pudo usar el consolidado Parquet. Se leerán los archivos semanales; esta carga puede tardar más.")
+    st.warning("Reconstrucción solicitada: se descargarán y procesarán los archivos semanales.")
     coleccion_dfs = []
     try:
         resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
@@ -219,8 +226,10 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
         lista_archivos = []
 
     if lista_archivos:
-        with ThreadPoolExecutor(max_workers=25) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             resultados = list(executor.map(descargar_y_procesar_archivo, lista_archivos))
+        if any(df is None for df in resultados):
+            raise RuntimeError("Falló la descarga de uno o más archivos; no se mostrará un histórico incompleto.")
         coleccion_dfs = [df for df in resultados if df is not None and not df.empty]
 
     if not coleccion_dfs:
@@ -250,7 +259,7 @@ def ejecutar_pipeline_ingestion_datos(hash_archivos: str = "") -> pd.DataFrame:
 ANIO_BASE_ESTRICTO: int = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str = "TOTALPLAY / OPERACIONES - REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str = "14.3.0-CARGA-BAJO-DEMANDA"
+VERSION_SISTEMA: str = "14.3.1-INGESTA-CONTROLADA"
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -649,73 +658,34 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
     # Ordenar por Cuenta y Cronología
     df_valid = df[mask_cta_valida].sort_values(by=["Cuenta_Cliente", "_SEM_TEMP", "_INDEX_ORIGINAL"]).copy()
 
-    dict_reincidencias = {}
-
-    # Lógica de reincidencia (Evento N-1)
-    for cuenta, g in df_valid.groupby("Cuenta_Cliente"):
-        registros = g.to_dict("records")
-        n = len(registros)
-        if n < 2:
-            continue
-
-        for i in range(1, n):
-            reg_actual = registros[i]
-            tipo_actual = reg_actual.get("Tipo_Orden", reg_actual.get("TIPO", ""))
-
-            # Si la visita actual es un SOPORTE -> Reincidencia
-            if es_evento_soporte(tipo_actual):
-                reg_prev = registros[i - 1]  # Evento inmediatamente anterior (visita n-1)
-                
-                tech_prev = str(reg_prev.get(col_tech, "SIN ESPECIFICAR"))
-                if tech_prev.upper() in ["NAN", "NONE", "", "N/A", "NULL"]:
-                    tech_prev = "SIN ESPECIFICAR"
-
-                emp_prev = str(reg_prev.get(col_empresa, "SIN EMPRESA"))
-                if emp_prev.upper() in ["NAN", "NONE", "", "N/A", "NULL"]:
-                    emp_prev = "SIN EMPRESA"
-
-                # Generar TIPO_2 resolviendo el fallback si la causa es NA/None
-                causa_raw = reg_prev.get(col_causa)
-                tipo_raw = reg_prev.get(col_tipo)
-                tipo_2_val = obtener_valor_tipo2(causa_raw, tipo_raw)
-                falla_val = reg_actual.get(col_falla, "N/A")
-
-                key_actual = reg_actual.get("FOLIO_KEY")
-                dict_reincidencias[key_actual] = {
-                    "Usuario_Origen": tech_prev,
-                    "Empresa_Origen": emp_prev,
-                    "Semana_Origen": reg_prev.get("_SEM_TEMP", np.nan),
-                    "Causa_Origen": str(causa_raw) if pd.notna(causa_raw) else "N/A",
-                    "TIPO_2": tipo_2_val,
-                    "Falla_Nueva": falla_val
-                }
-
-    # Asignar resultados al DataFrame principal
-    if dict_reincidencias:
-        keys_rein = set(dict_reincidencias.keys())
-        mask_rein = df["FOLIO_KEY"].isin(keys_rein)
-
+    # Desplazar solo las columnas necesarias dentro de cada cuenta.
+    columnas_previas = list(dict.fromkeys([col_tech, col_empresa, col_causa, col_tipo, "_SEM_TEMP"]))
+    grupos = df_valid.groupby("Cuenta_Cliente", sort=False)
+    anteriores = grupos[columnas_previas].shift(1)
+    soporte = df_valid["Tipo_Orden"].map(es_evento_soporte)
+    elegibles = soporte & grupos.cumcount().gt(0)
+    actual = df_valid.loc[elegibles]
+    previo = anteriores.loc[elegibles]
+    if not actual.empty:
+        resultados = pd.DataFrame(index=actual.index)
+        resultados["FOLIO_KEY"] = actual["FOLIO_KEY"]
+        for origen, destino, defecto in [
+            (col_tech, "Usuario_Origen_Reincidencia", "SIN ESPECIFICAR"),
+            (col_empresa, "Empresa_Origen_Reincidencia", "SIN EMPRESA"),
+        ]:
+            valores = previo[origen].astype(str)
+            resultados[destino] = valores.mask(valores.str.upper().isin(["NAN", "NONE", "", "N/A", "NULL"]), defecto)
+        resultados["Semana_Origen_Reincidencia"] = previo["_SEM_TEMP"]
+        resultados["Causa_Origen"] = previo[col_causa].map(lambda x: str(x) if pd.notna(x) else "N/A")
+        resultados["TIPO_2"] = [obtener_valor_tipo2(c, t) for c, t in zip(previo[col_causa], previo[col_tipo])]
+        resultados["Falla_Nueva"] = actual[col_falla]
+        # Conservar la regla anterior: último resultado por folio, aplicado a sus duplicados.
+        resultados = resultados.drop_duplicates("FOLIO_KEY", keep="last").set_index("FOLIO_KEY")
+        mask_rein = df["FOLIO_KEY"].isin(resultados.index)
         df.loc[mask_rein, "ES_REINCIDENCIA"] = "SI"
         df.loc[mask_rein, "CONTEO_PREVIO_8_SEM"] = 1
-
-        df.loc[mask_rein, "Usuario_Origen_Reincidencia"] = df.loc[mask_rein, "FOLIO_KEY"].map(
-            lambda k: dict_reincidencias[k]["Usuario_Origen"] if k in dict_reincidencias else "N/A"
-        )
-        df.loc[mask_rein, "Empresa_Origen_Reincidencia"] = df.loc[mask_rein, "FOLIO_KEY"].map(
-            lambda k: dict_reincidencias[k]["Empresa_Origen"] if k in dict_reincidencias else "N/A"
-        )
-        df.loc[mask_rein, "Semana_Origen_Reincidencia"] = df.loc[mask_rein, "FOLIO_KEY"].map(
-            lambda k: dict_reincidencias[k]["Semana_Origen"] if k in dict_reincidencias else np.nan
-        )
-        df.loc[mask_rein, "Causa_Origen"] = df.loc[mask_rein, "FOLIO_KEY"].map(
-            lambda k: dict_reincidencias[k]["Causa_Origen"] if k in dict_reincidencias else "N/A"
-        )
-        df.loc[mask_rein, "TIPO_2"] = df.loc[mask_rein, "FOLIO_KEY"].map(
-            lambda k: dict_reincidencias[k]["TIPO_2"] if k in dict_reincidencias else "N/A"
-        )
-        df.loc[mask_rein, "Falla_Nueva"] = df.loc[mask_rein, "FOLIO_KEY"].map(
-            lambda k: dict_reincidencias[k]["Falla_Nueva"] if k in dict_reincidencias else "N/A"
-        )
+        for columna in resultados.columns:
+            df.loc[mask_rein, columna] = df.loc[mask_rein, "FOLIO_KEY"].map(resultados[columna])
 
     # Limpiar auxiliares
     df.drop(columns=["_INDEX_ORIGINAL", "_SEM_TEMP"], errors="ignore", inplace=True)
@@ -1564,6 +1534,7 @@ def _renderizar_formulario_carga_github():
         st.success(mensaje)
         st.link_button("Abrir el CSV guardado en GitHub", confirmado["url"])
         st.cache_data.clear()
+        st.session_state.pop("dataset_reconstruido", None)
         # El consolidado pertenece únicamente a la carpeta configurada del dashboard.
         if carpeta == GITHUB_FOLDER.strip("/"):
             try:
@@ -2057,6 +2028,7 @@ def main() -> None:
         with btn_c1:
             if st.button("🔄 Recargar", use_container_width=True, type="primary"):
                 st.cache_data.clear()
+                st.session_state.pop("dataset_reconstruido", None)
                 st.rerun()
         with btn_c2:
             if st.button("🧹 Limpiar Caché", use_container_width=True, type="secondary"):
@@ -2069,7 +2041,25 @@ def main() -> None:
         renderizar_modulo_carga_github()
         return
 
-    df_raw = ejecutar_pipeline_ingestion_datos()
+    try:
+        df_raw = st.session_state.get("dataset_reconstruido")
+        if df_raw is None:
+            df_raw = ejecutar_pipeline_ingestion_datos()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.caption("La descarga completa del histórico requiere esta acción explícita.")
+        if st.button("Reconstruir lectura desde archivos semanales"):
+            try:
+                df_raw = ejecutar_pipeline_ingestion_datos(reconstruir=True)
+                st.session_state["dataset_reconstruido"] = df_raw
+            except Exception as error:
+                st.error(str(error))
+                return
+        else:
+            return
+    carga = df_raw.attrs.get("carga")
+    if carga:
+        st.caption(f"{carga['filas']:,} registros · Descarga: {carga['descarga_s']} s · Lectura Parquet: {carga['lectura_s']} s (en caché al repetir)")
 
     if df_raw.empty:
         st.error("⚠️ No hay datos disponibles en el repositorio de GitHub. Verifica el token, el repositorio y que existan archivos en la carpeta configurada.")
