@@ -1473,6 +1473,61 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
     )
 
 
+@st.dialog("Detalle de Reincidencias por Cuenta de Cliente", width="large")
+def mostrar_modal_detalle_cuenta(df_cuenta: pd.DataFrame, cuenta_id: str):
+    """
+    Pop-up con el historial completo de reincidencias de una cuenta específica.
+    Muestra todos los folios reincidentes, semanas, técnico origen, tipo reincidente
+    (resuelto con la misma regla: N/A → Tipo_Orden; distinto → "Soporte"), falla y causa.
+    """
+    st.markdown(f"**Cuenta:** `{cuenta_id}`  ·  **{len(df_cuenta):,}** visitas reincidentes registradas")
+    if df_cuenta.empty:
+        st.info("Sin folios reincidentes para esta cuenta.")
+        return
+
+    df_m = df_cuenta.copy()
+
+    # Resolver tipo reincidente con la misma regla del gráfico
+    def _tipo_rein_display(row) -> str:
+        t2 = str(row.get("TIPO_2", "")).strip().upper()
+        if t2 in ["", "N/A", "NAN", "NONE", "NULL"]:
+            return str(row.get("Tipo_Orden", "SIN TIPO")).strip()
+        return "SOPORTE"
+
+    df_m["Tipo Reincidente"] = df_m.apply(_tipo_rein_display, axis=1)
+
+    cols_display = {
+        "FOLIO_KEY":                      "Folio",
+        "Num_Semana_Archivo":             "Semana",
+        "Tipo Reincidente":               "Tipo Reincidente",
+        "TIPO_2":                         "Causa Origen (TIPO_2)",
+        "Falla_Nueva":                    "Falla (Soporte)",
+        "Usuario_Origen_Reincidencia":    "Técnico Origen",
+        "Empresa_Origen_Reincidencia":    "Empresa Origen",
+        "SEMANA_DIM":                     "Sem. Dim",
+    }
+    cols_ok = {k: v for k, v in cols_display.items() if k in df_m.columns}
+    df_show  = df_m[list(cols_ok.keys())].rename(columns=cols_ok)
+
+    # Mini-resumen por tipo reincidente
+    resumen = df_m["Tipo Reincidente"].value_counts().reset_index()
+    resumen.columns = ["Tipo Reincidente", "Visitas"]
+    c1, c2 = st.columns([0.35, 0.65])
+    with c1:
+        st.markdown("**Distribución por tipo:**")
+        st.dataframe(resumen, hide_index=True, use_container_width=True, height=180)
+    with c2:
+        st.markdown("**Historial de folios:**")
+        st.dataframe(df_show, hide_index=True, use_container_width=True, height=340)
+
+    st.download_button(
+        f"Descargar historial de cuenta {cuenta_id} (CSV)",
+        df_show.to_csv(index=False).encode("utf-8"),
+        f"Reincidencias_Cuenta_{cuenta_id}.csv", "text/csv",
+        use_container_width=True
+    )
+
+
 def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_sel: str) -> None:
     st.markdown("### Módulo de Análisis de Reincidencias y Efectividad Operativa")
 
@@ -1557,6 +1612,107 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     </div>
     """, unsafe_allow_html=True)
 
+    # --------------------------------------------------------------------------
+    # GRÁFICA: LÍNEA DE TIEMPO DE REINCIDENCIAS POR TIPO REINCIDENTE
+    # Regla de dimensión "Tipo Reincidente":
+    #   • Si TIPO_2 es N/A (o vacío) → se toma el valor de Tipo_Orden del evento
+    #     actual (la visita de Soporte reincidente).
+    #   • Si TIPO_2 tiene un valor distinto de N/A → se clasifica como "Soporte"
+    #     (porque TIPO_2 viene del antecedente, lo que indica que la visita actual
+    #     es un Soporte puro sobre un trabajo previo ya catalogado).
+    # --------------------------------------------------------------------------
+    if not df_fr.empty:
+        st.markdown("""<div class="matrix-title-card" style="margin-top:16px;">
+            <b>LÍNEA DE TIEMPO DE REINCIDENCIAS POR TIPO REINCIDENTE</b>
+            <p>Distribución temporal de reincidencias según el tipo de evento que las originó.</p>
+        </div>""", unsafe_allow_html=True)
+
+        def _resolver_tipo_rein(row) -> str:
+            t2 = str(row.get("TIPO_2", "")).strip().upper()
+            if t2 in ["", "N/A", "NAN", "NONE", "NULL"]:
+                return str(row.get("Tipo_Orden", "SIN TIPO")).strip()
+            return "SOPORTE"
+
+        df_fr_graf = df_fr.copy()
+        df_fr_graf["_TIPO_REIN"] = df_fr_graf.apply(_resolver_tipo_rein, axis=1)
+
+        # Ordenar eje X según la dimensión activa
+        if dimension_sel == "SEMANA_DIM":
+            dim_col = "SEMANA_DIM"
+            cats_ord = sorted(df_fr_graf[dim_col].dropna().unique(), key=_num_sem)
+        elif dimension_sel == "MES_DIM":
+            dim_col  = "MES_DIM"
+            cats_ord = [m for m in LISTA_ORDENADA_MESES if m in df_fr_graf[dim_col].unique()]
+        elif dimension_sel == "FECHA_TRUNCADA":
+            dim_col  = "FECHA_TRUNCADA"
+            cats_ord = sorted(df_fr_graf[dim_col].dropna().unique())
+        else:
+            dim_col  = "AÑO_DIM"
+            cats_ord = [str(ANIO_BASE_ESTRICTO)]
+
+        df_graf_agg = (
+            df_fr_graf.groupby([dim_col, "_TIPO_REIN"], observed=True)
+            .size().reset_index(name="Reincidencias")
+        )
+
+        # Paleta de colores rotativa para los tipos
+        colores_tipos = [
+            PALETA_COLOR["naranja_desierto"], PALETA_COLOR["turquesa_cyan"],
+            PALETA_COLOR["amarillo_sol"],     PALETA_COLOR["verde_montana"],
+            PALETA_COLOR["azul_marina"],      "#A78BFA", "#F43F5E", "#06B6D4"
+        ]
+        tipos_unicos = sorted(df_graf_agg["_TIPO_REIN"].unique())
+        mapa_color   = {t: colores_tipos[i % len(colores_tipos)] for i, t in enumerate(tipos_unicos)}
+
+        fig_rein = go.Figure()
+        for tipo in tipos_unicos:
+            sub = df_graf_agg[df_graf_agg["_TIPO_REIN"] == tipo]
+            sub = sub.set_index(dim_col).reindex(cats_ord, fill_value=0).reset_index()
+            sub.columns = [dim_col, "Reincidencias"]
+            fig_rein.add_trace(go.Bar(
+                x=sub[dim_col], y=sub["Reincidencias"],
+                name=tipo, marker_color=mapa_color[tipo],
+                text=sub["Reincidencias"].where(sub["Reincidencias"] > 0),
+                textposition="inside", textfont=dict(size=9, color="#FFFFFF"),
+            ))
+            tend = calcular_tendencia_lineal_robusta(sub["Reincidencias"].tolist())
+            fig_rein.add_trace(go.Scatter(
+                x=sub[dim_col], y=tend, name=f"Tendencia {tipo}",
+                mode="lines", showlegend=False,
+                line=dict(color=mapa_color[tipo], width=1.5, dash="dot"),
+            ))
+
+        fig_rein.update_layout(
+            barmode="stack",
+            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            font=dict(family="Arial, sans-serif", size=11, color="#000000"),
+            margin=dict(l=50, r=30, t=40, b=120),
+            title=dict(
+                text=f"<b>REINCIDENCIAS POR TIPO ({dimension_sel})</b>",
+                x=0.01, y=0.97,
+                font=dict(size=12, color="#000000", family="Arial, sans-serif")
+            ),
+            legend=dict(
+                orientation="h", yanchor="top", y=-0.35,
+                xanchor="center", x=0.5,
+                font=dict(size=10, color="#000000"),
+                bgcolor="rgba(255,255,255,0.8)", bordercolor="#E2E8F0", borderwidth=1
+            ),
+            xaxis=dict(
+                type="category", categoryorder="array", categoryarray=cats_ord,
+                tickangle=-45, tickfont=dict(size=10, color="#000000"),
+                showgrid=False, linecolor=PALETA_COLOR["azul_marina"],
+            ),
+            yaxis=dict(
+                title=dict(text="Reincidencias", font=dict(size=11, color="#000000")),
+                showgrid=True, gridcolor="#E2E8F0",
+                tickfont=dict(size=10, color="#000000"),
+            ),
+            dragmode=False,
+        )
+        st.plotly_chart(fig_rein, use_container_width=True, key="grafico_rein_timeline",
+                        config={"displayModeBar": False, "scrollZoom": False})
+
     st.markdown("""<div class="matrix-title-card">
         <b>EVALUACIÓN DE EFECTIVIDAD POR TÉCNICO ORIGEN</b>
         <p>Órdenes atendidas vs. reincidencias provocadas, agrupadas por técnico.</p>
@@ -1606,18 +1762,112 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     st.markdown("---")
     st.markdown("""<div class="matrix-title-card">
         <b>HISTORIAL POR CUENTA DE CLIENTE</b>
-        <p>Visitas reincidentes agrupadas por cuenta de cliente.</p>
+        <p>Busca una cuenta para consultar su historial completo de reincidencias. Haz clic en el botón de la fila para abrir el detalle.</p>
     </div>""", unsafe_allow_html=True)
 
     if not df_fr.empty:
-        _join2 = lambda x: " | ".join(sorted({str(v).strip() for v in x if pd.notna(v) and str(v).strip()}))
+        _join2 = lambda x: " | ".join(sorted({
+            str(v).strip() for v in x
+            if pd.notna(v) and str(v).strip() not in ["","nan","None","N/A"]
+        }))
+
         df_cta = (df_fr.groupby("Cuenta_Cliente", observed=True)
                   .agg(Visitas_Reincidentes=("FOLIO_KEY","count"),
-                       Semanas=("Num_Semana_Archivo", lambda x: ", ".join(map(str, sorted(set(x))))),
-                       Causas=("TIPO_2", _join2), Fallas=("Falla_Nueva", _join2),
+                       Semanas=("Num_Semana_Archivo",
+                                lambda x: ", ".join(map(str, sorted({int(v) for v in x if str(v).isdigit()})))),
+                       Tipos_Rein=("TIPO_2", lambda x: " | ".join(sorted({
+                           str(v).strip() if str(v).strip().upper() not in ["","N/A","NAN","NONE","NULL"]
+                           else "SOPORTE"
+                           for v in x if pd.notna(v)
+                       }))),
+                       Fallas=("Falla_Nueva", _join2),
                        Tecnicos=("Usuario_Origen_Reincidencia", _join2))
-                  .reset_index().sort_values("Visitas_Reincidentes", ascending=False))
-        st.dataframe(df_cta, use_container_width=True, hide_index=True, height=320)
+                  .reset_index()
+                  .sort_values("Visitas_Reincidentes", ascending=False)
+                  .rename(columns={
+                      "Cuenta_Cliente":    "Cuenta",
+                      "Visitas_Reincidentes": "Reincidencias",
+                      "Tipos_Rein":        "Tipos Reincidentes",
+                      "Tecnicos":          "Técnicos Origen",
+                  }))
+
+        # --- Buscador ---
+        col_bus, col_ord = st.columns([0.65, 0.35])
+        with col_bus:
+            texto_busq = st.text_input(
+                "Buscar cuenta:", placeholder="Número de cuenta, técnico o tipo…",
+                key="busq_cuenta_rein"
+            )
+        with col_ord:
+            orden_col = st.selectbox(
+                "Ordenar por:",
+                ["Reincidencias", "Cuenta", "Tipos Reincidentes"],
+                key="orden_cuenta_rein"
+            )
+
+        df_vis = df_cta.copy()
+        if texto_busq.strip():
+            mask = np.column_stack([
+                df_vis[c].astype(str).str.lower().str.contains(
+                    texto_busq.strip().lower(), na=False, regex=False
+                )
+                for c in df_vis.columns
+            ]).any(axis=1)
+            df_vis = df_vis[mask]
+
+        asc_map = {"Reincidencias": False, "Cuenta": True, "Tipos Reincidentes": True}
+        df_vis  = df_vis.sort_values(orden_col, ascending=asc_map.get(orden_col, False))
+
+        st.caption(f"{len(df_vis):,} cuentas encontradas de {len(df_cta):,} totales")
+
+        # --- Tabla + selector de cuenta para pop-up ---
+        col_tbl, col_det = st.columns([0.70, 0.30])
+
+        with col_tbl:
+            st.dataframe(
+                df_vis[["Cuenta","Reincidencias","Semanas","Tipos Reincidentes","Fallas","Técnicos Origen"]],
+                use_container_width=True, hide_index=True, height=360,
+                column_config={
+                    "Cuenta":             st.column_config.Column(width="small",  pinned=True),
+                    "Reincidencias":      st.column_config.NumberColumn(width="small"),
+                    "Semanas":            st.column_config.Column(width="small"),
+                    "Tipos Reincidentes": st.column_config.Column(width="medium"),
+                    "Fallas":             st.column_config.Column(width="large"),
+                    "Técnicos Origen":    st.column_config.Column(width="large"),
+                }
+            )
+
+        with col_det:
+            st.markdown("**Abrir detalle de cuenta:**")
+
+            # Si hay búsqueda activa y solo queda una cuenta, la pre-selecciona
+            cuentas_visibles = df_vis["Cuenta"].tolist()
+            idx_default = 0
+            if texto_busq.strip() and len(cuentas_visibles) == 1:
+                idx_default = 0
+
+            cuenta_sel = st.selectbox(
+                "Seleccionar cuenta:", cuentas_visibles,
+                index=idx_default, key="sel_cuenta_rein_popup"
+            ) if cuentas_visibles else None
+
+            if cuenta_sel:
+                st.metric("Reincidencias de esta cuenta",
+                          int(df_cta.loc[df_cta["Cuenta"] == cuenta_sel, "Reincidencias"].iloc[0]))
+
+            if st.button("Ver historial completo", type="primary",
+                         disabled=(cuenta_sel is None), use_container_width=True,
+                         key="btn_popup_cuenta"):
+                mostrar_modal_detalle_cuenta(
+                    df_fr[df_fr["Cuenta_Cliente"] == cuenta_sel], str(cuenta_sel)
+                )
+
+        # Descarga completa
+        st.download_button(
+            "Descargar todas las cuentas (CSV)",
+            df_cta.to_csv(index=False).encode("utf-8"),
+            "Reincidencias_por_Cuenta.csv", "text/csv"
+        )
     else:
         st.info("Sin historial de cuentas con reincidencia para mostrar.")
 
