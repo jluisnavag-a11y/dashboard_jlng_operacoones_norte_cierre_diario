@@ -222,31 +222,21 @@ def parsear_columna_fecha_robusta(serie_raw: pd.Series) -> pd.Series:
 
 def _dias_calendario_para_periodo(dimension: str, valor_dim: str, df_grupo: pd.DataFrame) -> int:
     """
-    Devuelve los días REALES del período calendario — NO los días con actividad en los datos.
-
-    Regla de negocio:
-      • SEMANA_DIM  → Número de fechas únicas observadas en ese grupo (pueden ser 1..7).
-                      Una semana incompleta (ej.: lunes y martes = 2 días) usa 2, no 7.
-      • MES_DIM     → Días del mes en el calendario (28-31 según mes y año).
-      • FECHA_TRUNCADA → 1 (siempre, es un único día).
-      • AÑO_DIM     → 365 ó 366 según año bisiesto.
+    Dias con actividad real para el denominador de productividad de UN periodo.
+    SEMANA_DIM -> fechas unicas reales (1..7), sin cap artificial.
+    Si el archivo fue subido el martes, hay 2 dias y se divide entre 2.
     """
     if dimension == "FECHA_TRUNCADA":
         return 1
-
+    if "FECHA_TRUNCADA" in df_grupo.columns:
+        dias_obs = int(df_grupo["FECHA_TRUNCADA"].nunique())
+        return max(1, dias_obs)
     if dimension == "AÑO_DIM":
         return 366 if calendar.isleap(ANIO_BASE_ESTRICTO) else 365
-
     if dimension == "MES_DIM":
         num_mes = MAPEO_MESES_NUM.get(str(valor_dim).strip().capitalize(), 1)
         return calendar.monthrange(ANIO_BASE_ESTRICTO, num_mes)[1]
-
-    # SEMANA_DIM → días únicos realmente observados en ese grupo (1..7)
-    if "FECHA_TRUNCADA" in df_grupo.columns:
-        dias_obs = df_grupo["FECHA_TRUNCADA"].nunique()
-        return max(1, min(dias_obs, 7))
-
-    return 7  # fallback
+    return 7
 
 
 # ==============================================================================
@@ -626,35 +616,49 @@ def calcular_tendencia_lineal_robusta(valores: List[float]) -> List[float]:
     return [round(float(v), 2) for v in p(x)]
 
 
-def extraer_metricas_kpi_totales(df_folios: pd.DataFrame, dimension: str = "SEMANA_DIM") -> MetricasResumenKPI:
+def extraer_metricas_kpi_totales(
+    df_folios: pd.DataFrame,
+    df_raw_completo: pd.DataFrame,
+    dimension: str = "SEMANA_DIM"
+) -> MetricasResumenKPI:
     """
-    Calcula los KPI generales usando los días reales del período según la dimensión activa.
-    Productividad incluye TODOS los tipos de evento (no solo los 4 elegibles).
-    """
-    total_eventos   = len(df_folios)
-    total_usuarios  = df_folios["Usuario_Tecnico"].nunique() if total_eventos > 0 else 0
+    KPI de productividad: SIEMPRE sobre el dataset completo sin filtros de UI.
 
-    # Días operativos reales según dimensión
-    if total_eventos > 0:
+    Fórmula:
+        Productividad = (Eventos totales / Técnicos únicos) / Días con actividad
+
+    Donde:
+    - Eventos totales  = len(df_raw_completo) — todos los tipos, pólizas, distritos, empresas.
+    - Técnicos únicos  = df_raw_completo["Usuario_Tecnico"].nunique() — ídem.
+    - Días con actividad = fechas únicas reales en df_raw_completo["FECHA_TRUNCADA"]
+      acotadas según dimensión:
+        • SEMANA_DIM   → fechas únicas reales en el período (1..N·7 semanas), sin cap artificial.
+        • MES_DIM      → fechas únicas reales del mes (1..31).
+        • AÑO_DIM      → fechas únicas reales del año (1..366).
+        • FECHA_TRUNCADA → 1.
+
+    Los KPI de conteo (total_eventos) sí reflejan el subconjunto filtrado de df_folios
+    para que el usuario pueda ver el impacto de sus filtros.
+    """
+    total_eventos  = len(df_folios)
+    total_usuarios = df_folios["Usuario_Tecnico"].nunique() if total_eventos > 0 else 0
+
+    # Productividad: usa el universo completo (sin filtros de UI)
+    ev_prod  = len(df_raw_completo)
+    usr_prod = df_raw_completo["Usuario_Tecnico"].nunique() if ev_prod > 0 else 0
+
+    if ev_prod > 0 and "FECHA_TRUNCADA" in df_raw_completo.columns:
         if dimension == "FECHA_TRUNCADA":
             dias_op = 1
-        elif dimension == "AÑO_DIM":
-            dias_op = 366 if calendar.isleap(ANIO_BASE_ESTRICTO) else 365
-        elif dimension == "MES_DIM":
-            meses_unicos = df_folios["MES_DIM"].dropna().unique()
-            if len(meses_unicos) == 1:
-                num_m = MAPEO_MESES_NUM.get(str(meses_unicos[0]).strip().capitalize(), 1)
-                dias_op = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
-            else:
-                dias_op = df_folios["FECHA_TRUNCADA"].nunique()
-        else:  # SEMANA_DIM
-            dias_op = max(1, min(df_folios["FECHA_TRUNCADA"].nunique(), 7))
+        else:
+            # Días únicos reales con actividad en todo el dataset — sin cap artificial
+            dias_op = max(1, int(df_raw_completo["FECHA_TRUNCADA"].nunique()))
     else:
-        dias_op = 0
+        dias_op = 1
 
-    prod_diaria = calcular_indice_productividad_diaria(total_eventos, total_usuarios, dias_op)
-    conteo_r3   = (df_folios["Codigo_Poliza"] == "R3").sum()
-    conteo_mt   = (df_folios["Codigo_Poliza"] == "MT").sum()
+    prod_diaria = calcular_indice_productividad_diaria(ev_prod, usr_prod, dias_op)
+    conteo_r3   = (df_folios["Codigo_Poliza"] == "R3").sum() if "Codigo_Poliza" in df_folios.columns else 0
+    conteo_mt   = (df_folios["Codigo_Poliza"] == "MT").sum() if "Codigo_Poliza" in df_folios.columns else 0
 
     return MetricasResumenKPI(
         total_eventos=total_eventos, total_usuarios=total_usuarios,
@@ -1143,8 +1147,8 @@ def abrir_captura_completa():
     st.session_state["seccion_principal"] = "Capturar / Actualizar datos"
 
 
-def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, dimension_sel: str) -> None:
-    kpis = extraer_metricas_kpi_totales(df_folios, dimension_sel)
+def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.DataFrame, dimension_sel: str) -> None:
+    kpis = extraer_metricas_kpi_totales(df_folios, df_raw, dimension_sel)
 
     sub_tab1, sub_tab2, sub_tab3, sub_tab4, sub_tab5 = st.tabs([
         "Evolución y Productividad",
@@ -1666,7 +1670,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
 
         fig_rein = go.Figure()
         for tipo in tipos_unicos:
-            sub = df_graf_agg[df_graf_agg["_TIPO_REIN"] == tipo]
+            sub = df_graf_agg[df_graf_agg["_TIPO_REIN"] == tipo][[dim_col, "Reincidencias"]]
             sub = sub.set_index(dim_col).reindex(cats_ord, fill_value=0).reset_index()
             sub.columns = [dim_col, "Reincidencias"]
             fig_rein.add_trace(go.Bar(
@@ -1956,10 +1960,6 @@ def main():
     sel_emps   = st.sidebar.multiselect("Proveedor / Empresa:", emps_disp)
     if sel_emps:    df_t = df_t[df_t["Empresa"].isin(sel_emps)]
 
-    # Filtro automático de pólizas válidas si no hay selección manual
-    if not cods_pol:
-        df_t = df_t[df_t["Codigo_Poliza"].isin(MAPEO_POLIZAS)]
-
     df_folios = df_t.drop_duplicates(subset=["FOLIO_KEY"], keep="first")
 
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -1970,7 +1970,7 @@ def main():
     ])
 
     with tab1:
-        renderizar_pestana_polizas_cuadrillas(df_folios, dimension_sel)
+        renderizar_pestana_polizas_cuadrillas(df_folios, df_raw, dimension_sel)
     with tab2:
         renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
     with tab3:
