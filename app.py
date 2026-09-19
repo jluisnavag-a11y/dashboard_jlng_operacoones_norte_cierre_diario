@@ -63,10 +63,19 @@ VERSION_SISTEMA: str          = "15.0.0-MASTER"
 # Tipos elegibles para denominador de efectividad y para el cálculo de productividad
 TIPOS_ELEGIBLES_EFECTIVIDAD = frozenset(["INSTALACION", "INSTALACIÓN", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO"])
 
+# Pólizas válidas para el sistema (generación "25" = planta externa: excluida en pipeline)
+POLIZAS_VALIDAS: frozenset = frozenset(["D1","D6","E3","M3","M4","MT","R3"])
+# Pólizas excluidas por DEFAULT en filtros UI (el usuario puede activarlas manualmente)
+POLIZAS_DEFAULT_EXCLUIDAS: frozenset = frozenset(["MT","R3"])
+
 MAPEO_POLIZAS: Dict[str, str] = {
-    "R3": "RECOLECCIÓN", "E3": "PÓLIZA 3",
-    "M3": "MULTIDISTRITO", "M4": "MULTIDISTRITO FLOTANTE",
-    "MT": "MTTO PI", "D1": "DESTAJO"
+    "R3": "RECOLECCIÓN",
+    "E3": "PÓLIZA 3",
+    "M3": "MULTIDISTRITO",
+    "M4": "MULTIDISTRITO FLOTANTE",
+    "MT": "MTTO PI",
+    "D1": "DESTAJO",
+    "D6": "DESTAJO 6",
 }
 
 DESCRIPCION_POLIZAS: Dict[str, str] = {
@@ -75,7 +84,43 @@ DESCRIPCION_POLIZAS: Dict[str, str] = {
     "M3": "Póliza Multi-Distrito Operativa asignada a Zonas Urbanas de Alta Densidad",
     "M4": "Póliza Multi-Distrito Flotante para Cuadrillas de Respaldo Inter-Zona",
     "MT": "Póliza de Mantenimiento PI separada del cálculo estándar de volumen",
-    "D1": "Póliza por Destajo asignada a Cuadrillas Contratistas Externas"
+    "D1": "Póliza por Destajo asignada a Cuadrillas Contratistas Externas",
+    "D6": "Póliza por Destajo Tipo 6 para Cuadrillas Contratistas Especializadas",
+}
+
+# Proveedores excluidos permanentemente del sistema (ruido / planta ajena)
+PROVEEDORES_EXCLUIDOS: frozenset = frozenset([
+    "TOTALBOX","TOTALPLAY","ITAI",
+    # Variantes con sufijos numéricos (ej. "ITAI 3", "TOTALBOX 2") se detectan por contains
+])
+PREFIJOS_PROVEEDOR_EXCLUIDO: tuple = ("TOTALBOX","TOTALPLAY","ITAI")
+
+# Tipos de evento NO válidos cuando el cierre viene de póliza generación "25" (planta externa)
+TIPOS_EXCLUIDOS_POLIZA25: frozenset = frozenset([
+    "CIERRE","DETENCIONES","ETIQUETADO","GASA","POSTE",
+    "RED NUEVA","RUTA","TEN GIGA",
+])
+
+# Todos los tipos elegibles para conteo en el sistema (incluyendo los que homologan a INSTALACION)
+TIPOS_VALIDOS_SISTEMA: frozenset = frozenset([
+    "ADDON WIFI EXTENDER","ADDONS","CAMBIO DE DOMICILIO","CAMBIO DE EQUIPO",
+    "CAMBIO DE PLAN","EMPRESARIAL","FACTIBILIDAD","HALLAZGO EMPRESARIAL",
+    "INSTALACION","INSTALACIÓN",
+    "MANTENIMIENTO MAYOR","MANTENIMIENTO MENOR","MANTENIMIENTO PREVENTIVO",
+    "RECOLECCION EMPRESARIAL","RECOLECCIÓN EMPRESARIAL",
+    "RECOLECCION PI","RECOLECCIÓN PI",
+    "SOPORTE",
+    # Los siguientes solo para pólizas válidas (no-25)
+    "CIERRE","DETENCIONES","ETIQUETADO","GASA","POSTE","RED NUEVA","RUTA","TEN GIGA",
+])
+
+# Mapa de homologación de tipos (normalizar variantes a un tipo canónico)
+HOMOLOGACION_TIPOS: Dict[str, str] = {
+    "INSTALACIÓN":               "INSTALACION",
+    "RECOLECCION PI":            "RECOLECCION PI",
+    "RECOLECCIÓN PI":            "RECOLECCION PI",
+    "RECOLECCION EMPRESARIAL":   "RECOLECCION EMPRESARIAL",
+    "RECOLECCIÓN EMPRESARIAL":   "RECOLECCION EMPRESARIAL",
 }
 
 MAPEO_MESES_TEXTO: Dict[int, str] = {
@@ -513,6 +558,33 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["Codigo_Poliza"] = ""; df["Nombre_Poliza"] = "NO VALIDO"
 
+    # ------------------------------------------------------------------
+    # FILTRO DE PLANTA EXTERNA (generación "25")
+    # Un técnico es "planta externa gen-25" si los caracteres 3-4 del
+    # código de usuario son "25" (ej: ITA25TIJT2981, POL25MEXT0108).
+    # Para estos usuarios:
+    #   • Se elimina el registro SI el tipo de evento está en
+    #     TIPOS_EXCLUIDOS_POLIZA25 (Cierre, Detenciones, Gasa, etc.).
+    #   • Si el tipo es uno de los elegibles, el registro SE MANTIENE.
+    # ------------------------------------------------------------------
+    if c_pol and c_pol in df.columns:
+        gen_cod = df[c_pol].astype(str).str[3:5]
+        mask_25 = gen_cod == "25"
+        mask_tipo_excluido = df["Tipo_Orden"].str.upper().isin(TIPOS_EXCLUIDOS_POLIZA25)
+        # Eliminar: es planta externa Y el tipo es de los excluidos
+        df = df[~(mask_25 & mask_tipo_excluido)].copy()
+        cols = list(df.columns)  # refrescar después del filtro
+
+    # ------------------------------------------------------------------
+    # HOMOLOGACIÓN DE TIPOS DE EVENTO
+    # Normaliza variantes ortográficas a la forma canónica del sistema.
+    # Instalación → INSTALACION
+    # Recolección PI / Recoleccion PI → RECOLECCION PI
+    # Recolección Empresarial → RECOLECCION EMPRESARIAL
+    # ------------------------------------------------------------------
+    if "Tipo_Orden" in df.columns:
+        df["Tipo_Orden"] = df["Tipo_Orden"].replace(HOMOLOGACION_TIPOS)
+
     # Dimensiones temporales
     sem_arch = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in cols else pd.Series(None, index=df.index)
     sem_iso  = pd.to_numeric(df["_datetime_parsed"].dt.isocalendar().week, errors="coerce").fillna(0).astype(int)
@@ -532,6 +604,29 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
     df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
     if not dates_valid.empty:
         df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
+
+    # ------------------------------------------------------------------
+    # FILTROS DE CALIDAD (reglas 8-11)
+    # Se aplican DESPUÉS de la homologación y ANTES del motor de
+    # reincidencias para que el análisis histórico ya use el dataset limpio.
+    # ------------------------------------------------------------------
+
+    # Regla 8: Proveedores excluidos permanentemente
+    # Cubre variantes como "ITAI 3", "TOTALBOX 2", "TOTALPLAY TIJUANA", etc.
+    if "Empresa" in df.columns:
+        mask_prov_exc = df["Empresa"].str.upper().str.startswith(PREFIJOS_PROVEEDOR_EXCLUIDO)
+        df = df[~mask_prov_exc].copy()
+
+    # Regla 9 & 10: Usuarios y proveedores con UN SOLO evento en todo el dataset
+    # (ruido estadístico; no aportan a tendencias ni a productividad real).
+    # Se calcula sobre el dataset ya filtrado para no contaminar con los excluidos.
+    if "Usuario_Tecnico" in df.columns:
+        conteo_usr = df["Usuario_Tecnico"].map(df["Usuario_Tecnico"].value_counts())
+        df = df[conteo_usr > 1].copy()
+
+    if "Empresa" in df.columns:
+        conteo_emp = df["Empresa"].map(df["Empresa"].value_counts())
+        df = df[conteo_emp > 1].copy()
 
     # Motor de reincidencias sobre el dataset COMPLETO (sin filtros)
     df = calcular_reincidencias_vectorizadas(df)
@@ -607,6 +702,36 @@ def calcular_indice_productividad_diaria(
     return round((total_eventos / total_usuarios) / dias_operativos, 2)
 
 
+def calcular_dias_cuadrilla_ponderados(
+    df: pd.DataFrame,
+    col_usuario: str = "Usuario_Tecnico",
+    col_fecha: str = "FECHA_TRUNCADA"
+) -> int:
+    """
+    Días-Cuadrilla acumulados = suma de cuántos días únicos tuvo actividad CADA técnico.
+
+    Ejemplo:
+        Juan Pérez   → 6 días con actividad → aporta 6
+        Pedro Pica   → 6 días con actividad → aporta 6
+        Pablo Mármol → 6 días con actividad → aporta 6
+        Total días-cuadrilla = 18
+
+    Productividad semanal = Total Eventos / Total Días-Cuadrilla
+                          = 90 / 18 = 5.0  (no se divide entre N técnicos)
+
+    Productividad mensual = Total Eventos / (Total Técnicos × Días del mes)
+        (en el mes se usa la misma lógica pero dividiendo por días del calendario)
+    """
+    if df.empty or col_usuario not in df.columns or col_fecha not in df.columns:
+        return 1
+    dias_por_tecnico = (
+        df.groupby(col_usuario, observed=True)[col_fecha]
+        .nunique()
+        .sum()
+    )
+    return max(1, int(dias_por_tecnico))
+
+
 def calcular_tendencia_lineal_robusta(valores: List[float]) -> List[float]:
     n = len(valores)
     if n <= 1:
@@ -622,47 +747,82 @@ def extraer_metricas_kpi_totales(
     dimension: str = "SEMANA_DIM"
 ) -> MetricasResumenKPI:
     """
-    KPI de productividad: SIEMPRE sobre el dataset completo sin filtros de UI.
+    Productividad según dimensión activa (siempre sobre df_raw_completo,
+    todos los tipos de evento, pólizas, distritos y empresas elegibles).
 
-    Fórmula:
-        Productividad = (Eventos totales / Técnicos únicos) / Días con actividad
+    POR DÍA (FECHA_TRUNCADA):
+        = Total Eventos / Total Técnicos / 1
 
-    Donde:
-    - Eventos totales  = len(df_raw_completo) — todos los tipos, pólizas, distritos, empresas.
-    - Técnicos únicos  = df_raw_completo["Usuario_Tecnico"].nunique() — ídem.
-    - Días con actividad = fechas únicas reales en df_raw_completo["FECHA_TRUNCADA"]
-      acotadas según dimensión:
-        • SEMANA_DIM   → fechas únicas reales en el período (1..N·7 semanas), sin cap artificial.
-        • MES_DIM      → fechas únicas reales del mes (1..31).
-        • AÑO_DIM      → fechas únicas reales del año (1..366).
-        • FECHA_TRUNCADA → 1.
+    POR SEMANA (SEMANA_DIM):
+        = Total Eventos / Días-Cuadrilla acumulados
+        Donde Días-Cuadrilla = SUM(días únicos con actividad por técnico).
+        Ejemplo: 3 técnicos × 6 días c/u = 18 días-cuadrilla.
+        Productividad = Eventos / 18  (no se divide por número de técnicos).
 
-    Los KPI de conteo (total_eventos) sí reflejan el subconjunto filtrado de df_folios
-    para que el usuario pueda ver el impacto de sus filtros.
+    POR MES (MES_DIM):
+        = Total Eventos / (Total Técnicos × Días del mes calendario)
+        Usa días del mes según el mes real (Agosto=31, Septiembre=30, etc.).
+        Si hay varios meses, usa promedio ponderado de días.
+
+    POR AÑO (AÑO_DIM):
+        = Total Eventos / (Total Técnicos × Días del año)
     """
     total_eventos  = len(df_folios)
     total_usuarios = df_folios["Usuario_Tecnico"].nunique() if total_eventos > 0 else 0
 
-    # Productividad: usa el universo completo (sin filtros de UI)
     ev_prod  = len(df_raw_completo)
     usr_prod = df_raw_completo["Usuario_Tecnico"].nunique() if ev_prod > 0 else 0
 
-    if ev_prod > 0 and "FECHA_TRUNCADA" in df_raw_completo.columns:
-        if dimension == "FECHA_TRUNCADA":
-            dias_op = 1
-        else:
-            # Días únicos reales con actividad en todo el dataset — sin cap artificial
-            dias_op = max(1, int(df_raw_completo["FECHA_TRUNCADA"].nunique()))
-    else:
-        dias_op = 1
+    if ev_prod == 0:
+        return MetricasResumenKPI(
+            total_eventos=total_eventos, total_usuarios=total_usuarios,
+            dias_operativos=0, productividad_diaria=0.0,
+            eventos_r3=0, eventos_mt=0
+        )
 
-    prod_diaria = calcular_indice_productividad_diaria(ev_prod, usr_prod, dias_op)
-    conteo_r3   = (df_folios["Codigo_Poliza"] == "R3").sum() if "Codigo_Poliza" in df_folios.columns else 0
-    conteo_mt   = (df_folios["Codigo_Poliza"] == "MT").sum() if "Codigo_Poliza" in df_folios.columns else 0
+    if dimension == "FECHA_TRUNCADA":
+        dias_op   = 1
+        prod_base = calcular_indice_productividad_diaria(ev_prod, usr_prod, dias_op)
+
+    elif dimension == "SEMANA_DIM":
+        # Días-Cuadrilla: cada técnico aporta sus días únicos con actividad
+        dias_cuadrilla = calcular_dias_cuadrilla_ponderados(df_raw_completo)
+        dias_op        = dias_cuadrilla
+        prod_base      = round(ev_prod / dias_cuadrilla, 2) if dias_cuadrilla > 0 else 0.0
+
+    elif dimension == "MES_DIM":
+        # Por mes: Eventos / (Técnicos × días del mes)
+        if "MES_DIM" in df_raw_completo.columns:
+            meses_unicos = df_raw_completo["MES_DIM"].dropna().unique()
+            if len(meses_unicos) == 1:
+                num_m   = MAPEO_MESES_NUM.get(str(meses_unicos[0]).strip().capitalize(), 8)
+                dias_mes = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
+            else:
+                # Varios meses: promedio ponderado de días por mes
+                total_dias_w, total_ev_w = 0, 0
+                for mes in meses_unicos:
+                    num_m    = MAPEO_MESES_NUM.get(str(mes).strip().capitalize(), 8)
+                    dias_m   = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
+                    ev_mes   = len(df_raw_completo[df_raw_completo["MES_DIM"] == mes])
+                    total_dias_w += dias_m * ev_mes
+                    total_ev_w   += ev_mes
+                dias_mes = round(total_dias_w / total_ev_w) if total_ev_w > 0 else 30
+        else:
+            dias_mes = 30
+        dias_op   = dias_mes
+        prod_base = round(ev_prod / (usr_prod * dias_mes), 2) if (usr_prod * dias_mes) > 0 else 0.0
+
+    else:  # AÑO_DIM
+        dias_anio = 366 if calendar.isleap(ANIO_BASE_ESTRICTO) else 365
+        dias_op   = dias_anio
+        prod_base = calcular_indice_productividad_diaria(ev_prod, usr_prod, dias_anio)
+
+    conteo_r3 = (df_folios["Codigo_Poliza"] == "R3").sum() if "Codigo_Poliza" in df_folios.columns else 0
+    conteo_mt = (df_folios["Codigo_Poliza"] == "MT").sum() if "Codigo_Poliza" in df_folios.columns else 0
 
     return MetricasResumenKPI(
         total_eventos=total_eventos, total_usuarios=total_usuarios,
-        dias_operativos=dias_op, productividad_diaria=prod_diaria,
+        dias_operativos=dias_op, productividad_diaria=prod_base,
         eventos_r3=int(conteo_r3), eventos_mt=int(conteo_mt)
     )
 
@@ -712,10 +872,28 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
             continue
         eje_x.append(str(cat))
         vals_ev.append(float(ev))
-        u     = max(mapa_usr.get(cat, 1), 1)
         grupo = mapa_grp.get(cat, pd.DataFrame())
-        dias  = _dias_calendario_para_periodo(dimension_temporal, cat, grupo)
-        vals_prod.append(calcular_indice_productividad_diaria(ev, u, dias))
+        u     = max(mapa_usr.get(cat, 1), 1)
+
+        if dimension_temporal == "SEMANA_DIM":
+            # Días-cuadrilla: suma de días únicos por técnico en esa semana
+            dias_cuad = calcular_dias_cuadrilla_ponderados(grupo)
+            prod_val  = round(ev / dias_cuad, 2) if dias_cuad > 0 else 0.0
+
+        elif dimension_temporal == "MES_DIM":
+            # Eventos / (Técnicos × días del mes calendario)
+            num_m    = MAPEO_MESES_NUM.get(str(cat).strip().capitalize(), 8)
+            dias_mes = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
+            prod_val = round(ev / (u * dias_mes), 2) if (u * dias_mes) > 0 else 0.0
+
+        elif dimension_temporal == "FECHA_TRUNCADA":
+            prod_val = calcular_indice_productividad_diaria(ev, u, 1)
+
+        else:  # AÑO_DIM
+            dias_anio = 366 if calendar.isleap(ANIO_BASE_ESTRICTO) else 365
+            prod_val  = calcular_indice_productividad_diaria(ev, u, dias_anio)
+
+        vals_prod.append(prod_val)
 
     if not eje_x:
         return go.Figure().update_layout(title="Sin registros activos en el rango seleccionado")
@@ -1944,7 +2122,9 @@ def main():
 
     pols_disp  = sorted([k for k in df_t["Codigo_Poliza"].unique() if k in MAPEO_POLIZAS])
     opc_pol    = [f"{c} — {MAPEO_POLIZAS[c]}" for c in pols_disp]
-    sel_pol    = st.sidebar.multiselect("Pólizas:", opc_pol)
+    # MT (MTTO PI) y R3 (RECOLECCIÓN) se excluyen por default; el usuario puede activarlas
+    default_pol = [op for op in opc_pol if not any(op.startswith(exc) for exc in POLIZAS_DEFAULT_EXCLUIDAS)]
+    sel_pol    = st.sidebar.multiselect("Pólizas:", opc_pol, default=default_pol)
     cods_pol   = [p.split(" — ")[0] for p in sel_pol]
     if cods_pol:    df_t = df_t[df_t["Codigo_Poliza"].isin(cods_pol)]
 
