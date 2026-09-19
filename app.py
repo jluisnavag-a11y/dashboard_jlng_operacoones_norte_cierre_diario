@@ -575,16 +575,6 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
         df = df[~(mask_25 & mask_tipo_excluido)].copy()
         cols = list(df.columns)  # refrescar después del filtro
 
-    # ------------------------------------------------------------------
-    # HOMOLOGACIÓN DE TIPOS DE EVENTO
-    # Normaliza variantes ortográficas a la forma canónica del sistema.
-    # Instalación → INSTALACION
-    # Recolección PI / Recoleccion PI → RECOLECCION PI
-    # Recolección Empresarial → RECOLECCION EMPRESARIAL
-    # ------------------------------------------------------------------
-    if "Tipo_Orden" in df.columns:
-        df["Tipo_Orden"] = df["Tipo_Orden"].replace(HOMOLOGACION_TIPOS)
-
     # Dimensiones temporales
     sem_arch = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in cols else pd.Series(None, index=df.index)
     sem_iso  = pd.to_numeric(df["_datetime_parsed"].dt.isocalendar().week, errors="coerce").fillna(0).astype(int)
@@ -747,82 +737,69 @@ def extraer_metricas_kpi_totales(
     dimension: str = "SEMANA_DIM"
 ) -> MetricasResumenKPI:
     """
-    Productividad según dimensión activa (siempre sobre df_raw_completo,
-    todos los tipos de evento, pólizas, distritos y empresas elegibles).
+    KPIs dinámicos: responden a los filtros activos de UI (df_folios).
+    df_raw_completo se reserva para futuras comparativas; el cálculo
+    de productividad opera sobre el subconjunto filtrado.
 
-    POR DÍA (FECHA_TRUNCADA):
-        = Total Eventos / Total Técnicos / 1
+    POR DÍA  : Eventos / Técnicos
+    POR SEMANA: Eventos / Dias-Cuadrilla  (suma de días únicos por técnico)
+    POR MES  : Eventos / (Técnicos × días del mes calendario)
+    POR AÑO  : Eventos / (Técnicos × días del año)
 
-    POR SEMANA (SEMANA_DIM):
-        = Total Eventos / Días-Cuadrilla acumulados
-        Donde Días-Cuadrilla = SUM(días únicos con actividad por técnico).
-        Ejemplo: 3 técnicos × 6 días c/u = 18 días-cuadrilla.
-        Productividad = Eventos / 18  (no se divide por número de técnicos).
-
-    POR MES (MES_DIM):
-        = Total Eventos / (Total Técnicos × Días del mes calendario)
-        Usa días del mes según el mes real (Agosto=31, Septiembre=30, etc.).
-        Si hay varios meses, usa promedio ponderado de días.
-
-    POR AÑO (AÑO_DIM):
-        = Total Eventos / (Total Técnicos × Días del año)
+    Tarjeta "Dias Cuadrilla" muestra:
+      - SEMANA: suma de días-cuadrilla del período filtrado
+      - MES   : días del mes calendario
+      - DÍA   : 1
+      - AÑO   : 365/366
     """
     total_eventos  = len(df_folios)
     total_usuarios = df_folios["Usuario_Tecnico"].nunique() if total_eventos > 0 else 0
 
-    ev_prod  = len(df_raw_completo)
-    usr_prod = df_raw_completo["Usuario_Tecnico"].nunique() if ev_prod > 0 else 0
-
-    if ev_prod == 0:
+    if total_eventos == 0:
         return MetricasResumenKPI(
-            total_eventos=total_eventos, total_usuarios=total_usuarios,
+            total_eventos=0, total_usuarios=0,
             dias_operativos=0, productividad_diaria=0.0,
             eventos_r3=0, eventos_mt=0
         )
 
     if dimension == "FECHA_TRUNCADA":
-        dias_op   = 1
-        prod_base = calcular_indice_productividad_diaria(ev_prod, usr_prod, dias_op)
+        dias_cuad = 1
+        prod_base = round(total_eventos / max(total_usuarios, 1), 2)
 
     elif dimension == "SEMANA_DIM":
-        # Días-Cuadrilla: cada técnico aporta sus días únicos con actividad
-        dias_cuadrilla = calcular_dias_cuadrilla_ponderados(df_raw_completo)
-        dias_op        = dias_cuadrilla
-        prod_base      = round(ev_prod / dias_cuadrilla, 2) if dias_cuadrilla > 0 else 0.0
+        dias_cuad = calcular_dias_cuadrilla_ponderados(df_folios)
+        prod_base = round(total_eventos / dias_cuad, 2) if dias_cuad > 0 else 0.0
 
     elif dimension == "MES_DIM":
-        # Por mes: Eventos / (Técnicos × días del mes)
-        if "MES_DIM" in df_raw_completo.columns:
-            meses_unicos = df_raw_completo["MES_DIM"].dropna().unique()
+        if "MES_DIM" in df_folios.columns:
+            meses_unicos = df_folios["MES_DIM"].dropna().unique()
             if len(meses_unicos) == 1:
-                num_m   = MAPEO_MESES_NUM.get(str(meses_unicos[0]).strip().capitalize(), 8)
+                num_m    = MAPEO_MESES_NUM.get(str(meses_unicos[0]).strip().capitalize(), 8)
                 dias_mes = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
             else:
-                # Varios meses: promedio ponderado de días por mes
-                total_dias_w, total_ev_w = 0, 0
+                total_dw, total_ew = 0, 0
                 for mes in meses_unicos:
-                    num_m    = MAPEO_MESES_NUM.get(str(mes).strip().capitalize(), 8)
-                    dias_m   = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
-                    ev_mes   = len(df_raw_completo[df_raw_completo["MES_DIM"] == mes])
-                    total_dias_w += dias_m * ev_mes
-                    total_ev_w   += ev_mes
-                dias_mes = round(total_dias_w / total_ev_w) if total_ev_w > 0 else 30
+                    num_m  = MAPEO_MESES_NUM.get(str(mes).strip().capitalize(), 8)
+                    dm     = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
+                    ev_m   = len(df_folios[df_folios["MES_DIM"] == mes])
+                    total_dw += dm * ev_m; total_ew += ev_m
+                dias_mes = round(total_dw / total_ew) if total_ew > 0 else 30
         else:
             dias_mes = 30
-        dias_op   = dias_mes
-        prod_base = round(ev_prod / (usr_prod * dias_mes), 2) if (usr_prod * dias_mes) > 0 else 0.0
+        dias_cuad = dias_mes
+        prod_base = round(total_eventos / (total_usuarios * dias_mes), 2) if (total_usuarios * dias_mes) > 0 else 0.0
 
     else:  # AÑO_DIM
         dias_anio = 366 if calendar.isleap(ANIO_BASE_ESTRICTO) else 365
-        dias_op   = dias_anio
-        prod_base = calcular_indice_productividad_diaria(ev_prod, usr_prod, dias_anio)
+        dias_cuad = dias_anio
+        prod_base = round(total_eventos / (total_usuarios * dias_anio), 2) if (total_usuarios * dias_anio) > 0 else 0.0
 
     conteo_r3 = (df_folios["Codigo_Poliza"] == "R3").sum() if "Codigo_Poliza" in df_folios.columns else 0
     conteo_mt = (df_folios["Codigo_Poliza"] == "MT").sum() if "Codigo_Poliza" in df_folios.columns else 0
 
     return MetricasResumenKPI(
         total_eventos=total_eventos, total_usuarios=total_usuarios,
-        dias_operativos=dias_op, productividad_diaria=prod_base,
+        dias_operativos=dias_cuad, productividad_diaria=prod_base,
         eventos_r3=int(conteo_r3), eventos_mt=int(conteo_mt)
     )
 
@@ -834,12 +811,16 @@ def _num_sem(val) -> int:
         return 999
 
 
-def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_temporal: str) -> go.Figure:
+def generar_figura_evolucion_temporal(
+    df_folios: pd.DataFrame,
+    dimension_temporal: str,
+    modo_barras: str = "Eventos Completados"
+) -> go.Figure:
     """
-    Gráfico de barras (Eventos) + línea (Productividad) con tendencias.
-    La productividad usa días reales del período, no días con actividad.
-    Productividad incluye TODOS los tipos de evento.
-    Eje X: etiquetas cortas (Sem 1, Sem 2…) con ángulo -45° y margen inferior ampliado.
+    Gráfico de barras + línea de productividad con tendencias.
+    modo_barras:
+      "Eventos Completados"              → Y = total de órdenes por período
+      "Cuadrillas Únicas con Actividad"  → Y = técnicos únicos por período
     """
     if df_folios.empty:
         return go.Figure().update_layout(title="Sin datos para la selección actual")
@@ -863,6 +844,7 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
     mapa_ev    = df_t.groupby(dimension_temporal).size().to_dict()
     mapa_usr   = df_t.groupby(dimension_temporal)["Usuario_Tecnico"].nunique().to_dict()
     mapa_grp   = dict(tuple(df_t.groupby(dimension_temporal)))
+    usar_cuadrillas = (modo_barras == "Cuadrillas Únicas con Actividad")
 
     eje_x, vals_ev, vals_prod = [], [], []
 
@@ -871,17 +853,20 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
         if ev <= 0:
             continue
         eje_x.append(str(cat))
-        vals_ev.append(float(ev))
         grupo = mapa_grp.get(cat, pd.DataFrame())
         u     = max(mapa_usr.get(cat, 1), 1)
 
+        # Valor Y de la barra según toggle
+        if usar_cuadrillas:
+            vals_ev.append(float(u))   # técnicos únicos con actividad
+        else:
+            vals_ev.append(float(ev))  # total eventos
+
         if dimension_temporal == "SEMANA_DIM":
-            # Días-cuadrilla: suma de días únicos por técnico en esa semana
             dias_cuad = calcular_dias_cuadrilla_ponderados(grupo)
             prod_val  = round(ev / dias_cuad, 2) if dias_cuad > 0 else 0.0
 
         elif dimension_temporal == "MES_DIM":
-            # Eventos / (Técnicos × días del mes calendario)
             num_m    = MAPEO_MESES_NUM.get(str(cat).strip().capitalize(), 8)
             dias_mes = calendar.monthrange(ANIO_BASE_ESTRICTO, num_m)[1]
             prod_val = round(ev / (u * dias_mes), 2) if (u * dias_mes) > 0 else 0.0
@@ -899,8 +884,10 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
         return go.Figure().update_layout(title="Sin registros activos en el rango seleccionado")
 
     fig = go.Figure()
+    nombre_barra = "Cuadrillas Únicas" if usar_cuadrillas else "Eventos Completados"
+    titulo_y_izq = "Cuadrillas Únicas (técnicos)" if usar_cuadrillas else "OT / Eventos Completados"
     fig.add_trace(go.Bar(
-        x=eje_x, y=vals_ev, name="Eventos Completados",
+        x=eje_x, y=vals_ev, name=nombre_barra,
         marker_color=PALETA_COLOR["azul_marina"], opacity=0.9, yaxis="y"
     ))
     fig.add_trace(go.Scatter(
@@ -941,7 +928,7 @@ def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_tempora
             type="category", categoryorder="array", categoryarray=eje_x_base,
         ),
         yaxis=dict(
-            title=dict(text="OT / Eventos Completados", font=dict(color="#000000", size=11)),
+            title=dict(text=titulo_y_izq, font=dict(color="#000000", size=11)),
             showgrid=True, gridcolor="#E2E8F0", linecolor=PALETA_COLOR["azul_marina"],
             tickfont=dict(color="#000000", size=10)
         ),
@@ -1355,9 +1342,9 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
                 <div class="kpi-card-subtitle">Usuarios únicos en el período</div>
             </div>
             <div class="kpi-card-enterprise">
-                <div class="kpi-card-title">Días Operativos</div>
+                <div class="kpi-card-title">Días Cuadrilla</div>
                 <div class="kpi-card-value">{kpis.dias_operativos}</div>
-                <div class="kpi-card-subtitle">Días calendario del período</div>
+                <div class="kpi-card-subtitle">Días-cuadrilla acumulados del período filtrado</div>
             </div>
             <div class="kpi-card-enterprise">
                 <div class="kpi-card-title">Productividad / Día</div>
@@ -1367,23 +1354,43 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
         </div>
         """, unsafe_allow_html=True)
 
+        toggle_modo = st.radio(
+            "Vista de barras:",
+            ["Eventos Completados", "Cuadrillas Únicas con Actividad"],
+            horizontal=True, key="radio_modo_barras_evolucion"
+        )
+
         mask_g = df_folios[dimension_sel].notnull() & (
             ~df_folios[dimension_sel].astype(str).str.lower().isin(["nan","none","null",""])
         )
-        fig_ev = generar_figura_evolucion_temporal(df_folios[mask_g], dimension_sel)
+        fig_ev = generar_figura_evolucion_temporal(
+            df_folios[mask_g], dimension_sel,
+            modo_barras=toggle_modo
+        )
         st.plotly_chart(fig_ev, use_container_width=True, key="grafico_evolucion_temporal",
                         config={"displayModeBar": False, "scrollZoom": False})
 
         nom_dim = {"FECHA_TRUNCADA":"Día","SEMANA_DIM":"Semana","MES_DIM":"Mes","AÑO_DIM":"Año"}.get(dimension_sel,"Período")
+        # La tabla siempre muestra la misma vista que el toggle del gráfico
+        es_cuadrillas = (toggle_modo == "Cuadrillas Únicas con Actividad")
+        etiqueta_vista = "CUADRILLAS ÚNICAS (TÉCNICOS)" if es_cuadrillas else "EVENTOS COMPLETADOS"
+        subtitulo_tbl  = "Técnicos únicos con actividad por período y proveedor." if es_cuadrillas else "Total de órdenes completadas por período y proveedor."
+
         st.markdown(f"""
         <div class="matrix-title-card">
-            <b>CUADRILLAS / TÉCNICOS ÚNICOS POR {nom_dim.upper()} Y PROVEEDOR</b>
-            <p>Conteo de usuarios técnicos con actividad registrada por período.</p>
+            <b>{etiqueta_vista} POR {nom_dim.upper()} Y PROVEEDOR</b>
+            <p>{subtitulo_tbl}</p>
         </div>""", unsafe_allow_html=True)
 
         if not df_folios.empty:
-            df_mz = pd.pivot_table(df_folios, index="Empresa", columns=dimension_sel,
-                                   values="Usuario_Tecnico", aggfunc="nunique", fill_value=0)
+            # Pivot: técnicos únicos o eventos completados según toggle
+            agg_func_mz = "nunique" if es_cuadrillas else "count"
+            val_col_mz  = "Usuario_Tecnico" if es_cuadrillas else "FOLIO_KEY"
+
+            df_mz = pd.pivot_table(
+                df_folios, index="Empresa", columns=dimension_sel,
+                values=val_col_mz, aggfunc=agg_func_mz, fill_value=0
+            )
             cols_r = list(df_mz.columns)
             if dimension_sel == "FECHA_TRUNCADA":
                 cols_ord = sorted(cols_r, key=lambda x: pd.to_datetime(x, format="%d.%m.%Y", errors="coerce") or x)
@@ -1398,21 +1405,27 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
             df_mz["Tendencia"]        = vals.tolist()
             df_mz["Promedio Período"] = np.round(vals.mean(axis=1), 1)
 
-            fila_tot = df_folios.groupby(dimension_sel)["Usuario_Tecnico"].nunique().reindex(cols_ord).fillna(0).astype(int)
+            # Fila de totales
+            if es_cuadrillas:
+                fila_tot = df_folios.groupby(dimension_sel)["Usuario_Tecnico"].nunique().reindex(cols_ord).fillna(0).astype(int)
+            else:
+                fila_tot = df_folios.groupby(dimension_sel)["FOLIO_KEY"].count().reindex(cols_ord).fillna(0).astype(int)
+
             row_dict = dict(zip(cols_ord, fila_tot.values))
             row_dict["Tendencia"]        = fila_tot.tolist()
             row_dict["Promedio Período"] = round(float(fila_tot.mean()), 1)
             df_mz = pd.concat([df_mz, pd.DataFrame([row_dict], index=["TOTAL GENERAL"])])
 
             cols_fin = ["Tendencia"] + cols_ord + ["Promedio Período"]
+            etiq_col = "Empresa / Proveedor"
             st.dataframe(
-                df_mz[cols_fin].reset_index().rename(columns={"index":"Empresa"}),
+                df_mz[cols_fin].reset_index().rename(columns={"index": etiq_col}),
                 column_config={
-                    "Empresa":          st.column_config.Column(width="medium", pinned=True),
+                    etiq_col:           st.column_config.Column(width="medium", pinned=True),
                     "Tendencia":        st.column_config.LineChartColumn(width="small", y_min=0, pinned=True),
                     "Promedio Período": st.column_config.NumberColumn(format="%.1f"),
                 },
-                use_container_width=True, hide_index=True, height=300
+                use_container_width=True, hide_index=True, height=320
             )
 
             st.markdown("---")
@@ -1449,33 +1462,141 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
 
     # --- SUBTAB 2: DESGLOSE PÓLIZAS ---
     with sub_tab2:
-        st.markdown("### Resumen Operativo por Tipo de Póliza")
+        st.markdown("### Desglose Operativo por Póliza, Distrito y Proveedor")
+        st.caption("Proveedor = empresa asignada al técnico. Vivo = cuadrillas únicas (técnicos distintos con al menos un evento en el período filtrado). Balance = Sugerido − Vivo.")
         if not df_folios.empty:
-            df_rp = (df_folios.groupby(["Codigo_Poliza","Nombre_Poliza"], observed=True)
-                     .agg(Total_Eventos=("FOLIO_KEY","count"),
-                          Tecnicos_Unicos=("Usuario_Tecnico","nunique"),
-                          Dias_Operativos=("FECHA_TRUNCADA","nunique"))
-                     .reset_index())
-            df_rp["Productividad_Promedio"] = np.vectorize(calcular_indice_productividad_diaria)(
-                df_rp["Total_Eventos"].to_numpy(),
-                df_rp["Tecnicos_Unicos"].to_numpy(),
-                df_rp["Dias_Operativos"].to_numpy()
+            # Tabla principal: Distrito / Proveedor / Póliza / Modalidad / Vivo / Balance
+            # "Vivo" = cuadrillas únicas (técnicos únicos con actividad)
+            # "Balance" = Sugerido − Vivo (configurable por el usuario en un editor lateral)
+
+            # --- Panel de sugeridos (configuración manual por fila) ---
+            df_base_pol = (
+                df_folios
+                .groupby(["Distrito","Empresa","Codigo_Poliza","Nombre_Poliza"], observed=True)
+                .agg(
+                    Vivo=("Usuario_Tecnico","nunique"),
+                    Eventos=("FOLIO_KEY","count"),
+                )
+                .reset_index()
+                .sort_values(["Distrito","Empresa","Codigo_Poliza"])
+                .rename(columns={
+                    "Codigo_Poliza": "Nomenclatura",
+                    "Nombre_Poliza": "Modalidad",
+                })
             )
-            st.dataframe(df_rp, use_container_width=True, hide_index=True)
+
+            # Clave de sugerido: persistida en session_state para que no se borre al filtrar
+            clave_sug = "sugeridos_poliza"
+            if clave_sug not in st.session_state:
+                st.session_state[clave_sug] = {}
+
+            col_tbl, col_sug = st.columns([0.75, 0.25])
+            with col_sug:
+                st.markdown("**Cuadrillas Sugeridas**")
+                st.caption("Define la meta de cuadrillas para cada fila (Distrito · Empresa · Póliza).")
+                for _, row in df_base_pol.iterrows():
+                    fila_key = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
+                    val_actual = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
+                    nuevo_val = st.number_input(
+                        f"{row['Distrito'][:8]} · {row['Empresa'][:10]} · {row['Nomenclatura']}",
+                        min_value=0, value=val_actual,
+                        key=f"sug_{fila_key}", label_visibility="visible"
+                    )
+                    st.session_state[clave_sug][fila_key] = nuevo_val
+
+            with col_tbl:
+                # Calcular Sugerido y Balance desde session_state
+                def _get_sug(row):
+                    k = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
+                    return st.session_state[clave_sug].get(k, int(row["Vivo"]))
+
+                df_base_pol["Sugerido"] = df_base_pol.apply(_get_sug, axis=1)
+                df_base_pol["Balance"]  = df_base_pol["Sugerido"] - df_base_pol["Vivo"]
+
+                def _color_balance(val):
+                    if val < 0:   return "color: #EF4444; font-weight:700;"
+                    if val == 0:  return "color: #FBBF24; font-weight:700;"
+                    return "color: #10B981; font-weight:700;"
+
+                cols_show = ["Distrito","Empresa","Nomenclatura","Modalidad","Sugerido","Vivo","Balance","Eventos"]
+                df_show_pol = df_base_pol[cols_show]
+
+                st.dataframe(
+                    df_show_pol.style.applymap(_color_balance, subset=["Balance"]),
+                    use_container_width=True, hide_index=True, height=480,
+                    column_config={
+                        "Distrito":     st.column_config.Column(width="small",  pinned=True),
+                        "Empresa":      st.column_config.Column(width="medium"),
+                        "Nomenclatura": st.column_config.Column(width="small"),
+                        "Modalidad":    st.column_config.Column(width="medium"),
+                        "Sugerido":     st.column_config.NumberColumn(width="small"),
+                        "Vivo":         st.column_config.NumberColumn(width="small"),
+                        "Balance":      st.column_config.NumberColumn(width="small"),
+                        "Eventos":      st.column_config.NumberColumn(width="small"),
+                    }
+                )
+                st.download_button(
+                    "Descargar desglose (CSV)",
+                    df_show_pol.to_csv(index=False).encode("utf-8"),
+                    "Desglose_Polizas.csv", "text/csv"
+                )
 
     # --- SUBTAB 3: RANKING ---
     with sub_tab3:
         st.markdown("### Ranking de Productividad por Técnico / Cuadrilla")
+        st.caption("Solo pólizas elegibles (D1, D6, E3, M3, M4, MT, R3). Excluye proveedores ITAI, TOTALBOX y TOTALPLAY. Excluye generación-25.")
         if not df_folios.empty:
-            df_rk = (df_folios.groupby(["Usuario_Tecnico","Codigo_Poliza","Nombre_Poliza","Empresa"], observed=True)
-                     .agg(Eventos_Totales=("FOLIO_KEY","count"),
-                          Dias_Activos=("FECHA_TRUNCADA","nunique"))
-                     .reset_index())
-            df_rk["Productividad_Diaria"] = np.vectorize(calcular_indice_productividad_diaria)(
-                df_rk["Eventos_Totales"].to_numpy(), 1, df_rk["Dias_Activos"].to_numpy()
+            col_rk1, col_rk2 = st.columns([0.6, 0.4])
+            with col_rk1:
+                ord_rk = st.radio("Ordenar por:", ["Productividad Diaria","Eventos Totales","Días Activos"],
+                                  horizontal=True, key="orden_ranking")
+            with col_rk2:
+                dir_rk = st.radio("Dirección:", ["Mayor a menor","Menor a mayor"],
+                                  horizontal=True, key="dir_ranking")
+            asc_rk = (dir_rk == "Menor a mayor")
+            col_ord_map = {
+                "Productividad Diaria": "Productividad_Diaria",
+                "Eventos Totales":      "Eventos_Totales",
+                "Días Activos":         "Dias_Activos",
+            }
+
+            df_rk = (df_folios.groupby(
+                ["Usuario_Tecnico","Distrito","Empresa","Codigo_Poliza","Nombre_Poliza"], observed=True
+            ).agg(
+                Eventos_Totales=("FOLIO_KEY","count"),
+                Dias_Activos=("FECHA_TRUNCADA","nunique"),
+            ).reset_index())
+
+            # Productividad por técnico = Eventos / Días-activos propios (no días globales)
+            df_rk["Productividad_Diaria"] = np.where(
+                df_rk["Dias_Activos"] > 0,
+                np.round(df_rk["Eventos_Totales"] / df_rk["Dias_Activos"], 2),
+                0.0
             )
-            df_rk = df_rk.sort_values("Productividad_Diaria", ascending=False)
-            st.dataframe(df_rk, use_container_width=True, hide_index=True, height=420)
+            df_rk = df_rk.sort_values(col_ord_map[ord_rk], ascending=asc_rk)
+            df_rk.columns = [
+                "Técnico","Distrito","Empresa","Póliza","Modalidad",
+                "Eventos Totales","Días Activos","Productividad Diaria"
+            ]
+            st.dataframe(
+                df_rk,
+                use_container_width=True, hide_index=True, height=440,
+                column_config={
+                    "Técnico":             st.column_config.Column(width="large", pinned=True),
+                    "Distrito":            st.column_config.Column(width="small"),
+                    "Empresa":             st.column_config.Column(width="medium"),
+                    "Póliza":              st.column_config.Column(width="small"),
+                    "Modalidad":           st.column_config.Column(width="medium"),
+                    "Eventos Totales":     st.column_config.NumberColumn(width="small"),
+                    "Días Activos":        st.column_config.NumberColumn(width="small"),
+                    "Productividad Diaria":st.column_config.NumberColumn(format="%.2f", width="small"),
+                }
+            )
+            st.download_button(
+                "Descargar ranking (CSV)",
+                df_rk.to_csv(index=False).encode("utf-8"),
+                "Ranking_Cuadrillas.csv","text/csv"
+            )
 
     # --- SUBTAB 4: DESCARGA ---
     with sub_tab4:
@@ -2139,6 +2260,20 @@ def main():
     emps_disp  = sorted(df_t["Empresa"].unique())
     sel_emps   = st.sidebar.multiselect("Proveedor / Empresa:", emps_disp)
     if sel_emps:    df_t = df_t[df_t["Empresa"].isin(sel_emps)]
+
+    # Filtro de técnico: usa el CÓDIGO DE USUARIO (primeros 15 chars antes del " | ")
+    # como ID primario para evitar duplicados cuando cambia el nombre asociado.
+    if "Usuario_Tecnico" in df_t.columns:
+        # Extraer el código (parte antes del " | ") como ID único del técnico
+        df_t["_cod_tecnico"] = df_t["Usuario_Tecnico"].str.split(" | ").str[0].str.strip()
+        cods_tech_disp = sorted(df_t["_cod_tecnico"].dropna().unique())
+        sel_techs = st.sidebar.multiselect(
+            "Técnico (Código):", cods_tech_disp,
+            key="filtro_tecnico_sidebar"
+        )
+        if sel_techs:
+            df_t = df_t[df_t["_cod_tecnico"].isin(sel_techs)]
+        df_t = df_t.drop(columns=["_cod_tecnico"], errors="ignore")
 
     df_folios = df_t.drop_duplicates(subset=["FOLIO_KEY"], keep="first")
 
