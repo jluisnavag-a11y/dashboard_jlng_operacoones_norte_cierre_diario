@@ -1564,12 +1564,16 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
             row_dict = dict(zip(cols_ord, fila_tot.values))
             row_dict["Tendencia"]        = fila_tot.tolist()
             row_dict["Promedio Período"] = round(float(fila_tot.mean()), 1)
-            df_mz = pd.concat([df_mz, pd.DataFrame([row_dict], index=["TOTAL GENERAL"])])
+            # TOTAL GENERAL separado: se añade DESPUÉS del sort para que no se mueva
+            df_mz_data = df_mz.copy()
+            df_mz_total = pd.DataFrame([row_dict], index=["TOTAL GENERAL"])
 
             cols_fin = ["Tendencia"] + cols_ord + ["Promedio Período"]
             etiq_col = "Empresa / Proveedor"
+            # Unir: datos ordenados + total al final (fijo)
+            df_mz_final = pd.concat([df_mz_data[cols_fin], df_mz_total[cols_fin]])
             st.dataframe(
-                df_mz[cols_fin].reset_index().rename(columns={"index": etiq_col}),
+                df_mz_final.reset_index().rename(columns={"index": etiq_col}),
                 column_config={
                     etiq_col:           st.column_config.Column(width="medium", pinned=True),
                     "Tendencia":        st.column_config.LineChartColumn(width="small", y_min=0, pinned=True),
@@ -2226,17 +2230,32 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             "Efectividad_%":                "% Efectividad",
         }).sort_values("Total Reincidencias", ascending=False)
 
+        # Filtro de técnicos por cuenta seleccionada (se conecta con la sección de cuentas)
+        cuenta_filtro_tech = st.session_state.get("cuenta_activa_rein", None)
+        if cuenta_filtro_tech:
+            techs_de_cuenta = set(
+                df_fr[df_fr["Cuenta_Cliente"] == cuenta_filtro_tech]["Usuario_Origen_Reincidencia"].dropna()
+            )
+            df_agt_vis = df_agt[df_agt["Técnico Reincidente (Origen)"].isin(techs_de_cuenta)]
+            st.info(f"Mostrando técnicos involucrados en cuenta {cuenta_filtro_tech}. "
+                    f"({len(df_agt_vis)} de {len(df_agt)})")
+            if st.button("Ver todos los técnicos", key="btn_clear_cuenta_tech"):
+                st.session_state["cuenta_activa_rein"] = None
+                st.rerun()
+        else:
+            df_agt_vis = df_agt
+
         col_t1, col_t2 = st.columns([0.75, 0.25])
         with col_t1:
-            st.dataframe(df_agt[["Técnico Reincidente (Origen)","Empresa","Eventos Completados",
-                                  "Total Reincidencias","% Efectividad","Causas_TIPO_2","Fallas_Nuevas"]],
+            st.dataframe(df_agt_vis[["Técnico Reincidente (Origen)","Empresa","Eventos Completados",
+                                     "Total Reincidencias","% Efectividad","Causas_TIPO_2","Fallas_Nuevas"]],
                          use_container_width=True, hide_index=True, height=360,
                          column_config={"% Efectividad": st.column_config.NumberColumn(format="%.2f %%")})
         with col_t2:
             st.markdown("**Ver detalle ampliado:**")
-            tech_lista = sorted(df_agt["Técnico Reincidente (Origen)"].unique())
-            tech_sel   = st.selectbox("Seleccionar técnico:", tech_lista, key="sb_pop_tech")
-            if st.button("Abrir detalle", use_container_width=True, key="btn_pop_tech"):
+            tech_lista = sorted(df_agt_vis["Técnico Reincidente (Origen)"].unique())
+            tech_sel   = st.selectbox("Seleccionar técnico:", tech_lista, key="sb_pop_tech") if tech_lista else None
+            if tech_sel and st.button("Abrir detalle", use_container_width=True, key="btn_pop_tech"):
                 mostrar_modal_detalle_usuario(
                     df_fr[df_fr["Usuario_Origen_Reincidencia"] == tech_sel], tech_sel
                 )
@@ -2339,12 +2358,20 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
                 st.metric("Reincidencias de esta cuenta",
                           int(df_cta.loc[df_cta["Cuenta"] == cuenta_sel, "Reincidencias"].iloc[0]))
 
-            if st.button("Ver historial completo", type="primary",
-                         disabled=(cuenta_sel is None), use_container_width=True,
-                         key="btn_popup_cuenta"):
-                mostrar_modal_detalle_cuenta(
-                    df_fr[df_fr["Cuenta_Cliente"] == cuenta_sel], str(cuenta_sel)
-                )
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                if st.button("Ver historial completo", type="primary",
+                             disabled=(cuenta_sel is None), use_container_width=True,
+                             key="btn_popup_cuenta"):
+                    mostrar_modal_detalle_cuenta(
+                        df_fr[df_fr["Cuenta_Cliente"] == cuenta_sel], str(cuenta_sel)
+                    )
+            with col_btn2:
+                if st.button("Filtrar técnicos", type="secondary",
+                             disabled=(cuenta_sel is None), use_container_width=True,
+                             key="btn_filtrar_tech_por_cuenta"):
+                    st.session_state["cuenta_activa_rein"] = cuenta_sel
+                    st.rerun()
 
         # Descarga completa
         st.download_button(
@@ -2354,6 +2381,562 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         )
     else:
         st.info("Sin historial de cuentas con reincidencia para mostrar.")
+
+
+# ==============================================================================
+# 12. MÓDULO IA — AUDITOR OPERATIVO
+# ==============================================================================
+
+def renderizar_pestana_ia(df_folios: pd.DataFrame, df_raw: pd.DataFrame) -> None:
+    """
+    Módulo IA — Auditor y Contralor Operativo.
+    Analiza cuentas o técnicos específicos usando los datos del sistema
+    y genera un informe de comportamiento + tabla de recomendaciones
+    mediante llamada a la API de Claude (claude-sonnet-4-6).
+    """
+    st.markdown("### IA — Auditor y Contralor Operativo")
+    st.caption("Ingresa uno o más códigos de técnico o números de cuenta separados por comas. "
+               "La IA analiza patrones de comportamiento, reincidencias, productividad y calidad.")
+
+    # ---- Buscador robusto ----
+    query_raw = st.text_area(
+        "Técnicos o cuentas a analizar:",
+        height=80,
+        placeholder="Ej: ECOE3TIJT2258, 142838878, JELE3MXLT0124",
+        key="ia_query"
+    )
+
+    col_ia1, col_ia2, col_ia3 = st.columns(3)
+    with col_ia1:
+        modo_busq = st.radio("Buscar por:", ["Técnico (código)","Cuenta"], horizontal=True, key="ia_modo")
+    with col_ia2:
+        semanas_ia = st.slider("Últimas N semanas:", 1, 52, 12, key="ia_sem")
+    with col_ia3:
+        ejecutar  = st.button("Analizar con IA", type="primary", key="ia_run",
+                               disabled=not query_raw.strip())
+
+    if not query_raw.strip():
+        st.markdown("""<div class="matrix-title-card">
+            <b>LIENZO DE ANÁLISIS</b>
+            <p>Ingresa uno o más técnicos o cuentas para generar el análisis automático de comportamiento.</p>
+        </div>""", unsafe_allow_html=True)
+        return
+
+    # Parsear entidades buscadas
+    entidades = [e.strip() for e in re.split(r"[,;\n]+", query_raw) if e.strip()]
+
+    # ---- Extraer datos del sistema ----
+    df_src = df_raw.copy() if not df_raw.empty else df_folios.copy()
+
+    # Filtrar por semanas recientes
+    if "Num_Semana_Archivo" in df_src.columns:
+        sem_max  = pd.to_numeric(df_src["Num_Semana_Archivo"], errors="coerce").max()
+        if pd.notna(sem_max):
+            df_src = df_src[pd.to_numeric(df_src["Num_Semana_Archivo"], errors="coerce")
+                             >= (sem_max - semanas_ia + 1)]
+
+    # Localizar registros por entidad
+    if modo_busq == "Técnico (código)":
+        col_id = "_cod_tecnico_ia"
+        df_src[col_id] = df_src["Usuario_Tecnico"].str.split(" | ").str[0].str.strip()
+        mask = df_src[col_id].isin(entidades)
+    else:
+        mask = df_src["Cuenta_Cliente"].isin(entidades)
+
+    df_ent = df_src[mask].copy()
+
+    if df_ent.empty:
+        st.warning(f"No se encontraron registros para: {', '.join(entidades)}")
+        return
+
+    # ---- Métricas base para el análisis ----
+    total_ev    = len(df_ent)
+    tecnicos_u  = df_ent["Usuario_Tecnico"].nunique() if "Usuario_Tecnico" in df_ent.columns else 0
+    dias_u      = df_ent["FECHA_TRUNCADA"].nunique()  if "FECHA_TRUNCADA" in df_ent.columns else 0
+    rein_total  = (df_ent.get("ES_REINCIDENCIA","NO") == "SI").sum()
+    tasa_rein   = round(rein_total / total_ev * 100, 1) if total_ev > 0 else 0
+
+    tipos_dist  = df_ent["Tipo_Orden"].value_counts().head(8).to_dict() if "Tipo_Orden" in df_ent.columns else {}
+    fallas_dist = df_ent.get("Falla_Registro", pd.Series()).value_counts().head(8).to_dict()
+    causas_dist = df_ent.get("Causa_Registro", pd.Series()).value_counts().head(8).to_dict()
+    soluc_dist  = df_ent.get("Solucion_Registro", pd.Series()).value_counts().head(8).to_dict()
+
+    # Tiempo de resolución
+    t_res_prom  = round(df_ent.get("Tiempo_Resolucion_Horas", pd.Series(dtype=float)).mean(), 2) if "Tiempo_Resolucion_Horas" in df_ent.columns else None
+
+    # Días de descanso más frecuentes
+    dias_trabajo = {}
+    if "_datetime_parsed" in df_ent.columns:
+        df_ent["_dia_semana"] = pd.to_datetime(df_ent["_datetime_parsed"], errors="coerce").dt.day_name()
+        dias_trabajo = df_ent["_dia_semana"].value_counts().to_dict()
+
+    # Hora de inicio / cierre
+    hora_inicio = None; hora_fin = None
+    if "_datetime_parsed" in df_ent.columns:
+        horas_i = pd.to_datetime(df_ent["_datetime_parsed"], errors="coerce").dt.hour
+        if not horas_i.dropna().empty:
+            hora_inicio = int(horas_i.mode()[0])
+    if "_datetime_termino" in df_ent.columns:
+        horas_f = pd.to_datetime(df_ent["_datetime_termino"], errors="coerce").dt.hour
+        if not horas_f.dropna().empty:
+            hora_fin = int(horas_f.mode()[0])
+
+    # Días trabajados por semana
+    dias_x_sem = {}
+    if "Num_Semana_Archivo" in df_ent.columns and "FECHA_TRUNCADA" in df_ent.columns:
+        dias_x_sem = (df_ent.groupby("Num_Semana_Archivo")["FECHA_TRUNCADA"]
+                      .nunique().describe().round(1).to_dict())
+
+    # Cuentas sin falla reportada (cierre sin falla)
+    sin_falla = 0
+    if "Falla_Registro" in df_ent.columns:
+        sin_falla = df_ent["Falla_Registro"].isin(["SIN FALLA","SIN ESPECIFICAR",""]).sum()
+
+    # KPIs visuales
+    st.markdown("---")
+    k1,k2,k3,k4 = st.columns(4)
+    k1.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Eventos Analizados</div>
+        <div class="kpi-card-value">{total_ev:,}</div>
+        <div class="kpi-card-subtitle">Últimas {semanas_ia} semanas</div>
+    </div>""", unsafe_allow_html=True)
+    k2.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Días con Actividad</div>
+        <div class="kpi-card-value">{dias_u}</div>
+        <div class="kpi-card-subtitle">Días únicos registrados</div>
+    </div>""", unsafe_allow_html=True)
+    k3.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Tasa de Reincidencia</div>
+        <div class="kpi-card-value" style="color:{PALETA_COLOR['naranja_desierto']} !important;">{tasa_rein}%</div>
+        <div class="kpi-card-subtitle">{rein_total} reincidencias de {total_ev}</div>
+    </div>""", unsafe_allow_html=True)
+    k4.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Cierres sin Falla</div>
+        <div class="kpi-card-value" style="color:{PALETA_COLOR['amarillo_sol']} !important;">{sin_falla:,}</div>
+        <div class="kpi-card-subtitle">Sin falla reportada</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Gráficos inline
+    if tipos_dist:
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            fig_t = px.bar(x=list(tipos_dist.values()), y=list(tipos_dist.keys()),
+                           orientation="h", title="<b>Tipos de Evento</b>",
+                           color_discrete_sequence=[PALETA_COLOR["azul_marina"]])
+            fig_t.update_layout(paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                                font=dict(family="Arial,sans-serif",size=10,color="#000000"),
+                                margin=dict(l=10,r=10,t=30,b=10), height=260,
+                                xaxis=dict(showgrid=True,gridcolor="#E2E8F0"),
+                                yaxis=dict(tickfont=dict(size=9)))
+            st.plotly_chart(fig_t, use_container_width=True, key="ia_tipos",
+                            config={"displayModeBar":False})
+        with col_g2:
+            if fallas_dist:
+                fig_f = px.bar(x=list(fallas_dist.values()), y=list(fallas_dist.keys()),
+                               orientation="h", title="<b>Top Fallas</b>",
+                               color_discrete_sequence=[PALETA_COLOR["turquesa_cyan"]])
+                fig_f.update_layout(paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+                                    font=dict(family="Arial,sans-serif",size=10,color="#000000"),
+                                    margin=dict(l=10,r=10,t=30,b=10), height=260,
+                                    xaxis=dict(showgrid=True,gridcolor="#E2E8F0"),
+                                    yaxis=dict(tickfont=dict(size=9)))
+                st.plotly_chart(fig_f, use_container_width=True, key="ia_fallas",
+                                config={"displayModeBar":False})
+
+    # ---- ANÁLISIS IA ----
+    if ejecutar:
+        prompt_data = f"""
+Eres un auditor y contralor de operaciones de campo de telecomunicaciones.
+Analiza los siguientes datos de los identificadores: {', '.join(entidades)}
+Modo de búsqueda: {modo_busq}. Período: últimas {semanas_ia} semanas.
+
+DATOS CUANTITATIVOS:
+- Total eventos: {total_ev}
+- Técnicos únicos: {tecnicos_u}
+- Días con actividad: {dias_u}
+- Reincidencias: {rein_total} ({tasa_rein}%)
+- Cierres sin falla reportada: {sin_falla}
+- Tiempo promedio de resolución (horas): {t_res_prom if t_res_prom else "No disponible"}
+- Hora de inicio más frecuente: {hora_inicio if hora_inicio is not None else "No disponible"}:00h
+- Hora de cierre más frecuente: {hora_fin if hora_fin is not None else "No disponible"}:00h
+- Días de la semana con actividad: {dias_trabajo}
+- Estadísticas días trabajados por semana: {dias_x_sem}
+- Distribución tipos de evento: {tipos_dist}
+- Top fallas registradas: {fallas_dist}
+- Top causas registradas: {causas_dist}
+- Top soluciones registradas: {soluc_dist}
+
+INSTRUCCIONES DE ANÁLISIS (responder en español formal):
+1. Resumen ejecutivo de comportamiento (3-4 oraciones).
+2. Patrones detectados: tendencias de falla, uso repetitivo de una sola falla, cierres sin falla.
+3. Análisis de tiempo: si tiene tendencia a descansar un día particular, horario de inicio y cierre.
+4. Análisis de productividad: días trabajados por semana, volumen por día.
+5. Análisis de calidad: tasa de reincidencia, tipos de falla más frecuentes.
+6. TABLA DE RECOMENDACIONES en formato JSON con esta estructura exacta:
+[
+  {{"prioridad": "ALTA|MEDIA|BAJA", "categoria": "Calidad|Productividad|Comportamiento|Cumplimiento", "observacion": "descripcion del hallazgo", "accion": "accion concreta recomendada", "impacto": "impacto esperado"}}
+]
+Termina siempre con el bloque JSON de recomendaciones.
+"""
+        with st.spinner("Analizando con IA..."):
+            try:
+                resp_ia = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 2000,
+                        "messages": [{"role": "user", "content": prompt_data}]
+                    },
+                    timeout=60
+                )
+                if resp_ia.status_code == 200:
+                    contenido_ia = resp_ia.json()["content"][0]["text"]
+
+                    # Separar análisis del JSON de recomendaciones
+                    import json as _json
+                    partes = contenido_ia.split("[", 1)
+                    analisis_txt = partes[0].strip()
+                    recom_json   = None
+                    if len(partes) > 1:
+                        try:
+                            recom_json = _json.loads("[" + partes[1].rsplit("]", 1)[0] + "]")
+                        except Exception:
+                            recom_json = None
+
+                    st.markdown("---")
+                    st.markdown("#### Análisis de la IA")
+                    st.markdown(analisis_txt)
+
+                    if recom_json:
+                        st.markdown("---")
+                        st.markdown("#### Tabla de Recomendaciones")
+                        df_recom = pd.DataFrame(recom_json)
+                        df_recom.columns = ["Prioridad","Categoría","Observación","Acción","Impacto"]
+
+                        def _color_prio(val):
+                            if val == "ALTA":  return "color:#EF4444;font-weight:700;"
+                            if val == "MEDIA": return "color:#FBBF24;font-weight:700;"
+                            return "color:#10B981;font-weight:700;"
+
+                        st.dataframe(
+                            df_recom.style.applymap(_color_prio, subset=["Prioridad"]),
+                            use_container_width=True, hide_index=True
+                        )
+                        st.download_button(
+                            "Descargar recomendaciones (CSV)",
+                            df_recom.to_csv(index=False).encode("utf-8"),
+                            f"Recomendaciones_IA_{'_'.join(entidades[:2])}.csv","text/csv"
+                        )
+                else:
+                    st.error(f"Error API IA: {resp_ia.status_code}. "
+                             "Verifica que el token de Anthropic esté configurado en secrets.")
+            except Exception as e:
+                st.error(f"Error conectando con la IA: {e}")
+
+
+# ==============================================================================
+# 12a. MÓDULO CAMBIOS DE EQUIPO
+# ==============================================================================
+
+def renderizar_pestana_cambios_equipo(df_folios: pd.DataFrame, df_raw: pd.DataFrame, dimension_sel: str) -> None:
+    """
+    Módulo Cambios de Equipo.
+    Efectividad = Cambio de equipo sin Soporte con falla "Cambio de ONT" en 60 días posteriores.
+    Estructura preparada para conexión futura con consumo de materiales.
+    """
+    st.markdown("### Cambios de Equipo — Control de Efectividad")
+
+    # Filtros independientes
+    fi1, fi2, fi3, fi4 = st.columns(4)
+    df_ce_base = df_raw.copy() if not df_raw.empty else df_folios.copy()
+
+    sems_ce   = sorted(df_ce_base.get("SEMANA_DIM", pd.Series()).dropna().unique() if "SEMANA_DIM" in df_ce_base.columns else [], key=_num_sem)
+    distr_ce  = sorted(df_ce_base["Distrito"].dropna().unique()) if "Distrito" in df_ce_base.columns else []
+    emp_ce    = sorted(df_ce_base["Empresa"].dropna().unique())  if "Empresa"  in df_ce_base.columns else []
+
+    with fi1:
+        sel_sem_ce  = st.multiselect("Semana:", sems_ce,  key="ce_sem")
+    with fi2:
+        sel_dist_ce = st.multiselect("Distrito:", distr_ce, key="ce_dist")
+    with fi3:
+        sel_emp_ce  = st.multiselect("Empresa:", emp_ce,  key="ce_emp")
+    with fi4:
+        ventana_dias = st.number_input("Ventana de efectividad (días):", 1, 180, 60, key="ce_ventana")
+
+    df_ce = df_ce_base.copy()
+    if sel_sem_ce:  df_ce = df_ce[df_ce["SEMANA_DIM"].isin(sel_sem_ce)]
+    if sel_dist_ce: df_ce = df_ce[df_ce["Distrito"].isin(sel_dist_ce)]
+    if sel_emp_ce:  df_ce = df_ce[df_ce["Empresa"].isin(sel_emp_ce)]
+
+    # Cambios de equipo
+    mask_ce = df_ce["Tipo_Orden"].str.upper().str.contains("CAMBIO DE EQUIPO", na=False)
+    df_ce_ev = df_ce[mask_ce].copy()
+    total_ce = len(df_ce_ev)
+
+    # Soporte con falla "Cambio de ONT" (buscar en Falla_Registro o Causa_Registro)
+    mask_sop = df_ce["Tipo_Orden"].str.upper().str.contains("SOPORTE", na=False)
+    df_sop   = df_ce[mask_sop].copy()
+    col_falla_ce = "Falla_Registro" if "Falla_Registro" in df_sop.columns else None
+    if col_falla_ce:
+        mask_ont = df_sop[col_falla_ce].str.upper().str.contains("ONT", na=False)
+        df_sop_ont = df_sop[mask_ont].copy()
+    else:
+        df_sop_ont = pd.DataFrame()
+
+    # Cruzar: cambios de equipo que tienen un soporte ONT posterior en < ventana_dias
+    tiene_fechas = "_datetime_parsed" in df_ce.columns and "_datetime_termino" in df_ce.columns
+    ce_fallidos = 0
+    if not df_ce_ev.empty and not df_sop_ont.empty and tiene_fechas:
+        for _, ce_row in df_ce_ev.iterrows():
+            f_cierre_ce = ce_row.get("_datetime_termino")
+            cta = ce_row.get("Cuenta_Cliente")
+            if pd.isna(f_cierre_ce) or pd.isna(cta):
+                continue
+            sop_misma_cta = df_sop_ont[df_sop_ont["Cuenta_Cliente"] == cta]
+            for _, sop_row in sop_misma_cta.iterrows():
+                f_sop = sop_row.get("_datetime_parsed")
+                if pd.notna(f_sop):
+                    delta = (pd.Timestamp(f_sop) - pd.Timestamp(f_cierre_ce)).days
+                    if 0 < delta <= ventana_dias:
+                        ce_fallidos += 1
+                        break
+
+    ce_efectivos = total_ce - ce_fallidos
+    tasa_efect   = round(ce_efectivos / total_ce * 100, 1) if total_ce > 0 else 0.0
+
+    # KPIs
+    k1, k2, k3, k4 = st.columns(4)
+    k1.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Total Cambios de Equipo</div>
+        <div class="kpi-card-value">{total_ce:,}</div>
+        <div class="kpi-card-subtitle">En el período filtrado</div>
+    </div>""", unsafe_allow_html=True)
+    k2.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Fallidos (Soporte ONT &le;{ventana_dias}d)</div>
+        <div class="kpi-card-value" style="color:{PALETA_COLOR['naranja_desierto']} !important;">{ce_fallidos:,}</div>
+        <div class="kpi-card-subtitle">Con reincidencia de falla ONT</div>
+    </div>""", unsafe_allow_html=True)
+    k3.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Efectivos</div>
+        <div class="kpi-card-value" style="color:{PALETA_COLOR['verde_montana']} !important;">{ce_efectivos:,}</div>
+        <div class="kpi-card-subtitle">Sin falla ONT posterior</div>
+    </div>""", unsafe_allow_html=True)
+    k4.markdown(f"""<div class="kpi-card-enterprise">
+        <div class="kpi-card-title">Tasa de Efectividad</div>
+        <div class="kpi-card-value" style="color:{PALETA_COLOR['turquesa_cyan']} !important;">{tasa_efect}%</div>
+        <div class="kpi-card-subtitle">Cambios sin falla posterior</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Gráfico de línea de tiempo
+    if not df_ce_ev.empty and "SEMANA_DIM" in df_ce_ev.columns:
+        st.markdown("---")
+        sems_ord_ce = sorted(df_ce_ev["SEMANA_DIM"].dropna().unique(), key=_num_sem)
+        cnt_ce = df_ce_ev.groupby("SEMANA_DIM").size().reindex(sems_ord_ce, fill_value=0)
+        tend_ce = calcular_tendencia_lineal_robusta(cnt_ce.tolist())
+
+        fig_ce = go.Figure()
+        fig_ce.add_trace(go.Bar(
+            x=sems_ord_ce, y=cnt_ce.values,
+            name="Cambios de Equipo", marker_color=PALETA_COLOR["azul_marina"], opacity=0.85,
+        ))
+        fig_ce.add_trace(go.Scatter(
+            x=sems_ord_ce, y=tend_ce, name="Tendencia",
+            mode="lines", line=dict(color=PALETA_COLOR["turquesa_cyan"], width=2, dash="dash"),
+        ))
+        fig_ce.update_layout(
+            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+            font=dict(family="Arial, sans-serif", size=11, color="#000000"),
+            margin=dict(l=50, r=30, t=40, b=120),
+            title=dict(text="<b>CAMBIOS DE EQUIPO POR SEMANA</b>",
+                       x=0.01, font=dict(size=13, color="#000000")),
+            xaxis=dict(tickangle=-45, tickfont=dict(size=9, color="#000000"),
+                       type="category", categoryorder="array", categoryarray=sems_ord_ce),
+            yaxis=dict(showgrid=True, gridcolor="#E2E8F0", tickfont=dict(color="#000000", size=10)),
+            legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="center", x=0.5),
+            dragmode=False,
+        )
+        st.plotly_chart(fig_ce, use_container_width=True, key="fig_cambios_equipo",
+                        config={"displayModeBar": False})
+
+    # Tabla por técnico
+    st.markdown("---")
+    st.markdown("#### Detalle por Técnico")
+    if not df_ce_ev.empty:
+        df_ce_tech = (df_ce_ev.groupby(["Usuario_Tecnico","Empresa","Distrito"], observed=True)
+                      .size().reset_index(name="Cambios de Equipo")
+                      .sort_values("Cambios de Equipo", ascending=False))
+        st.dataframe(df_ce_tech, use_container_width=True, hide_index=True, height=360)
+        st.download_button("Descargar tabla (CSV)",
+                           df_ce_tech.to_csv(index=False).encode("utf-8"),
+                           "Cambios_Equipo_Tecnicos.csv","text/csv")
+
+    # PLACEHOLDER: conexión futura con consumo de materiales
+    st.markdown("---")
+    st.markdown("""<div class="matrix-title-card">
+        <b>CONSUMO DE MATERIALES — ESTRUCTURA PREPARADA</b>
+        <p>Este módulo se conectará con el archivo de consumo de materiales cuando esté disponible.
+        La lógica validará si la falla incluye consumo de equipo (ONT u otro dispositivo)
+        para correlacionar el cambio físico con la reincidencia posterior.</p>
+    </div>""", unsafe_allow_html=True)
+    st.info("Pendiente de definición del nombre y ubicación del archivo de materiales. "
+            "Al conectarlo, se cruzará automáticamente con los cambios de equipo registrados aquí.")
+
+
+# ==============================================================================
+# 12b. MÓDULO CAUSA Y SOLUCIÓN SOPORTE
+# ==============================================================================
+
+def renderizar_pestana_causa_solucion(df_folios: pd.DataFrame, dimension_sel: str) -> None:
+    """
+    Módulo Causa y Solución Soporte.
+    Solo considera eventos de tipo SOPORTE.
+    Pareto 80/20 con jerarquía dinámica (Causa / Falla / Solución).
+    """
+    st.markdown("### Causa y Solución — Soporte")
+
+    # Solo SOPORTE
+    df_sop = df_folios[df_folios["Tipo_Orden"].str.upper().str.contains("SOPORTE", na=False)].copy()
+    if df_sop.empty:
+        st.info("Sin registros de tipo Soporte para los filtros activos.")
+        return
+
+    # Verificar columnas disponibles
+    tiene_causa   = "Causa_Registro"    in df_sop.columns
+    tiene_falla   = "Falla_Registro"    in df_sop.columns
+    tiene_sol     = "Solucion_Registro" in df_sop.columns
+
+    if not (tiene_causa or tiene_falla or tiene_sol):
+        st.warning("Los archivos cargados no contienen columnas de Causa, Falla o Solución. "
+                   "Verifica que el CSV incluya esas columnas.")
+        return
+
+    # Rellenar valores faltantes
+    for col, nombre in [("Causa_Registro","SIN CAUSA"),("Falla_Registro","SIN FALLA"),
+                         ("Solucion_Registro","SIN SOLUCION")]:
+        if col not in df_sop.columns:
+            df_sop[col] = nombre
+        else:
+            df_sop[col] = df_sop[col].fillna(nombre).replace("SIN ESPECIFICAR", nombre)
+
+    DIMS = {"Causa": "Causa_Registro", "Falla": "Falla_Registro", "Solución": "Solucion_Registro"}
+
+    # ---- Controles ----
+    st.markdown("#### Configuración del Pareto")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        nivel1 = st.selectbox("Nivel 1 (eje principal):", list(DIMS.keys()), index=0, key="cs_n1")
+    niv_rest = [k for k in DIMS if k != nivel1]
+    with c2:
+        nivel2 = st.selectbox("Nivel 2:", niv_rest, index=0, key="cs_n2")
+    nivel3 = [k for k in DIMS if k not in [nivel1, nivel2]][0]
+    with c3:
+        st.markdown(f"**Nivel 3:** {nivel3}")
+
+    col_n1 = DIMS[nivel1]; col_n2 = DIMS[nivel2]; col_n3 = DIMS[nivel3]
+
+    with c4:
+        top_n = st.slider("Top N categorías:", 5, 30, 15, key="cs_topn")
+
+    # Filtros internos de la sección (multiselect independientes)
+    fi1, fi2, fi3 = st.columns(3)
+    with fi1:
+        opts_causa = sorted(df_sop["Causa_Registro"].dropna().unique())
+        sel_causa  = st.multiselect("Filtrar Causa:", opts_causa, key="cs_fil_causa")
+    with fi2:
+        opts_falla = sorted(df_sop["Falla_Registro"].dropna().unique())
+        sel_falla  = st.multiselect("Filtrar Falla:", opts_falla, key="cs_fil_falla")
+    with fi3:
+        opts_sol   = sorted(df_sop["Solucion_Registro"].dropna().unique())
+        sel_sol    = st.multiselect("Filtrar Solución:", opts_sol, key="cs_fil_sol")
+
+    df_f = df_sop.copy()
+    if sel_causa: df_f = df_f[df_f["Causa_Registro"].isin(sel_causa)]
+    if sel_falla: df_f = df_f[df_f["Falla_Registro"].isin(sel_falla)]
+    if sel_sol:   df_f = df_f[df_f["Solucion_Registro"].isin(sel_sol)]
+
+    if df_f.empty:
+        st.info("Sin registros para los filtros seleccionados.")
+        return
+
+    # ---- PARETO ----
+    st.markdown("---")
+    st.markdown(f"#### Pareto 80/20 — {nivel1} como eje principal")
+
+    df_pareto = (df_f.groupby(col_n1, observed=True)
+                 .size().reset_index(name="Frecuencia")
+                 .sort_values("Frecuencia", ascending=False)
+                 .head(top_n))
+    df_pareto["% Acumulado"] = (df_pareto["Frecuencia"].cumsum() /
+                                 df_pareto["Frecuencia"].sum() * 100).round(1)
+
+    fig_pareto = go.Figure()
+    fig_pareto.add_trace(go.Bar(
+        x=df_pareto[col_n1], y=df_pareto["Frecuencia"],
+        name="Frecuencia", marker_color=PALETA_COLOR["azul_marina"],
+        text=df_pareto["Frecuencia"], textposition="outside",
+        textfont=dict(size=9, color="#000000"),
+    ))
+    fig_pareto.add_trace(go.Scatter(
+        x=df_pareto[col_n1], y=df_pareto["% Acumulado"],
+        name="% Acumulado", yaxis="y2", mode="lines+markers",
+        line=dict(color=PALETA_COLOR["turquesa_cyan"], width=2),
+        marker=dict(size=6, color=PALETA_COLOR["azul_noche"]),
+    ))
+    # Línea 80%
+    fig_pareto.add_hline(y=80, yref="y2", line_dash="dash",
+                          line_color=PALETA_COLOR["verde_montana"], line_width=1.5,
+                          annotation_text="80%", annotation_position="top right",
+                          annotation_font_color="#000000")
+    fig_pareto.update_layout(
+        barmode="group",
+        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+        font=dict(family="Arial, sans-serif", size=11, color="#000000"),
+        margin=dict(l=50, r=60, t=40, b=160),
+        title=dict(text=f"<b>PARETO DE {nivel1.upper()} — TOP {top_n}</b>",
+                   x=0.01, font=dict(size=13, color="#000000")),
+        legend=dict(orientation="h", yanchor="top", y=-0.45, xanchor="center", x=0.5,
+                    font=dict(size=10, color="#000000")),
+        xaxis=dict(tickangle=-45, tickfont=dict(size=9, color="#000000"),
+                   showgrid=False, type="category"),
+        yaxis=dict(title="Frecuencia", showgrid=True, gridcolor="#E2E8F0",
+                   tickfont=dict(color="#000000", size=10)),
+        yaxis2=dict(title="% Acumulado", overlaying="y", side="right",
+                    range=[0, 105], showgrid=False,
+                    tickfont=dict(color="#000000", size=10)),
+        dragmode=False,
+    )
+    st.plotly_chart(fig_pareto, use_container_width=True, key="pareto_causa_sol",
+                    config={"displayModeBar": False})
+
+    # ---- TABLA DESGLOSE ----
+    st.markdown(f"#### Desglose {nivel1} → {nivel2} → {nivel3}")
+    df_desg = (df_f.groupby([col_n1, col_n2, col_n3], observed=True)
+               .size().reset_index(name="Casos")
+               .sort_values("Casos", ascending=False))
+    df_desg.columns = [nivel1, nivel2, nivel3, "Casos"]
+    st.dataframe(df_desg, use_container_width=True, hide_index=True, height=320)
+
+    # ---- TÉCNICOS CON REINCIDENCIAS EN SOPORTE ----
+    st.markdown("---")
+    st.markdown("#### Técnicos — Reincidencias y Efectividad (filtrado a Soporte)")
+    if "ES_REINCIDENCIA" in df_f.columns and "Usuario_Tecnico" in df_f.columns:
+        df_tech_sop = (df_f.groupby("Usuario_Tecnico", observed=True)
+                       .agg(Total_Soportes=("FOLIO_KEY","count"),
+                            Reincidencias=("ES_REINCIDENCIA", lambda x: (x=="SI").sum()))
+                       .reset_index())
+        df_tech_sop["Efectividad_%"] = np.where(
+            df_tech_sop["Total_Soportes"] > 0,
+            np.round((1 - df_tech_sop["Reincidencias"] / df_tech_sop["Total_Soportes"]) * 100, 1),
+            100.0
+        )
+        df_tech_sop = df_tech_sop.sort_values("Reincidencias", ascending=False)
+        df_tech_sop.columns = ["Técnico","Total Soportes","Reincidencias","% Efectividad"]
+        st.dataframe(df_tech_sop, use_container_width=True, hide_index=True, height=320,
+                     column_config={"% Efectividad": st.column_config.NumberColumn(format="%.1f %%")})
+        st.download_button("Descargar tabla técnicos soporte (CSV)",
+                           df_tech_sop.to_csv(index=False).encode("utf-8"),
+                           "Soporte_Tecnicos.csv","text/csv")
 
 
 # ==============================================================================
@@ -2466,11 +3049,12 @@ def main():
 
     df_folios = df_t.drop_duplicates(subset=["FOLIO_KEY"], keep="first")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Pólizas y Cuadrillas",
         "Reincidencias",
         "Cambios de Equipo",
-        "Causa y Solución Soporte"
+        "Causa y Solución Soporte",
+        "IA — Auditor Operativo",
     ])
 
     with tab1:
@@ -2478,11 +3062,11 @@ def main():
     with tab2:
         renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
     with tab3:
-        st.markdown("### Cambios de Equipo")
-        st.info("Módulo en desarrollo.")
+        renderizar_pestana_cambios_equipo(df_folios, df_raw, dimension_sel)
     with tab4:
-        st.markdown("### Causa y Solución Soporte")
-        st.info("Módulo en desarrollo.")
+        renderizar_pestana_causa_solucion(df_folios, dimension_sel)
+    with tab5:
+        renderizar_pestana_ia(df_folios, df_raw)
 
 
 if __name__ == "__main__":
