@@ -114,13 +114,49 @@ TIPOS_VALIDOS_SISTEMA: frozenset = frozenset([
     "CIERRE","DETENCIONES","ETIQUETADO","GASA","POSTE","RED NUEVA","RUTA","TEN GIGA",
 ])
 
-# Mapa de homologación de tipos (normalizar variantes a un tipo canónico)
+# Catálogo canónico de homologación de tipos.
+# Clave = valor tal como puede llegar del CSV (incluyendo variantes con
+# caracteres corruptos por encoding). Valor = forma canónica del sistema.
+# Catálogo de homologación de tipos — se aplica sobre str.upper().strip()
+# Por eso todas las claves están en mayúsculas.
+# El bloque de contains posterior cubre variantes residuales no listadas.
 HOMOLOGACION_TIPOS: Dict[str, str] = {
-    "INSTALACIÓN":               "INSTALACION",
-    "RECOLECCION PI":            "RECOLECCION PI",
-    "RECOLECCIÓN PI":            "RECOLECCION PI",
-    "RECOLECCION EMPRESARIAL":   "RECOLECCION EMPRESARIAL",
-    "RECOLECCIÓN EMPRESARIAL":   "RECOLECCION EMPRESARIAL",
+    "SOPORTE":                      "SOPORTE",
+    "EMPRESARIAL":                  "EMPRESARIAL",
+    "CAMBIO DE EQUIPO":             "CAMBIO DE EQUIPO",
+    "CAMBIO DE DOMICILIO":          "CAMBIO DE DOMICILIO",
+    "CAMBIO DE PLAN":               "CAMBIO DE PLAN",
+    "ADDONS":                       "ADDONS",
+    "ADDON WIFI EXTENDER":          "ADDON WIFI EXTENDER",
+    "MANTENIMIENTO MENOR":          "MANTENIMIENTO MENOR",
+    "MANTENIMIENTO MAYOR":          "MANTENIMIENTO MAYOR",
+    "MANTENIMIENTO PREVENTIVO":     "MANTENIMIENTO PREVENTIVO",
+    "HALLAZGO EMPRESARIAL":         "HALLAZGO EMPRESARIAL",
+    "FACTIBILIDAD":                 "FACTIBILIDAD",
+    "CIERRE":                       "CIERRE",
+    "GASA":                         "GASA",
+    "ETIQUETADO":                   "ETIQUETADO",
+    "POSTE":                        "POSTE",
+    "DETENCIONES":                  "DETENCIONES",
+    "RUTA":                         "RUTA",
+    "TEN GIGA":                     "TEN GIGA",
+    "RED NUEVA":                    "RED NUEVA",
+    # Instalación — todas las variantes posibles de encoding
+    "INSTALACION":                  "INSTALACION",
+    "INSTALACIÓN":                  "INSTALACION",
+    "INSTALACIÃƒâ€šN": "INSTALACION",
+    "INSTALACI‚Ã‚Ã¶N": "INSTALACION",
+    "INSTALACI‚Äö√†√∂‚Äö√¢‚Ä¢N": "INSTALACION",
+    # Recolección PI
+    "RECOLECCION PI":               "RECOLECCION PI",
+    "RECOLECCIÓN PI":               "RECOLECCION PI",
+    "RECOLECCIÃƒâ€šN PI": "RECOLECCION PI",
+    "RECOLECCI‚Äö√†√∂‚Äö√¢‚Ä¢N PI": "RECOLECCION PI",
+    # Recolección Empresarial
+    "RECOLECCION EMPRESARIAL":      "RECOLECCION EMPRESARIAL",
+    "RECOLECCIÓN EMPRESARIAL":      "RECOLECCION EMPRESARIAL",
+    "RECOLECCIÃƒâ€šN EMPRESARIAL": "RECOLECCION EMPRESARIAL",
+    "RECOLECCI‚Äö√†√∂‚Äö√¢‚Ä¢N EMPRESARIAL": "RECOLECCION EMPRESARIAL",
 }
 
 MAPEO_MESES_TEXTO: Dict[int, str] = {
@@ -147,17 +183,19 @@ LISTA_ALIAS_FALLA:    List[str] = ["falla","observaciones","descripcion"]
 LISTA_ALIAS_CAUSA:    List[str] = ["causa","motivo","subtipo","diagnostico"]
 LISTA_ALIAS_SOLUCION: List[str] = ["solucion","solución","solution","resolucion","resolución"]
 LISTA_ALIAS_ESTATUS:  List[str] = ["estatus","status","estado"]
+LISTA_ALIAS_LAT:      List[str] = ["latitud","latitude","lat","coordenada_y","coord_lat","y_coord"]
+LISTA_ALIAS_LON:      List[str] = ["longitud","longitude","lon","lng","coordenada_x","coord_lon","x_coord"]
 
 PALETA_COLOR: Dict[str, str] = {
-    "azul_noche":      "#0B192C",
-    "azul_marina":     "#1E3E62",
-    "turquesa_cyan":   "#00D2C8",
-    "verde_montana":   "#10B981",
-    "naranja_desierto":"#F97316",
-    "amarillo_sol":    "#FBBF24",
+    "azul_noche":      "#0F1C2E",
+    "azul_marina":     "#294E76",
+    "turquesa_cyan":   "#2C9C9A",
+    "verde_montana":   "#3A7D62",
+    "naranja_desierto":"#BD7748",
+    "amarillo_sol":    "#B18A3D",
     "blanco_puro":     "#FFFFFF",
-    "gris_borde":      "#CBD5E1",
-    "texto_negro":     "#000000"
+    "gris_borde":      "#D8E1EA",
+    "texto_negro":     "#17212B"
 }
 
 MAPEO_BASE_CLUSTERS: Dict[str, str] = {
@@ -324,39 +362,53 @@ def obtener_valor_tipo2(valor_causa, valor_tipo_orden) -> str:
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=2)
 def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Motor de reincidencias enterprise.
+    Motor de reincidencias — v2 corregido.
 
-    Reglas:
-    1. Ordenamiento exclusivo por Num_Semana (asc) y posición ordinal de fila.
-       No se usa fecha de cierre para ordenar.
-    2. Una visita es reincidencia si:
-       a) Tipo_Orden actual es SOPORTE.
-       b) El antecedente inmediato (visita N-1) pertenece a: Instalación, Soporte,
-          Cambio de domicilio o Cambio de equipo.
-       c) La brecha entre fechas de creación es <= 60 días.
-    3. Si la causa del antecedente es N/A, se usa el valor de Tipo_Orden como causa.
-    4. El ID primario del técnico es Usuario; el nombre es complementario.
-    5. La búsqueda de antecedentes evalúa el DATASET COMPLETO (sin filtros de UI).
+    Reglas de negocio exactas:
+
+    1. ORDEN: cronológico por (Num_Semana ASC, posición de fila ASC).
+       Sin dependencia de fecha de cierre para ordenar.
+
+    2. ES_REINCIDENCIA = SI cuando:
+       a) El evento actual es de tipo SOPORTE.
+       b) Existe algún antecedente previo en la misma cuenta cuyo tipo sea
+          elegible: INSTALACION, SOPORTE, CAMBIO DE DOMICILIO, CAMBIO DE EQUIPO.
+       c) La brecha entre la FECHA DE CIERRE del antecedente y la FECHA DE
+          CREACIÓN del Soporte actual es > 0 y <= 60 días.
+          (La instalación "falla" días después de cerrarse, no de crearse.)
+       d) Si no hay fecha de cierre disponible, se usa fecha de creación como
+          aproximación y la brecha máxima pasa a ser 8 semanas.
+
+    3. CONTEO_PREVIO_8_SEM: número acumulado de reincidencias de esa cuenta
+       ANTERIORES a la posición actual (incluyendo eventos no reincidentes).
+       Ejemplo cuenta 142838878:
+         OT 34165545 Instalación → conteo=0 (no es reincidencia)
+         OT 35638804 Soporte     → conteo=1 (1ª reincidencia; brecha 52 días de instalación)
+         OT 37420992 Cambio Dom  → conteo=2 (no es reincidencia pero acumula 2)
+         OT 37805036 Soporte     → conteo=3 (2ª reincidencia; brecha del cambio domicilio)
+
+    4. TIPO_2: si causa del antecedente es N/A → usar Tipo_Orden del antecedente.
+
+    5. ID primario del técnico: código de usuario (antes del " | ").
     """
-    # Inicialización de columnas de salida
     df = df.copy()
     for col, val in [
-        ("ES_REINCIDENCIA", "NO"),
-        ("CONTEO_PREVIO_8_SEM", 0),
-        ("Usuario_Origen_Reincidencia", "N/A"),
-        ("Empresa_Origen_Reincidencia", "N/A"),
+        ("ES_REINCIDENCIA",           "NO"),
+        ("CONTEO_PREVIO_8_SEM",       0),
+        ("Usuario_Origen_Reincidencia","N/A"),
+        ("Empresa_Origen_Reincidencia","N/A"),
         ("Semana_Origen_Reincidencia", np.nan),
-        ("Causa_Origen", "N/A"),
-        ("TIPO_2", "N/A"),
-        ("Falla_Nueva", "N/A"),
-        ("ES_CASO_ESPECIAL", "NO"),
+        ("Causa_Origen",               "N/A"),
+        ("TIPO_2",                     "N/A"),
+        ("Falla_Nueva",                "N/A"),
+        ("ES_CASO_ESPECIAL",           "NO"),
     ]:
         df[col] = val
 
     if df.empty:
         return df
 
-    cols = list(df.columns)
+    cols        = list(df.columns)
     col_tech    = detectar_columna_por_patrones(cols, ["usuario_tecnico","tecnico","tech","usuario","atendio","nombre_tecnico"]) or "Usuario_Tecnico"
     col_semana  = detectar_columna_por_patrones(cols, ["num_semana_archivo","semana","sem"]) or "Num_Semana_Archivo"
     col_causa   = detectar_columna_por_patrones(cols, LISTA_ALIAS_CAUSA) or "Tipo_Orden"
@@ -364,102 +416,133 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
     col_empresa = detectar_columna_por_patrones(cols, LISTA_ALIAS_PROVEEDOR) or "Empresa"
     col_tipo    = "Tipo_Orden" if "Tipo_Orden" in cols else col_causa
 
+    COL_PARSED  = "_datetime_parsed"   # fecha de creación parseada
+    COL_TERMINO = "_datetime_termino"  # fecha de cierre parseada
+    tiene_fechas_creacion = COL_PARSED  in df.columns
+    tiene_fechas_cierre   = COL_TERMINO in df.columns
+
     df["_IDX_ORIG"] = range(len(df))
     df["_SEM_TEMP"] = pd.to_numeric(df[col_semana], errors="coerce").fillna(0).astype(int)
-
-    # Fechas para cálculo de brecha 60 días
-    col_dt_parsed = "_datetime_parsed"
-    tiene_fechas  = col_dt_parsed in df.columns
 
     mask_cta = df["Cuenta_Cliente"].notna() & (
         ~df["Cuenta_Cliente"].astype(str).str.upper().isin(["SIN_CTA","SIN_FOLIO","NAN","NONE",""])
     )
     df_valid = df[mask_cta].sort_values(["Cuenta_Cliente","_SEM_TEMP","_IDX_ORIG"]).copy()
 
-    dict_rein: Dict[str, dict] = {}
+    # Resultados indexados por FOLIO_KEY
+    resultados: Dict[str, dict] = {}
 
     for cuenta, g in df_valid.groupby("Cuenta_Cliente"):
-        registros = g.to_dict("records")
-        n = len(registros)
-        if n < 2:
-            continue
+        registros  = g.to_dict("records")
+        n          = len(registros)
+        conteo_acc = 0   # reincidencias acumuladas hasta el evento i
 
-        for i in range(1, n):
-            reg_act  = registros[i]
-            tipo_act = reg_act.get("Tipo_Orden", reg_act.get("TIPO", ""))
+        for i in range(n):
+            reg_act   = registros[i]
+            key_act   = reg_act.get("FOLIO_KEY")
+            tipo_act  = str(reg_act.get(col_tipo, "")).strip().upper()
+            es_soporte = _tipo_es_soporte(tipo_act)
 
-            if not _tipo_es_soporte(tipo_act):
+            # Guardar el conteo acumulado ANTES de procesar este evento
+            resultados[key_act] = {
+                "CONTEO": conteo_acc,
+                "ES_REIN": "NO",
+                "Usuario_Origen":  "N/A",
+                "Empresa_Origen":  "N/A",
+                "Semana_Origen":   np.nan,
+                "Causa_Origen":    "N/A",
+                "TIPO_2":          "N/A",
+                "Falla_Nueva":     "N/A",
+            }
+
+            if not es_soporte or i == 0:
                 continue
 
-            # Buscar antecedente válido más reciente hacia atrás
+            # Buscar antecedente elegible más reciente hacia atrás
             reg_prev = None
             for j in range(i - 1, -1, -1):
-                tipo_prev_candidato = registros[j].get("Tipo_Orden", registros[j].get("TIPO", ""))
-                if _tipo_es_antecedente_valido(tipo_prev_candidato):
+                t_prev = str(registros[j].get(col_tipo, "")).strip().upper()
+                if _tipo_es_antecedente_valido(t_prev):
                     reg_prev = registros[j]
                     break
 
             if reg_prev is None:
                 continue
 
-            # Validar brecha <= 60 días si hay fechas disponibles
-            if tiene_fechas:
-                fecha_act  = reg_act.get(col_dt_parsed)
-                fecha_prev = reg_prev.get(col_dt_parsed)
-                if pd.notna(fecha_act) and pd.notna(fecha_prev):
-                    delta = (pd.Timestamp(fecha_act) - pd.Timestamp(fecha_prev)).days
-                    if delta > 60 or delta < 0:
-                        continue
-                    semana_origen = reg_prev.get("_SEM_TEMP", np.nan)
+            # -------------------------------------------------------
+            # Brecha: fecha_cierre_antecedente → fecha_creacion_actual
+            # -------------------------------------------------------
+            es_rein = False
+            semana_origen = reg_prev.get("_SEM_TEMP", np.nan)
+
+            if tiene_fechas_creacion and tiene_fechas_cierre:
+                f_cierre_prev = reg_prev.get(COL_TERMINO)   # cierre del antecedente
+                f_crear_act   = reg_act.get(COL_PARSED)     # creación del soporte actual
+                if pd.notna(f_cierre_prev) and pd.notna(f_crear_act):
+                    delta_d = (pd.Timestamp(f_crear_act) - pd.Timestamp(f_cierre_prev)).days
+                    es_rein = (0 < delta_d <= 60)
+                elif pd.notna(reg_prev.get(COL_PARSED)) and pd.notna(f_crear_act):
+                    # Fallback: usar fecha creación del antecedente
+                    delta_d = (pd.Timestamp(f_crear_act) - pd.Timestamp(reg_prev[COL_PARSED])).days
+                    es_rein = (0 < delta_d <= 60)
                 else:
-                    # Sin fechas, se valida solo por semana (brecha <= 8 semanas)
-                    semana_origen = reg_prev.get("_SEM_TEMP", np.nan)
+                    # Sin fechas: validar por semana (<= 8)
                     if pd.notna(semana_origen):
                         brecha_sem = int(reg_act.get("_SEM_TEMP", 0)) - int(semana_origen)
-                        if brecha_sem > 8 or brecha_sem < 0:
-                            continue
+                        es_rein = (0 < brecha_sem <= 8)
             else:
-                semana_origen = reg_prev.get("_SEM_TEMP", np.nan)
+                # Sin columnas de fecha: validar solo por semana
+                if pd.notna(semana_origen):
+                    brecha_sem = int(reg_act.get("_SEM_TEMP", 0)) - int(semana_origen)
+                    es_rein = (0 < brecha_sem <= 8)
+
+            if not es_rein:
+                continue
+
+            # ---- Es reincidencia ----
+            conteo_acc += 1   # incrementar ANTES de guardar en este evento
 
             tech_prev = str(reg_prev.get(col_tech, "SIN ESPECIFICAR"))
             if tech_prev.upper() in ["NAN","NONE","","N/A","NULL"]:
                 tech_prev = "SIN ESPECIFICAR"
-
             emp_prev = str(reg_prev.get(col_empresa, "SIN EMPRESA"))
             if emp_prev.upper() in ["NAN","NONE","","N/A","NULL"]:
                 emp_prev = "SIN EMPRESA"
 
             causa_raw = reg_prev.get(col_causa)
             tipo_raw  = reg_prev.get(col_tipo)
-            tipo_2    = obtener_valor_tipo2(causa_raw, tipo_raw)
-            falla_val = reg_act.get(col_falla, "N/A")
 
-            key_act = reg_act.get("FOLIO_KEY")
-            if key_act:
-                dict_rein[key_act] = {
-                    "Usuario_Origen":  tech_prev,
-                    "Empresa_Origen":  emp_prev,
-                    "Semana_Origen":   semana_origen,
-                    "Causa_Origen":    str(causa_raw) if pd.notna(causa_raw) else "N/A",
-                    "TIPO_2":          tipo_2,
-                    "Falla_Nueva":     falla_val,
-                }
+            resultados[key_act].update({
+                "CONTEO":         conteo_acc,
+                "ES_REIN":        "SI",
+                "Usuario_Origen": tech_prev,
+                "Empresa_Origen": emp_prev,
+                "Semana_Origen":  semana_origen,
+                "Causa_Origen":   str(causa_raw) if pd.notna(causa_raw) else "N/A",
+                "TIPO_2":         obtener_valor_tipo2(causa_raw, tipo_raw),
+                "Falla_Nueva":    str(reg_act.get(col_falla, "N/A")),
+            })
 
-    if dict_rein:
-        mask_r = df["FOLIO_KEY"].isin(dict_rein)
-        df.loc[mask_r, "ES_REINCIDENCIA"]           = "SI"
-        df.loc[mask_r, "CONTEO_PREVIO_8_SEM"]       = 1
-        _map = lambda campo: df.loc[mask_r, "FOLIO_KEY"].map(
-            lambda k: dict_rein[k][campo] if k in dict_rein else "N/A"
-        )
-        df.loc[mask_r, "Usuario_Origen_Reincidencia"]  = _map("Usuario_Origen")
-        df.loc[mask_r, "Empresa_Origen_Reincidencia"]  = _map("Empresa_Origen")
-        df.loc[mask_r, "Semana_Origen_Reincidencia"]   = df.loc[mask_r, "FOLIO_KEY"].map(
-            lambda k: dict_rein[k]["Semana_Origen"] if k in dict_rein else np.nan
-        )
-        df.loc[mask_r, "Causa_Origen"]                 = _map("Causa_Origen")
-        df.loc[mask_r, "TIPO_2"]                       = _map("TIPO_2")
-        df.loc[mask_r, "Falla_Nueva"]                  = _map("Falla_Nueva")
+    # Asignar resultados al DataFrame original
+    if resultados:
+        folio_series = df["FOLIO_KEY"]
+        df["CONTEO_PREVIO_8_SEM"]        = folio_series.map(lambda k: resultados.get(k,{}).get("CONTEO", 0))
+        df["ES_REINCIDENCIA"]            = folio_series.map(lambda k: resultados.get(k,{}).get("ES_REIN","NO"))
+        mask_r = df["ES_REINCIDENCIA"] == "SI"
+        if mask_r.any():
+            for dest, campo in [
+                ("Usuario_Origen_Reincidencia", "Usuario_Origen"),
+                ("Empresa_Origen_Reincidencia", "Empresa_Origen"),
+                ("Causa_Origen",                "Causa_Origen"),
+                ("TIPO_2",                      "TIPO_2"),
+                ("Falla_Nueva",                 "Falla_Nueva"),
+            ]:
+                df.loc[mask_r, dest] = folio_series[mask_r].map(
+                    lambda k, c=campo: resultados.get(k, {}).get(c, "N/A")
+                )
+            df.loc[mask_r, "Semana_Origen_Reincidencia"] = folio_series[mask_r].map(
+                lambda k: resultados.get(k, {}).get("Semana_Origen", np.nan)
+            )
 
     df.drop(columns=["_IDX_ORIG","_SEM_TEMP"], errors="ignore", inplace=True)
     return df
@@ -523,10 +606,17 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
     c_falla  = get_col(LISTA_ALIAS_FALLA)
     c_sol    = get_col(LISTA_ALIAS_SOLUCION)
     c_status = get_col(LISTA_ALIAS_ESTATUS)
-    if c_causa  and c_causa  in cols: df["Causa_Registro"]  = sanit_txt(df[c_causa])
-    if c_falla  and c_falla  in cols: df["Falla_Registro"]  = sanit_txt(df[c_falla])
-    if c_sol    and c_sol    in cols: df["Solucion_Registro"]= sanit_txt(df[c_sol])
-    if c_status and c_status in cols: df["Estatus_Registro"] = sanit_txt(df[c_status])
+    c_lat    = get_col(LISTA_ALIAS_LAT)
+    c_lon    = get_col(LISTA_ALIAS_LON)
+    if c_causa  and c_causa  in cols: df["Causa_Registro"]   = sanit_txt(df[c_causa])
+    if c_falla  and c_falla  in cols: df["Falla_Registro"]   = sanit_txt(df[c_falla])
+    if c_sol    and c_sol    in cols: df["Solucion_Registro"] = sanit_txt(df[c_sol])
+    if c_status and c_status in cols: df["Estatus_Registro"]  = sanit_txt(df[c_status])
+    # Coordenadas: convertir a float, valores inválidos → NaN
+    if c_lat and c_lat in cols:
+        df["LAT"] = pd.to_numeric(df[c_lat].astype(str).str.replace(",",".",regex=False), errors="coerce")
+    if c_lon and c_lon in cols:
+        df["LON"] = pd.to_numeric(df[c_lon].astype(str).str.replace(",",".",regex=False), errors="coerce")
 
     s_os   = sanit_fol(df[c_os])   if c_os   else pd.Series("SIN_OS",  index=df.index)
     s_cta  = sanit_fol(df[c_cta])  if c_cta  else pd.Series("SIN_CTA", index=df.index)
@@ -574,6 +664,29 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
         # Eliminar: es planta externa Y el tipo es de los excluidos
         df = df[~(mask_25 & mask_tipo_excluido)].copy()
         cols = list(df.columns)  # refrescar después del filtro
+
+    # ------------------------------------------------------------------
+    # HOMOLOGACIÓN DE TIPOS DE EVENTO
+    # 1. Primero mapa exacto (cubre variantes con encoding corrupto).
+    # 2. Luego contains sobre el resultado normalizado a mayúsculas,
+    #    para cubrir cualquier variante no listada en el catálogo.
+    # ------------------------------------------------------------------
+    if "Tipo_Orden" in df.columns:
+        # Paso 1: mapa exacto (case-insensitive sobre upper())
+        tipo_up = df["Tipo_Orden"].str.upper().str.strip()
+        mapa_upper = {k.upper(): v for k, v in HOMOLOGACION_TIPOS.items()}
+        df["Tipo_Orden"] = tipo_up.map(mapa_upper).fillna(tipo_up)
+
+        # Paso 2: contains para cubrir variantes residuales no en el mapa
+        tipo_up2 = df["Tipo_Orden"].str.upper().str.strip()
+        mask_rec_emp = tipo_up2.str.contains("RECOLE", na=False) & (
+            tipo_up2.str.contains("EMPRE", na=False)
+        )
+        mask_rec_pi  = tipo_up2.str.contains("RECOLE", na=False) & ~mask_rec_emp
+        mask_inst    = tipo_up2.str.contains("INSTALA", na=False) & ~mask_rec_emp & ~mask_rec_pi
+        df.loc[mask_rec_emp, "Tipo_Orden"] = "RECOLECCION EMPRESARIAL"
+        df.loc[mask_rec_pi,  "Tipo_Orden"] = "RECOLECCION PI"
+        df.loc[mask_inst,    "Tipo_Orden"] = "INSTALACION"
 
     # Dimensiones temporales
     sem_arch = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in cols else pd.Series(None, index=df.index)
@@ -1134,112 +1247,147 @@ def inyectar_estilos_css_enterprise() -> None:
     p = PALETA_COLOR
     css = f"""
     <style>
+    :root {{
+        --ink: #17212B;
+        --muted: #66778A;
+        --canvas: #F4F7FA;
+        --paper: #FFFFFF;
+        --line: #D8E1EA;
+        --navy: {p["azul_noche"]};
+        --blue: {p["azul_marina"]};
+        --accent: {p["turquesa_cyan"]};
+    }}
     html, body, [class*="css"], .stApp {{
         font-family: Arial, "Helvetica Neue", Helvetica, sans-serif !important;
-        background-color: #F8FAFC !important;
-        color: #000000 !important;
+        background-color: var(--canvas) !important;
+        color: var(--ink) !important;
+    }}
+    .block-container {{
+        max-width: 1440px !important;
+        padding-top: 2.1rem !important;
+        padding-bottom: 3rem !important;
+    }}
+    h1, h2, h3, p, span, label {{
+        font-family: Arial, "Helvetica Neue", Helvetica, sans-serif !important;
+    }}
+    h1, h2, h3 {{
+        color: var(--ink) !important;
+        letter-spacing: -0.02em !important;
     }}
 
     /* Sidebar */
     [data-testid="stSidebar"] {{
-        background-color: {p["azul_noche"]} !important;
-        min-width: 300px !important;
+        background: linear-gradient(180deg, #101C2D 0%, #14263A 100%) !important;
+        min-width: 280px !important;
+        border-right: 1px solid rgba(255,255,255,0.07) !important;
     }}
     [data-testid="stSidebar"] * {{ color: #FFFFFF !important; }}
+    [data-testid="stSidebar"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] [data-baseweb="input"] {{
+        background: rgba(255,255,255,0.09) !important;
+        border-color: rgba(255,255,255,0.16) !important;
+        border-radius: 8px !important;
+    }}
 
     /* Header principal */
     .main-header-enterprise {{
-        background: linear-gradient(135deg, {p["azul_noche"]} 0%, {p["azul_marina"]} 100%);
-        padding: 22px 28px;
-        border-radius: 12px;
-        border-bottom: 3px solid {p["turquesa_cyan"]};
+        background: linear-gradient(122deg, #101D30 0%, #1E405F 100%);
+        padding: 30px 34px 27px;
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,0.08);
+        border-bottom: 4px solid {p["turquesa_cyan"]};
         color: #FFFFFF !important;
-        margin-bottom: 18px;
-        box-shadow: 0 6px 16px -4px rgba(11,25,44,0.35);
+        margin-bottom: 22px;
+        box-shadow: 0 16px 35px -22px rgba(15,28,46,0.65);
     }}
     .main-header-enterprise h1 {{
         font-family: Arial, sans-serif !important;
-        font-size: 22px !important;
+        font-size: clamp(22px, 2.2vw, 30px) !important;
         font-weight: 800 !important;
-        letter-spacing: 0.5px !important;
+        letter-spacing: -0.025em !important;
         color: #FFFFFF !important;
-        margin: 0 0 4px 0 !important;
+        margin: 0 0 8px 0 !important;
     }}
     .main-header-enterprise p {{
         font-family: Arial, sans-serif !important;
         font-size: 13px !important;
-        font-weight: 600 !important;
-        color: {p["turquesa_cyan"]} !important;
+        font-weight: 500 !important;
+        color: #D8F3F0 !important;
         margin: 0 !important;
     }}
 
     /* KPI Cards */
     .kpi-card-enterprise {{
-        background: linear-gradient(135deg, {p["azul_noche"]} 0%, {p["azul_marina"]} 80%);
-        border-radius: 10px;
-        padding: 16px 18px;
-        border: 1px solid {p["azul_marina"]};
-        box-shadow: 0 4px 10px -2px rgba(11,25,44,0.3);
+        position: relative;
+        overflow: hidden;
+        background: var(--paper);
+        border-radius: 13px;
+        padding: 19px 20px 17px;
+        border: 1px solid var(--line);
+        border-top: 3px solid {p["turquesa_cyan"]};
+        box-shadow: 0 12px 26px -23px rgba(15,28,46,0.55);
+        min-height: 116px;
     }}
     .kpi-card-title {{
         font-family: Arial, sans-serif;
         font-size: 10px;
         font-weight: 700;
-        letter-spacing: 1px;
-        color: {p["gris_borde"]};
+        letter-spacing: 0.08em;
+        color: #65768A;
         text-transform: uppercase;
-        margin-bottom: 6px;
+        margin-bottom: 9px;
     }}
     .kpi-card-value {{
         font-family: Arial, sans-serif;
-        font-size: 28px;
+        font-size: 29px;
         font-weight: 800;
-        color: {p["turquesa_cyan"]};
+        color: {p["azul_noche"]};
         line-height: 1.1;
     }}
     .kpi-card-subtitle {{
         font-family: Arial, sans-serif;
         font-size: 10px;
-        font-weight: 400;
-        color: {p["gris_borde"]};
-        margin-top: 4px;
+        font-weight: 500;
+        color: #718196;
+        margin-top: 7px;
     }}
 
     /* Tabs (navegación) */
     div[data-testid="stTabs"] {{
-        background-color: #0f172a !important;
-        padding: 6px !important;
-        border-radius: 10px !important;
-        border: 1px solid #1e293b !important;
+        background-color: transparent !important;
+        padding: 0 !important;
+        border-radius: 0 !important;
+        border: none !important;
     }}
     div[data-testid="stTabs"] > div[role="tablist"] {{
-        gap: 6px !important;
+        gap: 5px !important;
         background-color: transparent !important;
-        border-bottom: none !important;
+        border-bottom: 1px solid var(--line) !important;
+        padding-bottom: 7px !important;
     }}
     div[data-testid="stTabs"] button[role="tab"] {{
-        background-color: #1e293b !important;
-        border: 1px solid #334155 !important;
+        background-color: transparent !important;
+        border: 1px solid transparent !important;
         border-radius: 7px !important;
-        padding: 8px 16px !important;
+        padding: 8px 14px !important;
         transition: all 0.2s ease !important;
         font-family: Arial, sans-serif !important;
     }}
     div[data-testid="stTabs"] button[role="tab"] p,
     div[data-testid="stTabs"] button[role="tab"] span {{
-        color: #94a3b8 !important;
-        font-size: 13px !important;
-        font-weight: 600 !important;
+        color: #6B7B8F !important;
+        font-size: 12px !important;
+        font-weight: 700 !important;
         font-family: Arial, sans-serif !important;
     }}
     div[data-testid="stTabs"] button[role="tab"]:hover {{
-        background-color: #334155 !important;
+        background-color: #EAF2F5 !important;
     }}
-    div[data-testid="stTabs"] button[role="tab"]:hover p {{ color: #f8fafc !important; }}
+    div[data-testid="stTabs"] button[role="tab"]:hover p {{ color: {p["azul_noche"]} !important; }}
     div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
-        background-color: {p["azul_marina"]} !important;
-        border-color: {p["turquesa_cyan"]} !important;
-        box-shadow: 0 3px 10px rgba(0,210,200,0.25) !important;
+        background-color: {p["azul_noche"]} !important;
+        border-color: {p["azul_noche"]} !important;
+        box-shadow: 0 8px 14px -10px rgba(15,28,46,0.8) !important;
     }}
     div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p {{
         color: #ffffff !important; font-weight: 700 !important;
@@ -1248,27 +1396,28 @@ def inyectar_estilos_css_enterprise() -> None:
 
     /* Matriz / tablas header */
     .matrix-title-card {{
-        background: #1e293b;
-        padding: 10px 14px;
-        border-radius: 7px;
-        margin: 12px 0;
-        border: 1px solid #334155;
+        background: #FFFFFF;
+        padding: 14px 16px;
+        border-radius: 10px;
+        margin: 16px 0 12px;
+        border: 1px solid var(--line);
+        border-left: 3px solid {p["turquesa_cyan"]};
     }}
-    .matrix-title-card b {{ color: #f8fafc; font-family: Arial, sans-serif; font-size: 14px; font-weight: 700; }}
-    .matrix-title-card p  {{ color: #94a3b8; font-family: Arial, sans-serif; font-size: 11px; margin: 2px 0 0 0; }}
+    .matrix-title-card b {{ color: {p["azul_noche"]}; font-family: Arial, sans-serif; font-size: 13px; font-weight: 800; letter-spacing: 0.01em; }}
+    .matrix-title-card p  {{ color: #6B7B8F; font-family: Arial, sans-serif; font-size: 11px; margin: 4px 0 0 0; }}
 
     /* Inputs en sidebar */
     div[data-widget="stMultiSelect"] label,
-    div[data-widget="stSelectbox"]   label {{ color: #f1f5f9 !important; font-weight: 600 !important; font-size: 12px !important; }}
+    div[data-widget="stSelectbox"]   label {{ color: #F4F7FA !important; font-weight: 700 !important; font-size: 12px !important; }}
     div[data-testid="stTabs"] .stMarkdown p,
     div[data-testid="stTabs"] .stMarkdown h1,
     div[data-testid="stTabs"] .stMarkdown h2,
-    div[data-testid="stTabs"] .stMarkdown h3 {{ color: #f8fafc !important; }}
+    div[data-testid="stTabs"] .stMarkdown h3 {{ color: {p["texto_negro"]} !important; }}
 
     /* Textarea / inputs */
     div[data-testid="stTextArea"] textarea, div[data-testid="stTextInput"] input {{
-        background-color: #0f172a !important; color: #f8fafc !important;
-        border: 1px solid #334155 !important; border-radius: 7px !important;
+        background-color: #FFFFFF !important; color: {p["texto_negro"]} !important;
+        border: 1px solid #C5D1DD !important; border-radius: 8px !important;
     }}
 
     /* Formulario de carga (contraste claro) */
@@ -1282,19 +1431,42 @@ def inyectar_estilos_css_enterprise() -> None:
 
     /* Botones */
     div.stButton > button[kind="primary"] {{
-        background-color: {p["azul_marina"]} !important; color: #FFFFFF !important;
-        border: 1px solid {p["azul_marina"]} !important; border-radius: 7px !important;
+        background-color: {p["azul_noche"]} !important; color: #FFFFFF !important;
+        border: 1px solid {p["azul_noche"]} !important; border-radius: 8px !important;
         font-family: Arial, sans-serif !important; font-weight: 700 !important;
         font-size: 13px !important;
+        min-height: 38px !important;
     }}
     div.stButton > button[kind="primary"]:hover {{
-        background-color: {p["azul_noche"]} !important;
+        background-color: {p["azul_marina"]} !important;
+        border-color: {p["azul_marina"]} !important;
     }}
     div.stButton > button[kind="secondary"], div.stButton > button:not([kind="primary"]) {{
         background-color: #FFFFFF !important; color: {p["azul_marina"]} !important;
-        border: 1px solid {p["gris_borde"]} !important; border-radius: 7px !important;
+        border: 1px solid {p["gris_borde"]} !important; border-radius: 8px !important;
         font-family: Arial, sans-serif !important; font-weight: 600 !important;
         font-size: 13px !important;
+        min-height: 38px !important;
+    }}
+
+    /* Tablas, alertas y divisores */
+    [data-testid="stDataFrame"], [data-testid="stTable"] {{
+        border: 1px solid var(--line) !important;
+        border-radius: 10px !important;
+        overflow: hidden !important;
+        background: #FFFFFF !important;
+    }}
+    [data-testid="stAlert"] {{
+        border-radius: 9px !important;
+        border: 1px solid var(--line) !important;
+    }}
+    hr {{ border-color: var(--line) !important; margin: 1.5rem 0 !important; }}
+    @media (max-width: 760px) {{
+        .block-container {{ padding: 1rem 0.85rem 2rem !important; }}
+        .main-header-enterprise {{ padding: 22px 20px 20px !important; border-radius: 12px !important; }}
+        .main-header-enterprise h1 {{ font-size: 22px !important; }}
+        .kpi-card-enterprise {{ min-height: 102px !important; padding: 15px !important; }}
+        div[data-testid="stTabs"] button[role="tab"] {{ padding: 7px 10px !important; }}
     }}
 
     /* Desactivar zoom táctil en gráficos */
@@ -1461,85 +1633,116 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
                 st.plotly_chart(fig_e, use_container_width=True, config={"displayModeBar": False})
 
     # --- SUBTAB 2: DESGLOSE PÓLIZAS ---
+    # Esta tabla tiene sus PROPIOS filtros — no le afectan los filtros del sidebar.
+    # Fuente de datos: df_raw completo (pasado desde main como argumento).
     with sub_tab2:
         st.markdown("### Desglose Operativo por Póliza, Distrito y Proveedor")
-        st.caption("Proveedor = empresa asignada al técnico. Vivo = cuadrillas únicas (técnicos distintos con al menos un evento en el período filtrado). Balance = Sugerido − Vivo.")
-        if not df_folios.empty:
-            # Tabla principal: Distrito / Proveedor / Póliza / Modalidad / Vivo / Balance
-            # "Vivo" = cuadrillas únicas (técnicos únicos con actividad)
-            # "Balance" = Sugerido − Vivo (configurable por el usuario en un editor lateral)
+        st.caption(
+            "Filtros independientes del sidebar. "
+            "Vivo = cuadrillas únicas (técnicos únicos con actividad en la combinación "
+            "Distrito × Empresa × Póliza para la semana seleccionada). "
+            "Balance = Sugerido − Vivo."
+        )
 
-            # --- Panel de sugeridos (configuración manual por fila) ---
-            df_base_pol = (
-                df_folios
-                .groupby(["Distrito","Empresa","Codigo_Poliza","Nombre_Poliza"], observed=True)
-                .agg(
-                    Vivo=("Usuario_Tecnico","nunique"),
-                    Eventos=("FOLIO_KEY","count"),
+        if not df_raw.empty and "SEMANA_DIM" in df_raw.columns:
+            # ---- Filtros propios ----
+            sems_raw   = sorted(df_raw["SEMANA_DIM"].dropna().unique(), key=_num_sem)
+            # Default: última semana registrada
+            sem_deflt  = [sems_raw[-1]] if sems_raw else []
+
+            cf1, cf2, cf3, cf4 = st.columns(4)
+            with cf1:
+                sem_sel_pol = st.multiselect(
+                    "Semana:", sems_raw, default=sem_deflt, key="pol_sem_sel"
                 )
-                .reset_index()
-                .sort_values(["Distrito","Empresa","Codigo_Poliza"])
-                .rename(columns={
-                    "Codigo_Poliza": "Nomenclatura",
-                    "Nombre_Poliza": "Modalidad",
-                })
-            )
+            with cf2:
+                dist_raw   = sorted(df_raw["Distrito"].dropna().unique())
+                dist_sel_pol = st.multiselect("Distrito:", dist_raw, key="pol_dist_sel")
+            with cf3:
+                emp_raw    = sorted(df_raw["Empresa"].dropna().unique())
+                emp_sel_pol = st.multiselect("Empresa / Proveedor:", emp_raw, key="pol_emp_sel")
+            with cf4:
+                pol_raw    = sorted([k for k in df_raw["Codigo_Poliza"].dropna().unique() if k in MAPEO_POLIZAS])
+                pol_sel_pol = st.multiselect("Póliza:", pol_raw, key="pol_pol_sel")
 
-            # Clave de sugerido: persistida en session_state para que no se borre al filtrar
-            clave_sug = "sugeridos_poliza"
-            if clave_sug not in st.session_state:
-                st.session_state[clave_sug] = {}
+            # Aplicar filtros propios
+            df_pol_base = df_raw.copy()
+            if sem_sel_pol:  df_pol_base = df_pol_base[df_pol_base["SEMANA_DIM"].isin(sem_sel_pol)]
+            if dist_sel_pol: df_pol_base = df_pol_base[df_pol_base["Distrito"].isin(dist_sel_pol)]
+            if emp_sel_pol:  df_pol_base = df_pol_base[df_pol_base["Empresa"].isin(emp_sel_pol)]
+            if pol_sel_pol:  df_pol_base = df_pol_base[df_pol_base["Codigo_Poliza"].isin(pol_sel_pol)]
 
-            col_tbl, col_sug = st.columns([0.75, 0.25])
-            with col_sug:
-                st.markdown("**Cuadrillas Sugeridas**")
-                st.caption("Define la meta de cuadrillas para cada fila (Distrito · Empresa · Póliza).")
-                for _, row in df_base_pol.iterrows():
-                    fila_key = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
-                    val_actual = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
-                    nuevo_val = st.number_input(
-                        f"{row['Distrito'][:8]} · {row['Empresa'][:10]} · {row['Nomenclatura']}",
-                        min_value=0, value=val_actual,
-                        key=f"sug_{fila_key}", label_visibility="visible"
+            if df_pol_base.empty:
+                st.info("Sin datos para los filtros seleccionados.")
+            else:
+                df_base_pol = (
+                    df_pol_base
+                    .groupby(["Distrito","Empresa","Codigo_Poliza","Nombre_Poliza"], observed=True)
+                    .agg(
+                        Vivo=("Usuario_Tecnico","nunique"),
+                        Eventos=("FOLIO_KEY","count"),
                     )
-                    st.session_state[clave_sug][fila_key] = nuevo_val
-
-            with col_tbl:
-                # Calcular Sugerido y Balance desde session_state
-                def _get_sug(row):
-                    k = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
-                    return st.session_state[clave_sug].get(k, int(row["Vivo"]))
-
-                df_base_pol["Sugerido"] = df_base_pol.apply(_get_sug, axis=1)
-                df_base_pol["Balance"]  = df_base_pol["Sugerido"] - df_base_pol["Vivo"]
-
-                def _color_balance(val):
-                    if val < 0:   return "color: #EF4444; font-weight:700;"
-                    if val == 0:  return "color: #FBBF24; font-weight:700;"
-                    return "color: #10B981; font-weight:700;"
-
-                cols_show = ["Distrito","Empresa","Nomenclatura","Modalidad","Sugerido","Vivo","Balance","Eventos"]
-                df_show_pol = df_base_pol[cols_show]
-
-                st.dataframe(
-                    df_show_pol.style.applymap(_color_balance, subset=["Balance"]),
-                    use_container_width=True, hide_index=True, height=480,
-                    column_config={
-                        "Distrito":     st.column_config.Column(width="small",  pinned=True),
-                        "Empresa":      st.column_config.Column(width="medium"),
-                        "Nomenclatura": st.column_config.Column(width="small"),
-                        "Modalidad":    st.column_config.Column(width="medium"),
-                        "Sugerido":     st.column_config.NumberColumn(width="small"),
-                        "Vivo":         st.column_config.NumberColumn(width="small"),
-                        "Balance":      st.column_config.NumberColumn(width="small"),
-                        "Eventos":      st.column_config.NumberColumn(width="small"),
-                    }
+                    .reset_index()
+                    .sort_values(["Distrito","Empresa","Codigo_Poliza"])
+                    .rename(columns={"Codigo_Poliza":"Nomenclatura","Nombre_Poliza":"Modalidad"})
                 )
-                st.download_button(
-                    "Descargar desglose (CSV)",
-                    df_show_pol.to_csv(index=False).encode("utf-8"),
-                    "Desglose_Polizas.csv", "text/csv"
-                )
+
+                # Sugeridos persistidos en session_state
+                clave_sug = "sugeridos_poliza"
+                if clave_sug not in st.session_state:
+                    st.session_state[clave_sug] = {}
+
+                col_tbl, col_sug = st.columns([0.72, 0.28])
+                with col_sug:
+                    st.markdown("**Cuadrillas Sugeridas**")
+                    st.caption("Meta por Distrito · Empresa · Póliza.")
+                    for _, row in df_base_pol.iterrows():
+                        fila_key  = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
+                        val_prev  = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
+                        nuevo_val = st.number_input(
+                            f"{row['Distrito'][:10]} · {row['Empresa'][:12]} · {row['Nomenclatura']}",
+                            min_value=0, value=val_prev,
+                            key=f"sug_{fila_key}", label_visibility="visible"
+                        )
+                        st.session_state[clave_sug][fila_key] = nuevo_val
+
+                with col_tbl:
+                    def _get_sug(row):
+                        k = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
+                        return st.session_state[clave_sug].get(k, int(row["Vivo"]))
+
+                    df_base_pol["Sugerido"] = df_base_pol.apply(_get_sug, axis=1)
+                    df_base_pol["Balance"]  = df_base_pol["Sugerido"] - df_base_pol["Vivo"]
+
+                    def _color_balance(val):
+                        if val < 0:  return "color:#EF4444;font-weight:700;"
+                        if val == 0: return "color:#FBBF24;font-weight:700;"
+                        return "color:#10B981;font-weight:700;"
+
+                    df_show_pol = df_base_pol[
+                        ["Distrito","Empresa","Nomenclatura","Modalidad","Sugerido","Vivo","Balance","Eventos"]
+                    ]
+                    st.dataframe(
+                        df_show_pol.style.applymap(_color_balance, subset=["Balance"]),
+                        use_container_width=True, hide_index=True, height=500,
+                        column_config={
+                            "Distrito":     st.column_config.Column(width="small",  pinned=True),
+                            "Empresa":      st.column_config.Column(width="medium"),
+                            "Nomenclatura": st.column_config.Column(width="small"),
+                            "Modalidad":    st.column_config.Column(width="medium"),
+                            "Sugerido":     st.column_config.NumberColumn(width="small"),
+                            "Vivo":         st.column_config.NumberColumn(width="small"),
+                            "Balance":      st.column_config.NumberColumn(width="small"),
+                            "Eventos":      st.column_config.NumberColumn(width="small"),
+                        }
+                    )
+                    st.download_button(
+                        "Descargar desglose (CSV)",
+                        df_show_pol.to_csv(index=False).encode("utf-8"),
+                        "Desglose_Polizas.csv","text/csv"
+                    )
+        else:
+            st.info("Sin datos disponibles en el repositorio.")
 
     # --- SUBTAB 3: RANKING ---
     with sub_tab3:
@@ -2260,6 +2463,14 @@ def main():
     emps_disp  = sorted(df_t["Empresa"].unique())
     sel_emps   = st.sidebar.multiselect("Proveedor / Empresa:", emps_disp)
     if sel_emps:    df_t = df_t[df_t["Empresa"].isin(sel_emps)]
+
+    # Filtro de Cluster
+    if "Cluster_Base" in df_t.columns:
+        clusters_disp = sorted([c for c in df_t["Cluster_Base"].dropna().unique()
+                                if str(c).upper() not in ["SIN CLUSTER","CLUSTER GENERAL",""]])
+        sel_clusters = st.sidebar.multiselect("Cluster:", clusters_disp, key="filtro_cluster_sidebar")
+        if sel_clusters:
+            df_t = df_t[df_t["Cluster_Base"].isin(sel_clusters)]
 
     # Filtro de técnico: usa el CÓDIGO DE USUARIO (primeros 15 chars antes del " | ")
     # como ID primario para evitar duplicados cuando cambia el nombre asociado.
