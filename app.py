@@ -187,15 +187,15 @@ LISTA_ALIAS_LAT:      List[str] = ["latitud","latitude","lat","coordenada_y","co
 LISTA_ALIAS_LON:      List[str] = ["longitud","longitude","lon","lng","coordenada_x","coord_lon","x_coord"]
 
 PALETA_COLOR: Dict[str, str] = {
-    "azul_noche":      "#0F1C2E",
-    "azul_marina":     "#294E76",
-    "turquesa_cyan":   "#2C9C9A",
-    "verde_montana":   "#3A7D62",
-    "naranja_desierto":"#BD7748",
-    "amarillo_sol":    "#B18A3D",
+    "azul_noche":      "#0B192C",
+    "azul_marina":     "#1E3E62",
+    "turquesa_cyan":   "#00D2C8",
+    "verde_montana":   "#10B981",
+    "naranja_desierto":"#F97316",
+    "amarillo_sol":    "#FBBF24",
     "blanco_puro":     "#FFFFFF",
-    "gris_borde":      "#D8E1EA",
-    "texto_negro":     "#17212B"
+    "gris_borde":      "#CBD5E1",
+    "texto_negro":     "#000000"
 }
 
 MAPEO_BASE_CLUSTERS: Dict[str, str] = {
@@ -1247,147 +1247,112 @@ def inyectar_estilos_css_enterprise() -> None:
     p = PALETA_COLOR
     css = f"""
     <style>
-    :root {{
-        --ink: #17212B;
-        --muted: #66778A;
-        --canvas: #F4F7FA;
-        --paper: #FFFFFF;
-        --line: #D8E1EA;
-        --navy: {p["azul_noche"]};
-        --blue: {p["azul_marina"]};
-        --accent: {p["turquesa_cyan"]};
-    }}
     html, body, [class*="css"], .stApp {{
         font-family: Arial, "Helvetica Neue", Helvetica, sans-serif !important;
-        background-color: var(--canvas) !important;
-        color: var(--ink) !important;
-    }}
-    .block-container {{
-        max-width: 1440px !important;
-        padding-top: 2.1rem !important;
-        padding-bottom: 3rem !important;
-    }}
-    h1, h2, h3, p, span, label {{
-        font-family: Arial, "Helvetica Neue", Helvetica, sans-serif !important;
-    }}
-    h1, h2, h3 {{
-        color: var(--ink) !important;
-        letter-spacing: -0.02em !important;
+        background-color: #F8FAFC !important;
+        color: #000000 !important;
     }}
 
     /* Sidebar */
     [data-testid="stSidebar"] {{
-        background: linear-gradient(180deg, #101C2D 0%, #14263A 100%) !important;
-        min-width: 280px !important;
-        border-right: 1px solid rgba(255,255,255,0.07) !important;
+        background-color: {p["azul_noche"]} !important;
+        min-width: 300px !important;
     }}
     [data-testid="stSidebar"] * {{ color: #FFFFFF !important; }}
-    [data-testid="stSidebar"] [data-baseweb="select"] > div,
-    [data-testid="stSidebar"] [data-baseweb="input"] {{
-        background: rgba(255,255,255,0.09) !important;
-        border-color: rgba(255,255,255,0.16) !important;
-        border-radius: 8px !important;
-    }}
 
     /* Header principal */
     .main-header-enterprise {{
-        background: linear-gradient(122deg, #101D30 0%, #1E405F 100%);
-        padding: 30px 34px 27px;
-        border-radius: 16px;
-        border: 1px solid rgba(255,255,255,0.08);
-        border-bottom: 4px solid {p["turquesa_cyan"]};
+        background: linear-gradient(135deg, {p["azul_noche"]} 0%, {p["azul_marina"]} 100%);
+        padding: 22px 28px;
+        border-radius: 12px;
+        border-bottom: 3px solid {p["turquesa_cyan"]};
         color: #FFFFFF !important;
-        margin-bottom: 22px;
-        box-shadow: 0 16px 35px -22px rgba(15,28,46,0.65);
+        margin-bottom: 18px;
+        box-shadow: 0 6px 16px -4px rgba(11,25,44,0.35);
     }}
     .main-header-enterprise h1 {{
         font-family: Arial, sans-serif !important;
-        font-size: clamp(22px, 2.2vw, 30px) !important;
+        font-size: 22px !important;
         font-weight: 800 !important;
-        letter-spacing: -0.025em !important;
+        letter-spacing: 0.5px !important;
         color: #FFFFFF !important;
-        margin: 0 0 8px 0 !important;
+        margin: 0 0 4px 0 !important;
     }}
     .main-header-enterprise p {{
         font-family: Arial, sans-serif !important;
         font-size: 13px !important;
-        font-weight: 500 !important;
-        color: #D8F3F0 !important;
+        font-weight: 600 !important;
+        color: {p["turquesa_cyan"]} !important;
         margin: 0 !important;
     }}
 
     /* KPI Cards */
     .kpi-card-enterprise {{
-        position: relative;
-        overflow: hidden;
-        background: var(--paper);
-        border-radius: 13px;
-        padding: 19px 20px 17px;
-        border: 1px solid var(--line);
-        border-top: 3px solid {p["turquesa_cyan"]};
-        box-shadow: 0 12px 26px -23px rgba(15,28,46,0.55);
-        min-height: 116px;
+        background: linear-gradient(135deg, {p["azul_noche"]} 0%, {p["azul_marina"]} 80%);
+        border-radius: 10px;
+        padding: 16px 18px;
+        border: 1px solid {p["azul_marina"]};
+        box-shadow: 0 4px 10px -2px rgba(11,25,44,0.3);
     }}
     .kpi-card-title {{
         font-family: Arial, sans-serif;
         font-size: 10px;
         font-weight: 700;
-        letter-spacing: 0.08em;
-        color: #65768A;
+        letter-spacing: 1px;
+        color: {p["gris_borde"]};
         text-transform: uppercase;
-        margin-bottom: 9px;
+        margin-bottom: 6px;
     }}
     .kpi-card-value {{
         font-family: Arial, sans-serif;
-        font-size: 29px;
+        font-size: 28px;
         font-weight: 800;
-        color: {p["azul_noche"]};
+        color: {p["turquesa_cyan"]};
         line-height: 1.1;
     }}
     .kpi-card-subtitle {{
         font-family: Arial, sans-serif;
         font-size: 10px;
-        font-weight: 500;
-        color: #718196;
-        margin-top: 7px;
+        font-weight: 400;
+        color: {p["gris_borde"]};
+        margin-top: 4px;
     }}
 
     /* Tabs (navegación) */
     div[data-testid="stTabs"] {{
-        background-color: transparent !important;
-        padding: 0 !important;
-        border-radius: 0 !important;
-        border: none !important;
+        background-color: #0f172a !important;
+        padding: 6px !important;
+        border-radius: 10px !important;
+        border: 1px solid #1e293b !important;
     }}
     div[data-testid="stTabs"] > div[role="tablist"] {{
-        gap: 5px !important;
+        gap: 6px !important;
         background-color: transparent !important;
-        border-bottom: 1px solid var(--line) !important;
-        padding-bottom: 7px !important;
+        border-bottom: none !important;
     }}
     div[data-testid="stTabs"] button[role="tab"] {{
-        background-color: transparent !important;
-        border: 1px solid transparent !important;
+        background-color: #1e293b !important;
+        border: 1px solid #334155 !important;
         border-radius: 7px !important;
-        padding: 8px 14px !important;
+        padding: 8px 16px !important;
         transition: all 0.2s ease !important;
         font-family: Arial, sans-serif !important;
     }}
     div[data-testid="stTabs"] button[role="tab"] p,
     div[data-testid="stTabs"] button[role="tab"] span {{
-        color: #6B7B8F !important;
-        font-size: 12px !important;
-        font-weight: 700 !important;
+        color: #94a3b8 !important;
+        font-size: 13px !important;
+        font-weight: 600 !important;
         font-family: Arial, sans-serif !important;
     }}
     div[data-testid="stTabs"] button[role="tab"]:hover {{
-        background-color: #EAF2F5 !important;
+        background-color: #334155 !important;
     }}
-    div[data-testid="stTabs"] button[role="tab"]:hover p {{ color: {p["azul_noche"]} !important; }}
+    div[data-testid="stTabs"] button[role="tab"]:hover p {{ color: #f8fafc !important; }}
     div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
-        background-color: {p["azul_noche"]} !important;
-        border-color: {p["azul_noche"]} !important;
-        box-shadow: 0 8px 14px -10px rgba(15,28,46,0.8) !important;
+        background-color: {p["azul_marina"]} !important;
+        border-color: {p["turquesa_cyan"]} !important;
+        box-shadow: 0 3px 10px rgba(0,210,200,0.25) !important;
     }}
     div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p {{
         color: #ffffff !important; font-weight: 700 !important;
@@ -1396,28 +1361,27 @@ def inyectar_estilos_css_enterprise() -> None:
 
     /* Matriz / tablas header */
     .matrix-title-card {{
-        background: #FFFFFF;
-        padding: 14px 16px;
-        border-radius: 10px;
-        margin: 16px 0 12px;
-        border: 1px solid var(--line);
-        border-left: 3px solid {p["turquesa_cyan"]};
+        background: #1e293b;
+        padding: 10px 14px;
+        border-radius: 7px;
+        margin: 12px 0;
+        border: 1px solid #334155;
     }}
-    .matrix-title-card b {{ color: {p["azul_noche"]}; font-family: Arial, sans-serif; font-size: 13px; font-weight: 800; letter-spacing: 0.01em; }}
-    .matrix-title-card p  {{ color: #6B7B8F; font-family: Arial, sans-serif; font-size: 11px; margin: 4px 0 0 0; }}
+    .matrix-title-card b {{ color: #f8fafc; font-family: Arial, sans-serif; font-size: 14px; font-weight: 700; }}
+    .matrix-title-card p  {{ color: #94a3b8; font-family: Arial, sans-serif; font-size: 11px; margin: 2px 0 0 0; }}
 
     /* Inputs en sidebar */
     div[data-widget="stMultiSelect"] label,
-    div[data-widget="stSelectbox"]   label {{ color: #F4F7FA !important; font-weight: 700 !important; font-size: 12px !important; }}
+    div[data-widget="stSelectbox"]   label {{ color: #f1f5f9 !important; font-weight: 600 !important; font-size: 12px !important; }}
     div[data-testid="stTabs"] .stMarkdown p,
     div[data-testid="stTabs"] .stMarkdown h1,
     div[data-testid="stTabs"] .stMarkdown h2,
-    div[data-testid="stTabs"] .stMarkdown h3 {{ color: {p["texto_negro"]} !important; }}
+    div[data-testid="stTabs"] .stMarkdown h3 {{ color: #f8fafc !important; }}
 
     /* Textarea / inputs */
     div[data-testid="stTextArea"] textarea, div[data-testid="stTextInput"] input {{
-        background-color: #FFFFFF !important; color: {p["texto_negro"]} !important;
-        border: 1px solid #C5D1DD !important; border-radius: 8px !important;
+        background-color: #0f172a !important; color: #f8fafc !important;
+        border: 1px solid #334155 !important; border-radius: 7px !important;
     }}
 
     /* Formulario de carga (contraste claro) */
@@ -1431,42 +1395,19 @@ def inyectar_estilos_css_enterprise() -> None:
 
     /* Botones */
     div.stButton > button[kind="primary"] {{
-        background-color: {p["azul_noche"]} !important; color: #FFFFFF !important;
-        border: 1px solid {p["azul_noche"]} !important; border-radius: 8px !important;
+        background-color: {p["azul_marina"]} !important; color: #FFFFFF !important;
+        border: 1px solid {p["azul_marina"]} !important; border-radius: 7px !important;
         font-family: Arial, sans-serif !important; font-weight: 700 !important;
         font-size: 13px !important;
-        min-height: 38px !important;
     }}
     div.stButton > button[kind="primary"]:hover {{
-        background-color: {p["azul_marina"]} !important;
-        border-color: {p["azul_marina"]} !important;
+        background-color: {p["azul_noche"]} !important;
     }}
     div.stButton > button[kind="secondary"], div.stButton > button:not([kind="primary"]) {{
         background-color: #FFFFFF !important; color: {p["azul_marina"]} !important;
-        border: 1px solid {p["gris_borde"]} !important; border-radius: 8px !important;
+        border: 1px solid {p["gris_borde"]} !important; border-radius: 7px !important;
         font-family: Arial, sans-serif !important; font-weight: 600 !important;
         font-size: 13px !important;
-        min-height: 38px !important;
-    }}
-
-    /* Tablas, alertas y divisores */
-    [data-testid="stDataFrame"], [data-testid="stTable"] {{
-        border: 1px solid var(--line) !important;
-        border-radius: 10px !important;
-        overflow: hidden !important;
-        background: #FFFFFF !important;
-    }}
-    [data-testid="stAlert"] {{
-        border-radius: 9px !important;
-        border: 1px solid var(--line) !important;
-    }}
-    hr {{ border-color: var(--line) !important; margin: 1.5rem 0 !important; }}
-    @media (max-width: 760px) {{
-        .block-container {{ padding: 1rem 0.85rem 2rem !important; }}
-        .main-header-enterprise {{ padding: 22px 20px 20px !important; border-radius: 12px !important; }}
-        .main-header-enterprise h1 {{ font-size: 22px !important; }}
-        .kpi-card-enterprise {{ min-height: 102px !important; padding: 15px !important; }}
-        div[data-testid="stTabs"] button[role="tab"] {{ padding: 7px 10px !important; }}
     }}
 
     /* Desactivar zoom táctil en gráficos */
