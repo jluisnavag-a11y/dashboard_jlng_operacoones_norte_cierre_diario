@@ -332,18 +332,31 @@ TIPOS_ANTECEDENTE_VALIDO = frozenset([
     "CAMBIO DE DOMICILIO","CAMBIO DE EQUIPO"
 ])
 
+# Fragmentos que identifican cada tipo elegible de forma robusta
+# (resisten variantes con encoding corrupto porque buscan subcadenas cortas)
+_FRAGS_SOPORTE     = ("SOPORTE",)
+_FRAGS_ANTECEDENTE = ("INSTALA", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO")
+
 
 def _tipo_es_soporte(tipo_str: str) -> bool:
     if pd.isna(tipo_str):
         return False
-    return "SOPORTE" in str(tipo_str).upper()
+    t = str(tipo_str).strip().upper()
+    return any(f in t for f in _FRAGS_SOPORTE)
 
 
 def _tipo_es_antecedente_valido(tipo_str: str) -> bool:
+    """
+    Devuelve True si el tipo del evento previo califica como antecedente.
+    Usa contains robusto (fragmentos cortos) en vez de comparación exacta,
+    para resistir variantes con encoding corrupto (ej: Instalaci‚àö‚â•n).
+    Elegibles: INSTALACION (cualquier variante), SOPORTE, CAMBIO DE DOMICILIO,
+               CAMBIO DE EQUIPO.
+    """
     if pd.isna(tipo_str):
         return False
     t = str(tipo_str).strip().upper()
-    return any(elegible in t for elegible in TIPOS_ANTECEDENTE_VALIDO)
+    return any(f in t for f in _FRAGS_ANTECEDENTE)
 
 
 def obtener_valor_tipo2(valor_causa, valor_tipo_orden) -> str:
@@ -753,7 +766,8 @@ def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
         if resp.status_code == 200:
             df = pd.read_parquet(io.BytesIO(resp.content))
             if not df.empty and "MES_DIM" in df.columns:
-                return df
+                # Homologar tipos siempre, el parquet puede tener valores sin homologar
+                return _homologar_tipos_df(df)
     except Exception as e:
         logger.warning(f"No se pudo descargar Parquet consolidado: {e}")
 
@@ -781,6 +795,29 @@ def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
     df = pd.concat(coleccion, ignore_index=True)
     coleccion.clear(); gc.collect()
     return transformar_dataset_completo(df)
+
+
+def _homologar_tipos_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica homologación de Tipo_Orden sobre cualquier DataFrame ya cargado.
+    Se llama tanto sobre el parquet consolidado (ruta rápida) como sobre
+    el resultado del fallback, para garantizar que el motor de reincidencias
+    siempre reciba tipos canónicos.
+    """
+    if "Tipo_Orden" not in df.columns:
+        return df
+    tipo_up = df["Tipo_Orden"].str.upper().str.strip()
+    mapa_upper = {k.upper(): v for k, v in HOMOLOGACION_TIPOS.items()}
+    df = df.copy()
+    df["Tipo_Orden"] = tipo_up.map(mapa_upper).fillna(tipo_up)
+    tipo_up2 = df["Tipo_Orden"].str.upper().str.strip()
+    mask_rec_emp = tipo_up2.str.contains("RECOLE", na=False) & tipo_up2.str.contains("EMPRE", na=False)
+    mask_rec_pi  = tipo_up2.str.contains("RECOLE", na=False) & ~mask_rec_emp
+    mask_inst    = tipo_up2.str.contains("INSTALA", na=False) & ~mask_rec_emp & ~mask_rec_pi
+    df.loc[mask_rec_emp, "Tipo_Orden"] = "RECOLECCION EMPRESARIAL"
+    df.loc[mask_rec_pi,  "Tipo_Orden"] = "RECOLECCION PI"
+    df.loc[mask_inst,    "Tipo_Orden"] = "INSTALACION"
+    return df
 
 
 # ==============================================================================
