@@ -1523,6 +1523,42 @@ def inyectar_estilos_css_enterprise() -> None:
         font-family: Arial, sans-serif !important; font-weight: 600 !important;
         font-size: 13px !important;
     }}
+    /* Botones de descarga siempre legibles */
+    div[data-testid="stDownloadButton"] > button {{
+        background-color: #FFFFFF !important;
+        color: {p["azul_marina"]} !important;
+        border: 1px solid {p["gris_borde"]} !important;
+        border-radius: 7px !important;
+        font-family: Arial, sans-serif !important;
+        font-weight: 600 !important;
+        font-size: 12px !important;
+        width: auto !important;
+    }}
+    /* Métricas con fondo adaptado */
+    [data-testid="stMetricValue"] {{
+        color: {p["turquesa_cyan"]} !important;
+        font-family: Arial, sans-serif !important;
+        font-weight: 700 !important;
+    }}
+    [data-testid="stMetricLabel"] {{
+        color: {p["gris_borde"]} !important;
+        font-family: Arial, sans-serif !important;
+    }}
+    [data-testid="stMetricDelta"] {{
+        font-family: Arial, sans-serif !important;
+    }}
+    /* Number inputs con texto legible */
+    input[type="number"] {{
+        color: #000000 !important;
+        background: #FFFFFF !important;
+    }}
+    /* Sidebar métrica legible */
+    [data-testid="stSidebar"] [data-testid="stMetricValue"] {{
+        color: {p["turquesa_cyan"]} !important;
+    }}
+    [data-testid="stSidebar"] [data-testid="stMetricLabel"] {{
+        color: #FFFFFF !important;
+    }}
 
     /* === RESPONSIVO MÓVIL === */
     .kpi-grid-4 {{
@@ -1555,23 +1591,14 @@ def inyectar_estilos_css_enterprise() -> None:
 # 10. VISTAS
 # ==============================================================================
 
-def abrir_captura_completa():
-    st.session_state["seccion_principal"] = "Capturar / Actualizar datos"
-
-
 def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.DataFrame, dimension_sel: str) -> None:
     kpis = extraer_metricas_kpi_totales(df_folios, df_raw, dimension_sel)
 
-    sub_tab1, sub_tab2, sub_tab3, sub_tab4, sub_tab5 = st.tabs([
+    sub_tab1, sub_tab2, sub_tab3 = st.tabs([
         "Evolución y Productividad",
         "Desglose por Pólizas",
         "Ranking de Cuadrillas / Técnicos",
-        "Descarga de Reportes",
-        "Cargar Datos"
     ])
-
-    with sub_tab5:
-        st.button("Abrir panel de carga de datos", on_click=abrir_captura_completa, key="abrir_captura_ancha")
 
     # --- SUBTAB 1: EVOLUCIÓN & PRODUCTIVIDAD ---
     with sub_tab1:
@@ -1710,6 +1737,14 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
                                     yaxis=dict(tickfont=dict(color="#E2E8F0", size=10)))
                 fig_e.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=10))
                 st.plotly_chart(fig_e, use_container_width=True, config={"displayModeBar": False})
+
+            # Descarga del dataset filtrado actual
+            st.download_button(
+                "Descargar dataset filtrado (CSV)",
+                df_folios.to_csv(index=False).encode("utf-8"),
+                f"Dataset_Filtrado_{ANIO_BASE_ESTRICTO}.csv", "text/csv",
+                key="dl_dataset_subtab1"
+            )
 
     # --- SUBTAB 2: DESGLOSE PÓLIZAS ---
     # Esta tabla tiene sus PROPIOS filtros — no le afectan los filtros del sidebar.
@@ -1880,14 +1915,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
                 "Ranking_Cuadrillas.csv","text/csv"
             )
 
-    # --- SUBTAB 4: DESCARGA ---
-    with sub_tab4:
-        st.markdown("### Descarga de Reportes")
-        st.download_button(
-            "Descargar Dataset (CSV)",
-            df_folios.to_csv(index=False).encode("utf-8"),
-            f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv"
-        )
+
 
 
 # ==============================================================================
@@ -2552,26 +2580,18 @@ def renderizar_pestana_cambios_equipo(df_folios: pd.DataFrame, df_raw: pd.DataFr
 
     # KPIs
     k1, k2, k3, k4 = st.columns(4)
-    k1.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Total Cambios de Equipo</div>
-        <div class="kpi-card-value">{total_ce:,}</div>
-        <div class="kpi-card-subtitle">En el período filtrado</div>
-    </div>""", unsafe_allow_html=True)
-    k2.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Fallidos (Soporte ONT &le;{ventana_dias}d)</div>
-        <div class="kpi-card-value" style="color:{PALETA_COLOR['naranja_desierto']} !important;">{ce_fallidos:,}</div>
-        <div class="kpi-card-subtitle">Con reincidencia de falla ONT</div>
-    </div>""", unsafe_allow_html=True)
-    k3.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Efectivos</div>
-        <div class="kpi-card-value" style="color:{PALETA_COLOR['verde_montana']} !important;">{ce_efectivos:,}</div>
-        <div class="kpi-card-subtitle">Sin falla ONT posterior</div>
-    </div>""", unsafe_allow_html=True)
-    k4.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Tasa de Efectividad</div>
-        <div class="kpi-card-value" style="color:{PALETA_COLOR['turquesa_cyan']} !important;">{tasa_efect}%</div>
-        <div class="kpi-card-subtitle">Cambios sin falla posterior</div>
-    </div>""", unsafe_allow_html=True)
+    _col_ce = st.columns(4)
+    for _c, _titulo, _val, _sub, _col in [
+        (_col_ce[0], "Total Cambios de Equipo",       f"{total_ce:,}",    "En el período filtrado",          PALETA_COLOR["turquesa_cyan"]),
+        (_col_ce[1], f"Fallidos (ONT ≤{ventana_dias}d)", f"{ce_fallidos:,}", "Con reincidencia de falla ONT",   PALETA_COLOR["amarillo_sol"]),
+        (_col_ce[2], "Efectivos",                     f"{ce_efectivos:,}","Sin falla ONT posterior",         PALETA_COLOR["verde_montana"]),
+        (_col_ce[3], "Tasa de Efectividad",           f"{tasa_efect}%",   "Cambios sin falla posterior",     PALETA_COLOR["turquesa_cyan"]),
+    ]:
+        _c.markdown(f"""<div class="kpi-card-enterprise">
+            <div class="kpi-card-title">{_titulo}</div>
+            <div class="kpi-card-value" style="color:{_col} !important;">{_val}</div>
+            <div class="kpi-card-subtitle">{_sub}</div>
+        </div>""", unsafe_allow_html=True)
 
     # Gráfico de línea de tiempo
     if not df_ce_ev.empty and "SEMANA_DIM" in df_ce_ev.columns:
@@ -2840,57 +2860,81 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Filtros Dinámicos")
+    st.sidebar.caption("Cada filtro reduce las opciones de los siguientes.")
     df_t = df_raw.copy()
 
+    # ── 1. MES ───────────────────────────────────────────────────────────────
     meses_disp = [m for m in LISTA_ORDENADA_MESES if m in df_t["MES_DIM"].unique()]
-    sel_meses  = st.sidebar.multiselect("Mes:", meses_disp)
-    if sel_meses:   df_t = df_t[df_t["MES_DIM"].isin(sel_meses)]
+    sel_meses  = st.sidebar.multiselect(
+        f"Mes: ({len(meses_disp)} disponibles)", meses_disp, key="f_mes"
+    )
+    if sel_meses: df_t = df_t[df_t["MES_DIM"].isin(sel_meses)]
 
+    # ── 2. SEMANA (opciones reducidas por mes seleccionado) ──────────────────
     sems_disp  = sorted(df_t["SEMANA_DIM"].dropna().unique(), key=_num_sem)
-    sel_sems   = st.sidebar.multiselect("Semana:", sems_disp)
-    if sel_sems:    df_t = df_t[df_t["SEMANA_DIM"].isin(sel_sems)]
+    sel_sems   = st.sidebar.multiselect(
+        f"Semana: ({len(sems_disp)} disponibles)", sems_disp, key="f_sem"
+    )
+    if sel_sems: df_t = df_t[df_t["SEMANA_DIM"].isin(sel_sems)]
 
-    pols_disp  = sorted([k for k in df_t["Codigo_Poliza"].unique() if k in MAPEO_POLIZAS])
-    opc_pol    = [f"{c} — {MAPEO_POLIZAS[c]}" for c in pols_disp]
-    # MT (MTTO PI) y R3 (RECOLECCIÓN) se excluyen por default; el usuario puede activarlas
+    # ── 3. PÓLIZA ─────────────────────────────────────────────────────────────
+    pols_disp   = sorted([k for k in df_t["Codigo_Poliza"].dropna().unique() if k in MAPEO_POLIZAS])
+    opc_pol     = [f"{c} — {MAPEO_POLIZAS[c]}" for c in pols_disp]
     default_pol = [op for op in opc_pol if not any(op.startswith(exc) for exc in POLIZAS_DEFAULT_EXCLUIDAS)]
-    sel_pol    = st.sidebar.multiselect("Pólizas:", opc_pol, default=default_pol)
-    cods_pol   = [p.split(" — ")[0] for p in sel_pol]
-    if cods_pol:    df_t = df_t[df_t["Codigo_Poliza"].isin(cods_pol)]
+    sel_pol     = st.sidebar.multiselect(
+        f"Póliza: ({len(opc_pol)} disponibles)", opc_pol,
+        default=default_pol, key="f_pol"
+    )
+    cods_pol = [p.split(" — ")[0] for p in sel_pol]
+    if cods_pol: df_t = df_t[df_t["Codigo_Poliza"].isin(cods_pol)]
 
-    tipos_ev   = sorted(df_t["Tipo_Orden"].unique())
-    sel_tipos  = st.sidebar.multiselect("Tipo de Evento:", tipos_ev)
-    if sel_tipos:   df_t = df_t[df_t["Tipo_Orden"].isin(sel_tipos)]
+    # ── 4. TIPO DE EVENTO ─────────────────────────────────────────────────────
+    tipos_ev  = sorted(df_t["Tipo_Orden"].dropna().unique())
+    sel_tipos = st.sidebar.multiselect(
+        f"Tipo de Evento: ({len(tipos_ev)} disponibles)", tipos_ev, key="f_tipo"
+    )
+    if sel_tipos: df_t = df_t[df_t["Tipo_Orden"].isin(sel_tipos)]
 
-    distr_disp = sorted(df_t["Distrito"].unique())
-    sel_distr  = st.sidebar.multiselect("Distrito / Zona:", distr_disp)
-    if sel_distr:   df_t = df_t[df_t["Distrito"].isin(sel_distr)]
+    # ── 5. DISTRITO ───────────────────────────────────────────────────────────
+    distr_disp = sorted(df_t["Distrito"].dropna().unique())
+    sel_distr  = st.sidebar.multiselect(
+        f"Distrito: ({len(distr_disp)} disponibles)", distr_disp, key="f_dist"
+    )
+    if sel_distr: df_t = df_t[df_t["Distrito"].isin(sel_distr)]
 
-    emps_disp  = sorted(df_t["Empresa"].unique())
-    sel_emps   = st.sidebar.multiselect("Proveedor / Empresa:", emps_disp)
-    if sel_emps:    df_t = df_t[df_t["Empresa"].isin(sel_emps)]
+    # ── 6. EMPRESA / PROVEEDOR ────────────────────────────────────────────────
+    emps_disp = sorted(df_t["Empresa"].dropna().unique())
+    sel_emps  = st.sidebar.multiselect(
+        f"Empresa: ({len(emps_disp)} disponibles)", emps_disp, key="f_emp"
+    )
+    if sel_emps: df_t = df_t[df_t["Empresa"].isin(sel_emps)]
 
-    # Filtro de Cluster
+    # ── 7. CLUSTER ────────────────────────────────────────────────────────────
     if "Cluster_Base" in df_t.columns:
-        clusters_disp = sorted([c for c in df_t["Cluster_Base"].dropna().unique()
-                                if str(c).upper() not in ["SIN CLUSTER","CLUSTER GENERAL",""]])
-        sel_clusters = st.sidebar.multiselect("Cluster:", clusters_disp, key="filtro_cluster_sidebar")
-        if sel_clusters:
-            df_t = df_t[df_t["Cluster_Base"].isin(sel_clusters)]
+        clusters_disp = sorted([
+            c for c in df_t["Cluster_Base"].dropna().unique()
+            if str(c).upper() not in ["SIN CLUSTER","CLUSTER GENERAL",""]
+        ])
+        sel_clusters = st.sidebar.multiselect(
+            f"Cluster: ({len(clusters_disp)} disponibles)",
+            clusters_disp, key="f_cluster"
+        )
+        if sel_clusters: df_t = df_t[df_t["Cluster_Base"].isin(sel_clusters)]
 
-    # Filtro de técnico: usa el CÓDIGO DE USUARIO (primeros 15 chars antes del " | ")
-    # como ID primario para evitar duplicados cuando cambia el nombre asociado.
+    # ── 8. TÉCNICO (código — ID primario) ────────────────────────────────────
     if "Usuario_Tecnico" in df_t.columns:
-        # Extraer el código (parte antes del " | ") como ID único del técnico
         df_t["_cod_tecnico"] = df_t["Usuario_Tecnico"].str.split(" | ").str[0].str.strip()
         cods_tech_disp = sorted(df_t["_cod_tecnico"].dropna().unique())
         sel_techs = st.sidebar.multiselect(
-            "Técnico (Código):", cods_tech_disp,
-            key="filtro_tecnico_sidebar"
+            f"Técnico: ({len(cods_tech_disp)} disponibles)",
+            cods_tech_disp, key="f_tecnico"
         )
-        if sel_techs:
-            df_t = df_t[df_t["_cod_tecnico"].isin(sel_techs)]
+        if sel_techs: df_t = df_t[df_t["_cod_tecnico"].isin(sel_techs)]
         df_t = df_t.drop(columns=["_cod_tecnico"], errors="ignore")
+
+    # Indicador de registros activos
+    st.sidebar.markdown("---")
+    st.sidebar.metric("Registros activos", f"{len(df_t):,}", f"de {len(df_raw):,} totales")
 
     df_folios = df_t.drop_duplicates(subset=["FOLIO_KEY"], keep="first")
 
