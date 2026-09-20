@@ -52,6 +52,11 @@ HEADERS          = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN el
 GITHUB_API_URL   = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_FOLDER}?ref={GITHUB_BRANCH}"
 GITHUB_RAW_BASE  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}"
 
+# Carpeta de ingresos de soporte (estructura separada, se integra al parquet consolidado)
+GITHUB_FOLDER_SOPORTE  = gh_cfg.get("folder_soporte", "ingreso_soporte")
+GITHUB_API_URL_SOPORTE = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_FOLDER_SOPORTE}?ref={GITHUB_BRANCH}"
+GITHUB_RAW_BASE_SOPORTE= f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER_SOPORTE}"
+
 # ==============================================================================
 # 2. CONSTANTES GLOBALES
 # ==============================================================================
@@ -797,6 +802,78 @@ def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
     return transformar_dataset_completo(df)
 
 
+# ==============================================================================
+# PIPELINE INGRESO SOPORTE (estructura preparada — carpeta ingreso_soporte/)
+# ==============================================================================
+# Columnas esperadas en los archivos de ingreso_soporte/ (a confirmar con el
+# equipo cuando el archivo esté disponible).  Las claves de cruce con
+# datos_semanales/ son: OT, OS y/o Cuenta.  Al integrarse, se generará un
+# único parquet consolidado con la información combinada.
+
+COLUMNAS_ESPERADAS_INGRESO_SOPORTE: List[str] = [
+    # Claves de cruce (deben coincidir con datos_semanales)
+    "OT", "OS", "Cuenta",
+    # Columnas propias del ingreso de soporte (pendiente de confirmar)
+    # "Tipo_Ingreso", "Fecha_Ingreso", "Tecnico_Ingreso", ...
+]
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
+def cargar_ingreso_soporte() -> pd.DataFrame:
+    """
+    Descarga y procesa los archivos de la carpeta ingreso_soporte/ en GitHub.
+    Retorna un DataFrame listo para cruzarse con datos_semanales.
+    Si la carpeta no existe o está vacía, retorna DataFrame vacío sin error.
+
+    TODO: cuando el archivo esté disponible, definir aquí:
+      - Mapeo de columnas al esquema común (FOLIO_KEY, Cuenta_Cliente, Tipo_Orden…)
+      - Reglas de homologación propias del ingreso de soporte
+      - Cruce con datos_semanales por OT / OS / Cuenta
+    """
+    try:
+        resp = requests.get(GITHUB_API_URL_SOPORTE, headers=HEADERS, timeout=10)
+        if resp.status_code == 404:
+            return pd.DataFrame()   # carpeta aún no existe
+        if resp.status_code != 200:
+            logger.warning(f"ingreso_soporte: HTTP {resp.status_code}")
+            return pd.DataFrame()
+        archivos = [
+            f["name"] for f in resp.json()
+            if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
+        ]
+        if not archivos:
+            return pd.DataFrame()
+
+        coleccion = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            def _dl(nombre):
+                try:
+                    r = requests.get(f"{GITHUB_RAW_BASE_SOPORTE}/{nombre}",
+                                     headers=HEADERS, timeout=15)
+                    if r.status_code == 200:
+                        bdata = io.BytesIO(r.content)
+                        df_t  = (pd.read_parquet(bdata) if nombre.endswith(".parquet")
+                                 else pd.read_csv(bdata, dtype=str, low_memory=False,
+                                                  encoding="utf-8", on_bad_lines="skip"))
+                        df_t["Archivo_Soporte"] = nombre
+                        return df_t
+                except Exception as e:
+                    logger.error(f"ingreso_soporte/{nombre}: {e}")
+                return None
+            coleccion = [d for d in ex.map(_dl, archivos) if d is not None]
+
+        if not coleccion:
+            return pd.DataFrame()
+
+        df_soporte = pd.concat(coleccion, ignore_index=True)
+        # TODO: aplicar transformaciones específicas de ingreso_soporte aquí
+        return df_soporte
+
+    except Exception as e:
+        logger.error(f"Error cargando ingreso_soporte: {e}")
+        return pd.DataFrame()
+
+
 def _homologar_tipos_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aplica homologación de Tipo_Orden sobre cualquier DataFrame ya cargado.
@@ -1447,8 +1524,28 @@ def inyectar_estilos_css_enterprise() -> None:
         font-size: 13px !important;
     }}
 
-    /* Desactivar zoom táctil en gráficos */
+    /* === RESPONSIVO MÓVIL === */
+    .kpi-grid-4 {{
+        display: grid !important;
+        grid-template-columns: repeat(4, 1fr) !important;
+        gap: 10px !important;
+        margin-bottom: 16px !important;
+    }}
+    @media (max-width: 640px) {{
+        .kpi-grid-4 {{ grid-template-columns: repeat(2, 1fr) !important; }}
+        .kpi-card-value {{ font-size: 22px !important; }}
+        .kpi-card-title {{ font-size: 9px !important; }}
+        .kpi-card-subtitle {{ font-size: 9px !important; }}
+        .js-plotly-plot .plotly .drag {{ pointer-events: none !important; }}
+        .js-plotly-plot {{ touch-action: none !important; }}
+        [data-testid="stDataFrame"] {{ overflow-x: auto !important; }}
+    }}
+    /* Deshabilitar pinch-zoom en gráficos en todos los dispositivos */
     .js-plotly-plot {{ touch-action: pan-y !important; }}
+    /* Sidebar colapsado empuja el contenido a ancho completo */
+    [data-testid="stSidebar"][aria-expanded="false"] ~ .main {{
+        margin-left: 0 !important; width: 100% !important;
+    }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
@@ -1480,7 +1577,7 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
     with sub_tab1:
         # KPI Cards
         st.markdown(f"""
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
+        <div class="kpi-grid-4">
             <div class="kpi-card-enterprise">
                 <div class="kpi-card-title">Órdenes Totales</div>
                 <div class="kpi-card-value">{kpis.total_eventos:,}</div>
@@ -2076,7 +2173,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     tasa_efectividad  = round(100.0 - tasa_reincidencia, 2)
 
     st.markdown(f"""
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
+    <div class="kpi-grid-4">
         <div class="kpi-card-enterprise">
             <div class="kpi-card-title">Órdenes Completadas (Base)</div>
             <div class="kpi-card-value">{total_base:,}</div>
@@ -2381,258 +2478,6 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         )
     else:
         st.info("Sin historial de cuentas con reincidencia para mostrar.")
-
-
-# ==============================================================================
-# 12. MÓDULO IA — AUDITOR OPERATIVO
-# ==============================================================================
-
-def renderizar_pestana_ia(df_folios: pd.DataFrame, df_raw: pd.DataFrame) -> None:
-    """
-    Módulo IA — Auditor y Contralor Operativo.
-    Analiza cuentas o técnicos específicos usando los datos del sistema
-    y genera un informe de comportamiento + tabla de recomendaciones
-    mediante llamada a la API de Claude (claude-sonnet-4-6).
-    """
-    st.markdown("### IA — Auditor y Contralor Operativo")
-    st.caption("Ingresa uno o más códigos de técnico o números de cuenta separados por comas. "
-               "La IA analiza patrones de comportamiento, reincidencias, productividad y calidad.")
-
-    # ---- Buscador robusto ----
-    query_raw = st.text_area(
-        "Técnicos o cuentas a analizar:",
-        height=80,
-        placeholder="Ej: ECOE3TIJT2258, 142838878, JELE3MXLT0124",
-        key="ia_query"
-    )
-
-    col_ia1, col_ia2, col_ia3 = st.columns(3)
-    with col_ia1:
-        modo_busq = st.radio("Buscar por:", ["Técnico (código)","Cuenta"], horizontal=True, key="ia_modo")
-    with col_ia2:
-        semanas_ia = st.slider("Últimas N semanas:", 1, 52, 12, key="ia_sem")
-    with col_ia3:
-        ejecutar  = st.button("Analizar con IA", type="primary", key="ia_run",
-                               disabled=not query_raw.strip())
-
-    if not query_raw.strip():
-        st.markdown("""<div class="matrix-title-card">
-            <b>LIENZO DE ANÁLISIS</b>
-            <p>Ingresa uno o más técnicos o cuentas para generar el análisis automático de comportamiento.</p>
-        </div>""", unsafe_allow_html=True)
-        return
-
-    # Parsear entidades buscadas
-    entidades = [e.strip() for e in re.split(r"[,;\n]+", query_raw) if e.strip()]
-
-    # ---- Extraer datos del sistema ----
-    df_src = df_raw.copy() if not df_raw.empty else df_folios.copy()
-
-    # Filtrar por semanas recientes
-    if "Num_Semana_Archivo" in df_src.columns:
-        sem_max  = pd.to_numeric(df_src["Num_Semana_Archivo"], errors="coerce").max()
-        if pd.notna(sem_max):
-            df_src = df_src[pd.to_numeric(df_src["Num_Semana_Archivo"], errors="coerce")
-                             >= (sem_max - semanas_ia + 1)]
-
-    # Localizar registros por entidad
-    if modo_busq == "Técnico (código)":
-        col_id = "_cod_tecnico_ia"
-        df_src[col_id] = df_src["Usuario_Tecnico"].str.split(" | ").str[0].str.strip()
-        mask = df_src[col_id].isin(entidades)
-    else:
-        mask = df_src["Cuenta_Cliente"].isin(entidades)
-
-    df_ent = df_src[mask].copy()
-
-    if df_ent.empty:
-        st.warning(f"No se encontraron registros para: {', '.join(entidades)}")
-        return
-
-    # ---- Métricas base para el análisis ----
-    total_ev    = len(df_ent)
-    tecnicos_u  = df_ent["Usuario_Tecnico"].nunique() if "Usuario_Tecnico" in df_ent.columns else 0
-    dias_u      = df_ent["FECHA_TRUNCADA"].nunique()  if "FECHA_TRUNCADA" in df_ent.columns else 0
-    rein_total  = (df_ent.get("ES_REINCIDENCIA","NO") == "SI").sum()
-    tasa_rein   = round(rein_total / total_ev * 100, 1) if total_ev > 0 else 0
-
-    tipos_dist  = df_ent["Tipo_Orden"].value_counts().head(8).to_dict() if "Tipo_Orden" in df_ent.columns else {}
-    fallas_dist = df_ent.get("Falla_Registro", pd.Series()).value_counts().head(8).to_dict()
-    causas_dist = df_ent.get("Causa_Registro", pd.Series()).value_counts().head(8).to_dict()
-    soluc_dist  = df_ent.get("Solucion_Registro", pd.Series()).value_counts().head(8).to_dict()
-
-    # Tiempo de resolución
-    t_res_prom  = round(df_ent.get("Tiempo_Resolucion_Horas", pd.Series(dtype=float)).mean(), 2) if "Tiempo_Resolucion_Horas" in df_ent.columns else None
-
-    # Días de descanso más frecuentes
-    dias_trabajo = {}
-    if "_datetime_parsed" in df_ent.columns:
-        df_ent["_dia_semana"] = pd.to_datetime(df_ent["_datetime_parsed"], errors="coerce").dt.day_name()
-        dias_trabajo = df_ent["_dia_semana"].value_counts().to_dict()
-
-    # Hora de inicio / cierre
-    hora_inicio = None; hora_fin = None
-    if "_datetime_parsed" in df_ent.columns:
-        horas_i = pd.to_datetime(df_ent["_datetime_parsed"], errors="coerce").dt.hour
-        if not horas_i.dropna().empty:
-            hora_inicio = int(horas_i.mode()[0])
-    if "_datetime_termino" in df_ent.columns:
-        horas_f = pd.to_datetime(df_ent["_datetime_termino"], errors="coerce").dt.hour
-        if not horas_f.dropna().empty:
-            hora_fin = int(horas_f.mode()[0])
-
-    # Días trabajados por semana
-    dias_x_sem = {}
-    if "Num_Semana_Archivo" in df_ent.columns and "FECHA_TRUNCADA" in df_ent.columns:
-        dias_x_sem = (df_ent.groupby("Num_Semana_Archivo")["FECHA_TRUNCADA"]
-                      .nunique().describe().round(1).to_dict())
-
-    # Cuentas sin falla reportada (cierre sin falla)
-    sin_falla = 0
-    if "Falla_Registro" in df_ent.columns:
-        sin_falla = df_ent["Falla_Registro"].isin(["SIN FALLA","SIN ESPECIFICAR",""]).sum()
-
-    # KPIs visuales
-    st.markdown("---")
-    k1,k2,k3,k4 = st.columns(4)
-    k1.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Eventos Analizados</div>
-        <div class="kpi-card-value">{total_ev:,}</div>
-        <div class="kpi-card-subtitle">Últimas {semanas_ia} semanas</div>
-    </div>""", unsafe_allow_html=True)
-    k2.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Días con Actividad</div>
-        <div class="kpi-card-value">{dias_u}</div>
-        <div class="kpi-card-subtitle">Días únicos registrados</div>
-    </div>""", unsafe_allow_html=True)
-    k3.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Tasa de Reincidencia</div>
-        <div class="kpi-card-value" style="color:{PALETA_COLOR['naranja_desierto']} !important;">{tasa_rein}%</div>
-        <div class="kpi-card-subtitle">{rein_total} reincidencias de {total_ev}</div>
-    </div>""", unsafe_allow_html=True)
-    k4.markdown(f"""<div class="kpi-card-enterprise">
-        <div class="kpi-card-title">Cierres sin Falla</div>
-        <div class="kpi-card-value" style="color:{PALETA_COLOR['amarillo_sol']} !important;">{sin_falla:,}</div>
-        <div class="kpi-card-subtitle">Sin falla reportada</div>
-    </div>""", unsafe_allow_html=True)
-
-    # Gráficos inline
-    if tipos_dist:
-        col_g1, col_g2 = st.columns(2)
-        with col_g1:
-            fig_t = px.bar(x=list(tipos_dist.values()), y=list(tipos_dist.keys()),
-                           orientation="h", title="<b>Tipos de Evento</b>",
-                           color_discrete_sequence=[PALETA_COLOR["azul_marina"]])
-            fig_t.update_layout(paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-                                font=dict(family="Arial,sans-serif",size=10,color="#000000"),
-                                margin=dict(l=10,r=10,t=30,b=10), height=260,
-                                xaxis=dict(showgrid=True,gridcolor="#E2E8F0"),
-                                yaxis=dict(tickfont=dict(size=9)))
-            st.plotly_chart(fig_t, use_container_width=True, key="ia_tipos",
-                            config={"displayModeBar":False})
-        with col_g2:
-            if fallas_dist:
-                fig_f = px.bar(x=list(fallas_dist.values()), y=list(fallas_dist.keys()),
-                               orientation="h", title="<b>Top Fallas</b>",
-                               color_discrete_sequence=[PALETA_COLOR["turquesa_cyan"]])
-                fig_f.update_layout(paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-                                    font=dict(family="Arial,sans-serif",size=10,color="#000000"),
-                                    margin=dict(l=10,r=10,t=30,b=10), height=260,
-                                    xaxis=dict(showgrid=True,gridcolor="#E2E8F0"),
-                                    yaxis=dict(tickfont=dict(size=9)))
-                st.plotly_chart(fig_f, use_container_width=True, key="ia_fallas",
-                                config={"displayModeBar":False})
-
-    # ---- ANÁLISIS IA ----
-    if ejecutar:
-        prompt_data = f"""
-Eres un auditor y contralor de operaciones de campo de telecomunicaciones.
-Analiza los siguientes datos de los identificadores: {', '.join(entidades)}
-Modo de búsqueda: {modo_busq}. Período: últimas {semanas_ia} semanas.
-
-DATOS CUANTITATIVOS:
-- Total eventos: {total_ev}
-- Técnicos únicos: {tecnicos_u}
-- Días con actividad: {dias_u}
-- Reincidencias: {rein_total} ({tasa_rein}%)
-- Cierres sin falla reportada: {sin_falla}
-- Tiempo promedio de resolución (horas): {t_res_prom if t_res_prom else "No disponible"}
-- Hora de inicio más frecuente: {hora_inicio if hora_inicio is not None else "No disponible"}:00h
-- Hora de cierre más frecuente: {hora_fin if hora_fin is not None else "No disponible"}:00h
-- Días de la semana con actividad: {dias_trabajo}
-- Estadísticas días trabajados por semana: {dias_x_sem}
-- Distribución tipos de evento: {tipos_dist}
-- Top fallas registradas: {fallas_dist}
-- Top causas registradas: {causas_dist}
-- Top soluciones registradas: {soluc_dist}
-
-INSTRUCCIONES DE ANÁLISIS (responder en español formal):
-1. Resumen ejecutivo de comportamiento (3-4 oraciones).
-2. Patrones detectados: tendencias de falla, uso repetitivo de una sola falla, cierres sin falla.
-3. Análisis de tiempo: si tiene tendencia a descansar un día particular, horario de inicio y cierre.
-4. Análisis de productividad: días trabajados por semana, volumen por día.
-5. Análisis de calidad: tasa de reincidencia, tipos de falla más frecuentes.
-6. TABLA DE RECOMENDACIONES en formato JSON con esta estructura exacta:
-[
-  {{"prioridad": "ALTA|MEDIA|BAJA", "categoria": "Calidad|Productividad|Comportamiento|Cumplimiento", "observacion": "descripcion del hallazgo", "accion": "accion concreta recomendada", "impacto": "impacto esperado"}}
-]
-Termina siempre con el bloque JSON de recomendaciones.
-"""
-        with st.spinner("Analizando con IA..."):
-            try:
-                resp_ia = requests.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "model": "claude-sonnet-4-6",
-                        "max_tokens": 2000,
-                        "messages": [{"role": "user", "content": prompt_data}]
-                    },
-                    timeout=60
-                )
-                if resp_ia.status_code == 200:
-                    contenido_ia = resp_ia.json()["content"][0]["text"]
-
-                    # Separar análisis del JSON de recomendaciones
-                    import json as _json
-                    partes = contenido_ia.split("[", 1)
-                    analisis_txt = partes[0].strip()
-                    recom_json   = None
-                    if len(partes) > 1:
-                        try:
-                            recom_json = _json.loads("[" + partes[1].rsplit("]", 1)[0] + "]")
-                        except Exception:
-                            recom_json = None
-
-                    st.markdown("---")
-                    st.markdown("#### Análisis de la IA")
-                    st.markdown(analisis_txt)
-
-                    if recom_json:
-                        st.markdown("---")
-                        st.markdown("#### Tabla de Recomendaciones")
-                        df_recom = pd.DataFrame(recom_json)
-                        df_recom.columns = ["Prioridad","Categoría","Observación","Acción","Impacto"]
-
-                        def _color_prio(val):
-                            if val == "ALTA":  return "color:#EF4444;font-weight:700;"
-                            if val == "MEDIA": return "color:#FBBF24;font-weight:700;"
-                            return "color:#10B981;font-weight:700;"
-
-                        st.dataframe(
-                            df_recom.style.applymap(_color_prio, subset=["Prioridad"]),
-                            use_container_width=True, hide_index=True
-                        )
-                        st.download_button(
-                            "Descargar recomendaciones (CSV)",
-                            df_recom.to_csv(index=False).encode("utf-8"),
-                            f"Recomendaciones_IA_{'_'.join(entidades[:2])}.csv","text/csv"
-                        )
-                else:
-                    st.error(f"Error API IA: {resp_ia.status_code}. "
-                             "Verifica que el token de Anthropic esté configurado en secrets.")
-            except Exception as e:
-                st.error(f"Error conectando con la IA: {e}")
 
 
 # ==============================================================================
@@ -2946,26 +2791,26 @@ def renderizar_pestana_causa_solucion(df_folios: pd.DataFrame, dimension_sel: st
 def main():
     inyectar_estilos_css_enterprise()
 
-    col_hdr_left, col_hdr_right = st.columns([0.70, 0.30])
-    with col_hdr_left:
-        st.markdown(f"""
-        <div class="main-header-enterprise">
-            <h1>OPERACIONES — REGIÓN NORTE LA BAJA</h1>
-            <p>Módulo Consolidado de Analítica, Pólizas y Control Técnico de Campo ({ANIO_BASE_ESTRICTO})</p>
-        </div>""", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="main-header-enterprise">
+        <h1>OPERACIONES — REGIÓN NORTE LA BAJA</h1>
+        <p>Módulo Consolidado de Analítica, Pólizas y Control Técnico de Campo ({ANIO_BASE_ESTRICTO})</p>
+    </div>""", unsafe_allow_html=True)
 
-    with col_hdr_right:
-        st.write("")
-        btn_c1, btn_c2 = st.columns(2)
-        with btn_c1:
-            if st.button("Recargar", use_container_width=True, type="primary"):
-                st.cache_data.clear(); st.rerun()
-        with btn_c2:
-            if st.button("Limpiar Caché", use_container_width=True, type="secondary"):
-                st.cache_data.clear()
-                for k in list(st.session_state.keys()):
-                    del st.session_state[k]
-                st.rerun()
+    # Indicador de frescura del parquet vs CSV más reciente
+    try:
+        r_check = requests.head(
+            f"{GITHUB_RAW_BASE}/datos_consolidados.parquet",
+            headers=HEADERS, timeout=5, allow_redirects=True
+        )
+        parquet_ok = r_check.status_code == 200
+    except Exception:
+        parquet_ok = False
+
+    if parquet_ok:
+        st.sidebar.success("Dataset consolidado disponible")
+    else:
+        st.sidebar.warning("Sin parquet consolidado — carga lenta activa")
 
     seccion = st.sidebar.radio(
         "Sección principal:",
@@ -3049,12 +2894,11 @@ def main():
 
     df_folios = df_t.drop_duplicates(subset=["FOLIO_KEY"], keep="first")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "Pólizas y Cuadrillas",
         "Reincidencias",
         "Cambios de Equipo",
         "Causa y Solución Soporte",
-        "IA — Auditor Operativo",
     ])
 
     with tab1:
@@ -3065,8 +2909,7 @@ def main():
         renderizar_pestana_cambios_equipo(df_folios, df_raw, dimension_sel)
     with tab4:
         renderizar_pestana_causa_solucion(df_folios, dimension_sel)
-    with tab5:
-        renderizar_pestana_ia(df_folios, df_raw)
+
 
 
 if __name__ == "__main__":
