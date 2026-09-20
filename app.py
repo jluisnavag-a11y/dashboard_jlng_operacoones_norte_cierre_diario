@@ -750,7 +750,126 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
         df = df[conteo_emp > 1].copy()
 
     # Motor de reincidencias sobre el dataset COMPLETO (sin filtros)
+    # NOTA: cuando se llama desde _regenerar_parquet_consolidado, las
+    # reincidencias se calculan en el consolidado total, no aquí.
+    # El parámetro calcular_rein=True mantiene compatibilidad con el fallback.
     df = calcular_reincidencias_vectorizadas(df)
+    return df
+
+
+def transformar_dataset_base(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Igual que transformar_dataset_completo pero SIN calcular reincidencias.
+    Se usa en la regeneración del parquet para que las reincidencias
+    se calculen sobre el consolidado total (histórico + nuevo), no
+    solo sobre el archivo recién subido.
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    cols = list(df.columns)
+
+    get_col   = lambda alias: detectar_columna_por_patrones(cols, alias)
+    sanit_fol = lambda s: s.apply(sanitizar_folio_identificador)
+    sanit_txt = lambda s: s.apply(sanitizar_cadena_texto)
+
+    col_fecha     = get_col(LISTA_ALIAS_CREACION)
+    col_fecha_fin = get_col(LISTA_ALIAS_TERMINO)
+    df["_datetime_parsed"]  = parsear_columna_fecha_robusta(df[col_fecha]) if col_fecha and col_fecha in cols else pd.NaT
+    df["_datetime_termino"] = parsear_columna_fecha_robusta(df[col_fecha_fin]) if col_fecha_fin and col_fecha_fin in cols else pd.NaT
+    delta_h = (df["_datetime_termino"] - df["_datetime_parsed"]).dt.total_seconds() / 3600.0
+    df["Tiempo_Resolucion_Horas"] = delta_h.where(delta_h >= 0)
+
+    c_os  = get_col(LISTA_ALIAS_ORDEN);    c_cta = get_col(LISTA_ALIAS_CUENTA)
+    c_ot  = get_col(LISTA_ALIAS_OT);      c_tipo = get_col(LISTA_ALIAS_TIPO)
+    c_usr = get_col(LISTA_ALIAS_USUARIO); c_nom  = get_col(LISTA_ALIAS_NOMBRE)
+    c_prov= get_col(LISTA_ALIAS_PROVEEDOR);c_dist= get_col(LISTA_ALIAS_DISTRITO)
+    c_clus= get_col(LISTA_ALIAS_CLUSTER)
+    c_causa  = get_col(LISTA_ALIAS_CAUSA);  c_falla = get_col(LISTA_ALIAS_FALLA)
+    c_sol    = get_col(LISTA_ALIAS_SOLUCION); c_status = get_col(LISTA_ALIAS_ESTATUS)
+    c_lat    = get_col(LISTA_ALIAS_LAT);   c_lon = get_col(LISTA_ALIAS_LON)
+
+    if c_causa  and c_causa  in cols: df["Causa_Registro"]    = sanit_txt(df[c_causa])
+    if c_falla  and c_falla  in cols: df["Falla_Registro"]    = sanit_txt(df[c_falla])
+    if c_sol    and c_sol    in cols: df["Solucion_Registro"]  = sanit_txt(df[c_sol])
+    if c_status and c_status in cols: df["Estatus_Registro"]   = sanit_txt(df[c_status])
+    if c_lat    and c_lat    in cols: df["LAT"] = pd.to_numeric(df[c_lat].astype(str).str.replace(",",".",regex=False), errors="coerce")
+    if c_lon    and c_lon    in cols: df["LON"] = pd.to_numeric(df[c_lon].astype(str).str.replace(",",".",regex=False), errors="coerce")
+
+    s_os   = sanit_fol(df[c_os])   if c_os   else pd.Series("SIN_OS",  index=df.index)
+    s_cta  = sanit_fol(df[c_cta])  if c_cta  else pd.Series("SIN_CTA", index=df.index)
+    s_ot   = sanit_fol(df[c_ot])   if c_ot   else pd.Series("SIN_OT",  index=df.index)
+    s_tipo = sanit_txt(df[c_tipo])  if c_tipo else pd.Series("EVENTO GENERAL", index=df.index)
+
+    df["FOLIO_KEY"]      = s_os.astype(str)+"_"+s_cta.astype(str)+"_"+s_ot.astype(str)+"_"+s_tipo.astype(str)
+    df["Cuenta_Cliente"] = s_cta.astype(str)
+
+    s_u = sanit_txt(df[c_usr]) if c_usr else pd.Series("SIN ESPECIFICAR", index=df.index)
+    s_n = sanit_txt(df[c_nom]) if c_nom else pd.Series("SIN ESPECIFICAR", index=df.index)
+    df["Usuario_Tecnico"] = np.where(
+        (s_u != "SIN ESPECIFICAR") & (s_n != "SIN ESPECIFICAR"), s_u+" | "+s_n,
+        np.where(s_n != "SIN ESPECIFICAR", s_n, s_u)
+    )
+    df["Empresa"]      = sanit_txt(df[c_prov]) if c_prov else "SIN PROVEEDOR"
+    df["Distrito"]     = sanit_txt(df[c_dist]) if c_dist else "DISTRITO GENERAL"
+    df["Tipo_Orden"]   = s_tipo
+    df["Cluster_Raw"]  = sanit_txt(df[c_clus]) if c_clus else "SIN CLUSTER"
+    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
+
+    c_pol = c_usr or c_nom
+    if c_pol and c_pol in cols:
+        sub_cods = df[c_pol].astype(str).str[3:5]
+        df["Codigo_Poliza"] = np.where(sub_cods.isin(MAPEO_POLIZAS), sub_cods, "")
+        df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("NO VALIDO")
+    else:
+        df["Codigo_Poliza"] = ""; df["Nombre_Poliza"] = "NO VALIDO"
+
+    if c_pol and c_pol in cols:
+        gen_cod = df[c_pol].astype(str).str[3:5]
+        mask_25 = gen_cod == "25"
+        mask_tipo_excluido = df["Tipo_Orden"].str.upper().isin(TIPOS_EXCLUIDOS_POLIZA25)
+        df = df[~(mask_25 & mask_tipo_excluido)].copy()
+        cols = list(df.columns)
+
+    if "Tipo_Orden" in df.columns:
+        tipo_up = df["Tipo_Orden"].str.upper().str.strip()
+        mapa_upper = {k.upper(): v for k, v in HOMOLOGACION_TIPOS.items()}
+        df["Tipo_Orden"] = tipo_up.map(mapa_upper).fillna(tipo_up)
+        tipo_up2 = df["Tipo_Orden"].str.upper().str.strip()
+        mask_rec_emp = tipo_up2.str.contains("RECOLE", na=False) & tipo_up2.str.contains("EMPRE", na=False)
+        mask_rec_pi  = tipo_up2.str.contains("RECOLE", na=False) & ~mask_rec_emp
+        mask_inst    = tipo_up2.str.contains("INSTALA", na=False) & ~mask_rec_emp & ~mask_rec_pi
+        df.loc[mask_rec_emp, "Tipo_Orden"] = "RECOLECCION EMPRESARIAL"
+        df.loc[mask_rec_pi,  "Tipo_Orden"] = "RECOLECCION PI"
+        df.loc[mask_inst,    "Tipo_Orden"] = "INSTALACION"
+
+    if "Empresa" in df.columns:
+        mask_prov_exc = df["Empresa"].str.upper().str.startswith(PREFIJOS_PROVEEDOR_EXCLUIDO)
+        df = df[~mask_prov_exc].copy()
+
+    if "Usuario_Tecnico" in df.columns:
+        conteo_usr = df["Usuario_Tecnico"].map(df["Usuario_Tecnico"].value_counts())
+        df = df[conteo_usr > 1].copy()
+    if "Empresa" in df.columns:
+        conteo_emp = df["Empresa"].map(df["Empresa"].value_counts())
+        df = df[conteo_emp > 1].copy()
+
+    sem_arch = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(None, index=df.index)
+    sem_iso  = pd.to_numeric(df["_datetime_parsed"].dt.isocalendar().week, errors="coerce").fillna(0).astype(int)
+    df["Num_Semana_Archivo"] = np.where(
+        pd.to_numeric(sem_arch, errors="coerce").fillna(0) > 0,
+        pd.to_numeric(sem_arch, errors="coerce").fillna(0).astype(int), sem_iso
+    )
+    df["AÑO_DIM"]    = str(ANIO_BASE_ESTRICTO)
+    df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Sem {int(x)}" if x > 0 else "SIN_FECHA")
+    df["MES_DIM"]    = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO).fillna("Enero")
+    dates_valid = df["_datetime_parsed"].dropna()
+    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
+    if not dates_valid.empty:
+        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
+
     return df
 
 
@@ -1287,17 +1406,62 @@ def leer_bytes_github(ruta: str) -> bytes:
 
 
 def _regenerar_parquet_consolidado(nombre_csv: str, df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Regenera el parquet consolidado con el historial correcto.
+
+    Flujo:
+    1. Descarga el parquet anterior (histórico).
+    2. Elimina del histórico las filas del archivo que se está actualizando.
+    3. Transforma el nuevo archivo (fechas, pólizas, dimensiones) SIN reincidencias.
+    4. Concatena histórico transformado + nuevo transformado.
+    5. Corre calcular_reincidencias_vectorizadas sobre el TOTAL — esto garantiza
+       que una instalación de sem 16 y un soporte de sem 24 (archivos distintos)
+       queden correctamente vinculados como reincidencia.
+    6. Devuelve el dataset completo con reincidencias correctas.
+    """
     inventario_repositorio_github.clear()
-    inventario = inventario_repositorio_github()
-    prefijo    = f"{GITHUB_FOLDER.strip('/')}/"
-    ruta_cons  = prefijo + "datos_consolidados.parquet"
-    nuevo = df_raw.copy(); nuevo["Archivo_Origen"] = nombre_csv
+    inventario  = inventario_repositorio_github()
+    prefijo     = f"{GITHUB_FOLDER.strip('/')}/"
+    ruta_cons   = prefijo + "datos_consolidados.parquet"
+
+    # Transformar el nuevo archivo (sin reincidencias aún)
+    nuevo = df_raw.copy()
+    nuevo["Archivo_Origen"] = nombre_csv
+    nuevo_base = transformar_dataset_base(nuevo)
+
     if ruta_cons in inventario:
-        anterior = pd.read_parquet(io.BytesIO(leer_bytes_github(ruta_cons)))
-        if "Archivo_Origen" in anterior.columns:
-            anterior = anterior[anterior["Archivo_Origen"] != nombre_csv]
-        return pd.concat([anterior, transformar_dataset_completo(nuevo)], ignore_index=True)
-    return transformar_dataset_completo(nuevo)
+        try:
+            anterior_completo = pd.read_parquet(io.BytesIO(leer_bytes_github(ruta_cons)))
+            # Quitar del histórico las columnas de reincidencias calculadas
+            # (se van a recalcular sobre el total)
+            cols_rein = [
+                "ES_REINCIDENCIA","CONTEO_PREVIO_8_SEM",
+                "Usuario_Origen_Reincidencia","Empresa_Origen_Reincidencia",
+                "Semana_Origen_Reincidencia","Causa_Origen","TIPO_2",
+                "Falla_Nueva","ES_CASO_ESPECIAL"
+            ]
+            anterior_base = anterior_completo.copy()
+            if "Archivo_Origen" in anterior_base.columns:
+                anterior_base = anterior_base[anterior_base["Archivo_Origen"] != nombre_csv]
+            # Quitar columnas de reincidencias del histórico para recalcular
+            anterior_base = anterior_base.drop(
+                columns=[c for c in cols_rein if c in anterior_base.columns],
+                errors="ignore"
+            )
+            # Homologar tipos del histórico también
+            anterior_base = _homologar_tipos_df(anterior_base)
+
+            # Consolidado base = histórico (sin rein) + nuevo (sin rein)
+            consolidado_base = pd.concat([anterior_base, nuevo_base], ignore_index=True)
+        except Exception as e:
+            logger.warning(f"No se pudo leer el parquet previo, regenerando desde cero: {e}")
+            consolidado_base = nuevo_base
+    else:
+        consolidado_base = nuevo_base
+
+    # Calcular reincidencias sobre el TOTAL — aquí está la clave
+    consolidado_final = calcular_reincidencias_vectorizadas(consolidado_base)
+    return consolidado_final
 
 
 def guardar_csv_en_carpeta(ruta: str, df: pd.DataFrame, agregar: bool) -> pd.DataFrame:
@@ -1924,16 +2088,75 @@ def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.Da
 
 def renderizar_modulo_carga_github():
     st.markdown("""<style>
-    .st-key-formulario_carga [data-testid="stSelectbox"] div,
-    .st-key-formulario_carga [data-testid="stSelectbox"] input,
-    .st-key-formulario_carga [data-testid="stSelectbox"] [role="combobox"] {{
-        background: #ffffff !important; color: #000000 !important;
+    /* ── Contenedor completo del formulario de carga ── */
+    .st-key-formulario_carga,
+    .st-key-formulario_carga * {
+        color: #000000 !important;
         -webkit-text-fill-color: #000000 !important;
-    }}
+    }
+    /* Labels de todos los campos */
+    .st-key-formulario_carga label,
+    .st-key-formulario_carga .stMarkdown p,
+    .st-key-formulario_carga .stCaption p {
+        color: #1E3E62 !important;
+        font-weight: 600 !important;
+    }
+    /* Selectbox / Dropdown */
+    .st-key-formulario_carga [data-testid="stSelectbox"] > div,
+    .st-key-formulario_carga [data-testid="stSelectbox"] input,
+    .st-key-formulario_carga [data-testid="stSelectbox"] [role="combobox"],
+    .st-key-formulario_carga [data-baseweb="select"] > div {
+        background: #ffffff !important;
+        color: #000000 !important;
+        border: 1px solid #CBD5E1 !important;
+        border-radius: 7px !important;
+    }
+    /* Opciones del dropdown */
     body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="listbox"],
-    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"] {{
-        background-color: #ffffff !important; color: #000000 !important;
-    }}
+    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"] {
+        background-color: #ffffff !important;
+        color: #000000 !important;
+    }
+    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"]:hover {
+        background-color: #E2E8F0 !important;
+    }
+    /* Radio buttons */
+    .st-key-formulario_carga [data-testid="stRadio"] label,
+    .st-key-formulario_carga [data-testid="stRadio"] p {
+        color: #000000 !important;
+        font-weight: 500 !important;
+    }
+    /* Text inputs */
+    .st-key-formulario_carga [data-testid="stTextInput"] input,
+    .st-key-formulario_carga [data-testid="stTextArea"] textarea {
+        background-color: #ffffff !important;
+        color: #000000 !important;
+        border: 1px solid #CBD5E1 !important;
+        border-radius: 7px !important;
+    }
+    /* Password input */
+    .st-key-formulario_carga [data-testid="stTextInput"] input[type="password"] {
+        background-color: #ffffff !important;
+        color: #000000 !important;
+    }
+    /* Caption / info */
+    .st-key-formulario_carga [data-testid="stCaptionContainer"] p {
+        color: #475569 !important;
+    }
+    /* Botón principal de guardar */
+    .st-key-formulario_carga div.stButton > button[kind="primary"] {
+        background-color: #1E3E62 !important;
+        color: #ffffff !important;
+        border: none !important;
+        font-weight: 700 !important;
+    }
+    /* Métricas dentro del formulario */
+    .st-key-formulario_carga [data-testid="stMetricValue"] {
+        color: #1E3E62 !important;
+    }
+    .st-key-formulario_carga [data-testid="stMetricLabel"] {
+        color: #475569 !important;
+    }
     </style>""", unsafe_allow_html=True)
     with st.container(key="formulario_carga"):
         _renderizar_formulario_carga_github()
