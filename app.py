@@ -1491,7 +1491,12 @@ def guardar_csv_en_carpeta(ruta: str, df: pd.DataFrame, agregar: bool) -> pd.Dat
         else:
             final = final.drop_duplicates(keep="last")
     elif res.status_code == 200:
-        raise ValueError("Ya existe un archivo con ese nombre. Selecciona actualizar o escribe otro nombre.")
+        # El archivo existe en GitHub aunque el usuario eligió "Crear nuevo".
+        # Esto ocurre cuando el inventario cacheado está desactualizado o cuando
+        # el usuario confirmó explícitamente la sobrescritura en el formulario.
+        # Usamos el SHA para hacer un PUT y sobrescribir el archivo.
+        sha = res.json().get("sha")
+        # final ya tiene los datos nuevos (df), no concatenamos con el anterior
     elif res.status_code != 404:
         res.raise_for_status()
 
@@ -2229,8 +2234,21 @@ def _renderizar_formulario_carga_github():
                                    placeholder="CIERRE DIARIO SEM 38 2026.csv").strip()
         if nombre_inp:
             candidato = nombre_inp if nombre_inp.lower().endswith(".csv") else f"{nombre_inp}.csv"
-            if prefijo + candidato in inventario:
-                st.error("Ese nombre ya existe. Elige 'Actualizar' o escribe otro nombre.")
+            ruta_candidato = prefijo + candidato
+            if ruta_candidato in inventario:
+                st.warning(
+                    f"**`{candidato}`** ya aparece en el inventario del repositorio. "
+                    "Si lo borraste de GitHub y quieres volver a cargarlo, confirma abajo. "
+                    "Si solo quieres actualizarlo con nuevas filas, elige 'Actualizar un CSV existente'."
+                )
+                sobrescribir = st.checkbox(
+                    "Sí, quiero sobrescribir / volver a crear este archivo",
+                    key="chk_sobrescribir_csv"
+                )
+                if sobrescribir:
+                    nombre_csv = candidato   # permitir la carga
+                    # Limpiar inventario para que no haya falsos positivos
+                    inventario_repositorio_github.clear()
             else:
                 nombre_csv = candidato
 
@@ -2271,13 +2289,53 @@ def _renderizar_formulario_carga_github():
                     rp = "/".join(p for p in (GITHUB_FOLDER.strip("/"), "datos_consolidados.parquet") if p)
                     ok, det = _push_blob_git_data_api(rp, buf.getvalue(), f"Consolidado tras {nombre_csv}")
                     if ok:
-                        st.success("Dataset consolidado actualizado. El dashboard reflejará los datos de inmediato.")
+                        # Verificar que el Parquet tiene las filas esperadas
+                        try:
+                            resp_ver = requests.get(
+                                f"{GITHUB_RAW_BASE}/datos_consolidados.parquet",
+                                headers=HEADERS, timeout=20
+                            )
+                            if resp_ver.status_code == 200:
+                                df_ver = pd.read_parquet(io.BytesIO(resp_ver.content))
+                                n_parquet = len(df_ver)
+                                st.success(
+                                    f"Dataset consolidado actualizado — "
+                                    f"{n_parquet:,} registros totales en el Parquet."
+                                )
+                                # Archivar el CSV (moverlo a datos_semanales/archivo/)
+                                ruta_archivo_csv = f"{GITHUB_FOLDER.strip('/')}/archivo/{nombre_csv}"
+                                csv_bytes_arc = final.to_csv(index=False).encode("utf-8-sig")
+                                ok_arc, _ = _push_contenido_api(
+                                    ruta_archivo_csv, csv_bytes_arc,
+                                    f"Archivar {nombre_csv} tras integración al Parquet"
+                                )
+                                if ok_arc:
+                                    # Eliminar el CSV de la carpeta raíz de datos_semanales
+                                    url_del = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{destino}"
+                                    res_sha = requests.get(f"{url_del}?ref={GITHUB_BRANCH}", headers=_headers_gh(), timeout=15)
+                                    sha_del = res_sha.json().get("sha") if res_sha.status_code == 200 else None
+                                    if sha_del:
+                                        requests.delete(url_del, json={
+                                            "message": f"Archivar {nombre_csv} (integrado al Parquet)",
+                                            "sha": sha_del, "branch": GITHUB_BRANCH
+                                        }, headers=_headers_gh(), timeout=30)
+                                    st.info(
+                                        f"CSV archivado en `{GITHUB_FOLDER}/archivo/` y eliminado de la carpeta raíz. "
+                                        "El dashboard consultará únicamente el Parquet consolidado."
+                                    )
+                                else:
+                                    st.info("Parquet actualizado. El CSV permanece en la carpeta raíz como respaldo.")
+                            else:
+                                st.warning("Parquet actualizado pero no se pudo verificar su contenido.")
+                        except Exception as e_ver:
+                            st.warning(f"Parquet subido pero no verificado: {e_ver}")
                     else:
                         raise ValueError(det)
                 except Exception as exc:
                     st.warning(f"El CSV sí quedó guardado, pero no se pudo regenerar el consolidado: {exc}")
 
         st.cache_data.clear()
+        inventario_repositorio_github.clear()
         listar_archivos_semanales_github.clear()
         st.rerun()
 
