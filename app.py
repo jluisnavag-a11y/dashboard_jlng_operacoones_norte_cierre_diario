@@ -2272,6 +2272,45 @@ def _renderizar_formulario_carga_github():
 
     clave = st.text_input("Clave de autorización:", type="password", key="token_auth_carga_v2")
 
+    st.markdown("---")
+    st.markdown("#### Mantenimiento del consolidado")
+    st.caption(
+        "Usa esta acción una sola vez para integrar todos los CSV ya existentes, "
+        "incluidos los guardados en `datos_semanales/archivo/`. No crea ni modifica CSV."
+    )
+    if st.button("Reconstruir Parquet completo", key="reconstruir_parquet_completo"):
+        if not GITHUB_TOKEN:
+            st.error("Configura github.token en los secretos de Streamlit.")
+            return
+        if clave != st.secrets.get("UPLOAD_PASSWORD", "admin123"):
+            st.error("Clave de autorización incorrecta.")
+            return
+        with st.spinner("Leyendo todos los CSV históricos y reconstruyendo el Parquet..."):
+            try:
+                cons = _regenerar_parquet_consolidado("", pd.DataFrame())
+                if cons is None or cons.empty:
+                    raise ValueError("Consolidado vacío.")
+                buf = io.BytesIO()
+                cons.to_parquet(buf, index=False)
+                rp = "/".join(p for p in (GITHUB_FOLDER.strip("/"), "datos_consolidados.parquet") if p)
+                ok, det = _push_blob_git_data_api(rp, buf.getvalue(), "Reconstruir Parquet completo desde CSV históricos")
+                if not ok:
+                    raise ValueError(det)
+
+                semanas_origen = (cons["Num_Semana_Archivo"]
+                                  if "Num_Semana_Archivo" in cons.columns else pd.Series(dtype=float))
+                semanas = pd.to_numeric(semanas_origen, errors="coerce").dropna()
+                rango = (f"Sem {int(semanas.min())} a Sem {int(semanas.max())}"
+                         if not semanas.empty else "sin semanas identificadas")
+                st.success(
+                    f"Parquet reconstruido y publicado: {len(cons):,} registros · {rango}."
+                )
+                st.cache_data.clear()
+                inventario_repositorio_github.clear()
+                listar_archivos_semanales_github.clear()
+            except Exception as exc:
+                st.error(f"No se reemplazó el Parquet: {exc}")
+
     puede_guardar = df_preview is not None and destino is not None
     if st.button("Guardar CSV en GitHub", type="primary", disabled=not puede_guardar, key="guardar_captura"):
         if not GITHUB_TOKEN:
