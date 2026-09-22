@@ -873,52 +873,30 @@ def transformar_dataset_base(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=86400, show_spinner="Cargando dataset...", max_entries=1)
+@st.cache_data(ttl=900, show_spinner="Cargando dataset consolidado...", max_entries=1)
 def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
     """
-    Fuente única: GitHub.
-    1) Ruta rápida: datos_consolidados.parquet (2-5 seg).
-    2) Fallback: descarga en paralelo todos los CSV/parquet de la carpeta.
+    Fuente exclusiva del dashboard: datos_consolidados.parquet.
+
+    Los CSV son únicamente insumos de respaldo y se consolidan fuera de
+    Streamlit. Nunca se descargan durante la apertura del dashboard: si el
+    Parquet no está disponible o no es válido, se devuelve vacío para mostrar
+    un error inmediato en lugar de activar una carga lenta por archivos.
     """
     cols_base = ["FOLIO_KEY","Cuenta_Cliente","Usuario_Tecnico","Empresa",
                  "Distrito","Tipo_Orden","Cluster_Base","Nombre_Poliza",
                  "Num_Semana_Archivo","SEMANA_DIM","FECHA_TRUNCADA"]
 
-    # Ruta rápida
     try:
         resp = requests.get(f"{GITHUB_RAW_BASE}/datos_consolidados.parquet", headers=HEADERS, timeout=15)
         if resp.status_code == 200:
             df = pd.read_parquet(io.BytesIO(resp.content))
             if not df.empty and "MES_DIM" in df.columns:
-                # Homologar tipos siempre, el parquet puede tener valores sin homologar
                 return _homologar_tipos_df(df)
+        logger.error("Parquet no disponible o incompleto (HTTP %s).", resp.status_code)
     except Exception as e:
         logger.warning(f"No se pudo descargar Parquet consolidado: {e}")
-
-    # Fallback
-    try:
-        resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
-        lista = [
-            f["name"] for f in resp.json()
-            if isinstance(f, dict) and f["name"].endswith((".csv",".parquet"))
-            and f["name"] != "datos_consolidados.parquet"
-        ] if resp.status_code == 200 else []
-    except Exception as e:
-        logger.error(f"Error conectando GitHub API: {e}")
-        lista = []
-
-    if not lista:
-        return pd.DataFrame(columns=cols_base)
-
-    with ThreadPoolExecutor(max_workers=25) as ex:
-        resultados = list(ex.map(descargar_y_procesar_archivo, lista))
-    coleccion = [d for d in resultados if d is not None and not d.empty]
-    if not coleccion:
-        return pd.DataFrame(columns=cols_base)
-
-    df = pd.concat(coleccion, ignore_index=True)
-    coleccion.clear(); gc.collect()
-    return transformar_dataset_completo(df)
+    return pd.DataFrame(columns=cols_base)
 
 
 # ==============================================================================
@@ -1405,62 +1383,76 @@ def leer_bytes_github(ruta: str) -> bytes:
     return res.content
 
 
+def _leer_csv_historico_github(ruta: str) -> pd.DataFrame:
+    """Lee un CSV del árbol completo del repositorio y conserva su origen."""
+    datos = leer_bytes_github(ruta)
+    try:
+        df = pd.read_csv(io.BytesIO(datos), dtype=str, low_memory=False,
+                         encoding="utf-8", on_bad_lines="skip")
+    except UnicodeDecodeError:
+        df = pd.read_csv(io.BytesIO(datos), dtype=str, low_memory=False,
+                         encoding="latin1", on_bad_lines="skip")
+    if df.empty:
+        raise ValueError(f"El archivo no contiene filas: {ruta}")
+    df["Archivo_Origen"] = ruta
+    return df
+
+
 def _regenerar_parquet_consolidado(nombre_csv: str, df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Regenera el parquet consolidado con el historial correcto.
+    Reconstruye el Parquet desde TODOS los CSV históricos del repositorio.
 
-    Flujo:
-    1. Descarga el parquet anterior (histórico).
-    2. Elimina del histórico las filas del archivo que se está actualizando.
-    3. Transforma el nuevo archivo (fechas, pólizas, dimensiones) SIN reincidencias.
-    4. Concatena histórico transformado + nuevo transformado.
-    5. Corre calcular_reincidencias_vectorizadas sobre el TOTAL — esto garantiza
-       que una instalación de sem 16 y un soporte de sem 24 (archivos distintos)
-       queden correctamente vinculados como reincidencia.
-    6. Devuelve el dataset completo con reincidencias correctas.
+    Los CSV archivados en ``datos_semanales/archivo/`` también son parte del
+    histórico. No se utiliza el Parquet previo como fuente porque éste podría
+    estar incompleto; de ese modo una regeneración siempre corrige el historial
+    y recalcula las reincidencias sobre la base completa.
     """
     inventario_repositorio_github.clear()
-    inventario  = inventario_repositorio_github()
-    prefijo     = f"{GITHUB_FOLDER.strip('/')}/"
-    ruta_cons   = prefijo + "datos_consolidados.parquet"
+    inventario = inventario_repositorio_github()
+    prefijo = f"{GITHUB_FOLDER.strip('/')}/"
 
-    # Transformar el nuevo archivo (sin reincidencias aún)
-    nuevo = df_raw.copy()
-    nuevo["Archivo_Origen"] = nombre_csv
-    nuevo_base = transformar_dataset_base(nuevo)
+    rutas_csv = sorted(
+        ruta for ruta, tipo in inventario.items()
+        if tipo == "blob"
+        and ruta.startswith(prefijo)
+        and ruta.lower().endswith(".csv")
+    )
+    if not rutas_csv:
+        raise ValueError("No se encontraron CSV históricos para reconstruir el consolidado.")
 
-    if ruta_cons in inventario:
-        try:
-            anterior_completo = pd.read_parquet(io.BytesIO(leer_bytes_github(ruta_cons)))
-            # Quitar del histórico las columnas de reincidencias calculadas
-            # (se van a recalcular sobre el total)
-            cols_rein = [
-                "ES_REINCIDENCIA","CONTEO_PREVIO_8_SEM",
-                "Usuario_Origen_Reincidencia","Empresa_Origen_Reincidencia",
-                "Semana_Origen_Reincidencia","Causa_Origen","TIPO_2",
-                "Falla_Nueva","ES_CASO_ESPECIAL"
-            ]
-            anterior_base = anterior_completo.copy()
-            if "Archivo_Origen" in anterior_base.columns:
-                anterior_base = anterior_base[anterior_base["Archivo_Origen"] != nombre_csv]
-            # Quitar columnas de reincidencias del histórico para recalcular
-            anterior_base = anterior_base.drop(
-                columns=[c for c in cols_rein if c in anterior_base.columns],
-                errors="ignore"
-            )
-            # Homologar tipos del histórico también
-            anterior_base = _homologar_tipos_df(anterior_base)
+    # El CSV recién guardado ya forma parte del árbol. Si GitHub aún no lo
+    # devuelve por latencia, se incorpora la copia recibida por la pantalla.
+    nombre_actual_en_arbol = any(ruta.rsplit("/", 1)[-1] == nombre_csv for ruta in rutas_csv)
+    errores: List[str] = []
+    frames: List[pd.DataFrame] = []
 
-            # Consolidado base = histórico (sin rein) + nuevo (sin rein)
-            consolidado_base = pd.concat([anterior_base, nuevo_base], ignore_index=True)
-        except Exception as e:
-            logger.warning(f"No se pudo leer el parquet previo, regenerando desde cero: {e}")
-            consolidado_base = nuevo_base
-    else:
-        consolidado_base = nuevo_base
+    with ThreadPoolExecutor(max_workers=min(12, len(rutas_csv))) as ex:
+        futuros = {ex.submit(_leer_csv_historico_github, ruta): ruta for ruta in rutas_csv}
+        for futuro, ruta in futuros.items():
+            try:
+                frames.append(futuro.result())
+            except Exception as exc:
+                errores.append(f"{ruta}: {exc}")
 
-    # Calcular reincidencias sobre el TOTAL — aquí está la clave
+    # Nunca crear un Parquet parcial: si un histórico no puede leerse, se
+    # conserva el consolidado vigente y se informa el archivo problemático.
+    if errores:
+        raise ValueError("No se reconstruyó el Parquet porque fallaron archivos históricos: " + " | ".join(errores[:5]))
+
+    if not nombre_actual_en_arbol:
+        nuevo = df_raw.copy()
+        nuevo["Archivo_Origen"] = f"{prefijo}{nombre_csv}"
+        frames.append(nuevo)
+
+    historico_crudo = pd.concat(frames, ignore_index=True)
+    logger.info("Reconstrucción completa: %s CSV y %s filas crudas", len(frames), len(historico_crudo))
+
+    consolidado_base = transformar_dataset_base(historico_crudo)
+    if consolidado_base is None or consolidado_base.empty:
+        raise ValueError("La transformación del histórico produjo un dataset vacío.")
+
     consolidado_final = calcular_reincidencias_vectorizadas(consolidado_base)
+    logger.info("Parquet reconstruido: %s filas finales", len(consolidado_final))
     return consolidado_final
 
 
@@ -2258,6 +2250,11 @@ def _renderizar_formulario_carga_github():
 
     clave = st.text_input("Clave de autorización:", type="password", key="token_auth_carga_v2")
 
+    st.caption(
+        "El Parquet histórico se genera localmente con `generar_parquet.py`. "
+        "El dashboard sólo consulta el archivo consolidado para mantener una apertura rápida."
+    )
+
     puede_guardar = df_preview is not None and destino is not None
     if st.button("Guardar CSV en GitHub", type="primary", disabled=not puede_guardar, key="guardar_captura"):
         if not GITHUB_TOKEN:
@@ -2278,61 +2275,10 @@ def _renderizar_formulario_carga_github():
         st.success(f"Guardado y verificado: {destino} — {len(final):,} registros.")
         st.link_button("Ver el CSV en GitHub", confirmado["url"])
 
-        if carpeta and carpeta.rstrip("/") == GITHUB_FOLDER.strip("/"):
-            with st.spinner("Regenerando el dataset consolidado..."):
-                try:
-                    cons = _regenerar_parquet_consolidado(nombre_csv, final)
-                    if cons is None or cons.empty:
-                        raise ValueError("Consolidado vacío.")
-                    buf = io.BytesIO()
-                    cons.to_parquet(buf, index=False)
-                    rp = "/".join(p for p in (GITHUB_FOLDER.strip("/"), "datos_consolidados.parquet") if p)
-                    ok, det = _push_blob_git_data_api(rp, buf.getvalue(), f"Consolidado tras {nombre_csv}")
-                    if ok:
-                        # Verificar que el Parquet tiene las filas esperadas
-                        try:
-                            resp_ver = requests.get(
-                                f"{GITHUB_RAW_BASE}/datos_consolidados.parquet",
-                                headers=HEADERS, timeout=20
-                            )
-                            if resp_ver.status_code == 200:
-                                df_ver = pd.read_parquet(io.BytesIO(resp_ver.content))
-                                n_parquet = len(df_ver)
-                                st.success(
-                                    f"Dataset consolidado actualizado — "
-                                    f"{n_parquet:,} registros totales en el Parquet."
-                                )
-                                # Archivar el CSV (moverlo a datos_semanales/archivo/)
-                                ruta_archivo_csv = f"{GITHUB_FOLDER.strip('/')}/archivo/{nombre_csv}"
-                                csv_bytes_arc = final.to_csv(index=False).encode("utf-8-sig")
-                                ok_arc, _ = _push_contenido_api(
-                                    ruta_archivo_csv, csv_bytes_arc,
-                                    f"Archivar {nombre_csv} tras integración al Parquet"
-                                )
-                                if ok_arc:
-                                    # Eliminar el CSV de la carpeta raíz de datos_semanales
-                                    url_del = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{destino}"
-                                    res_sha = requests.get(f"{url_del}?ref={GITHUB_BRANCH}", headers=_headers_gh(), timeout=15)
-                                    sha_del = res_sha.json().get("sha") if res_sha.status_code == 200 else None
-                                    if sha_del:
-                                        requests.delete(url_del, json={
-                                            "message": f"Archivar {nombre_csv} (integrado al Parquet)",
-                                            "sha": sha_del, "branch": GITHUB_BRANCH
-                                        }, headers=_headers_gh(), timeout=30)
-                                    st.info(
-                                        f"CSV archivado en `{GITHUB_FOLDER}/archivo/` y eliminado de la carpeta raíz. "
-                                        "El dashboard consultará únicamente el Parquet consolidado."
-                                    )
-                                else:
-                                    st.info("Parquet actualizado. El CSV permanece en la carpeta raíz como respaldo.")
-                            else:
-                                st.warning("Parquet actualizado pero no se pudo verificar su contenido.")
-                        except Exception as e_ver:
-                            st.warning(f"Parquet subido pero no verificado: {e_ver}")
-                    else:
-                        raise ValueError(det)
-                except Exception as exc:
-                    st.warning(f"El CSV sí quedó guardado, pero no se pudo regenerar el consolidado: {exc}")
+        st.info(
+            "El CSV quedó guardado como respaldo. Para actualizar el dashboard, "
+            "ejecuta `generar_parquet.py` en VS Code y sube el Parquet resultante."
+        )
 
         st.cache_data.clear()
         inventario_repositorio_github.clear()
@@ -3112,6 +3058,10 @@ def main():
         st.sidebar.success("Dataset consolidado disponible")
     else:
         st.sidebar.warning("Sin parquet consolidado — carga lenta activa")
+
+    if st.sidebar.button("Actualizar datos", key="actualizar_parquet_dashboard"):
+        st.cache_data.clear()
+        st.rerun()
 
     seccion = st.sidebar.radio(
         "Sección principal:",
