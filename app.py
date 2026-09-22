@@ -427,7 +427,13 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     cols        = list(df.columns)
-    col_tech    = detectar_columna_por_patrones(cols, ["usuario_tecnico","tecnico","tech","usuario","atendio","nombre_tecnico"]) or "Usuario_Tecnico"
+    # Usar la llave normalizada: USUARIO | NOMBRE.
+    # La reincidencia conserva ambos datos del técnico antecedente.
+    col_tech    = "Usuario_Tecnico" if "Usuario_Tecnico" in cols else (
+        detectar_columna_por_patrones(
+            cols, ["usuario_tecnico", "tecnico", "tech", "usuario", "atendio", "nombre_tecnico"]
+        ) or "Usuario_Tecnico"
+    )
     col_semana  = detectar_columna_por_patrones(cols, ["num_semana_archivo","semana","sem"]) or "Num_Semana_Archivo"
     col_causa   = detectar_columna_por_patrones(cols, LISTA_ALIAS_CAUSA) or "Tipo_Orden"
     col_falla   = detectar_columna_por_patrones(cols, LISTA_ALIAS_FALLA) or "Tipo_Orden"
@@ -2559,8 +2565,12 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     </div>""", unsafe_allow_html=True)
 
     if not df_fr.empty:
-        col_tech_b = detectar_columna_por_patrones(list(df_folios.columns),
-                         ["usuario_tecnico","tecnico","tech","usuario","atendio"]) or "Usuario_Tecnico"
+        # Misma llave que la reincidencia: USUARIO | NOMBRE.
+        col_tech_b = "Usuario_Tecnico" if "Usuario_Tecnico" in df_folios.columns else (
+            detectar_columna_por_patrones(
+                list(df_folios.columns), ["usuario_tecnico", "tecnico", "tech", "usuario", "atendio"]
+            ) or "Usuario_Tecnico"
+        )
         ev_x_tech  = df_base_efect.groupby(col_tech_b, observed=True).size().to_dict()
 
         _join = lambda x: " | ".join(sorted({str(v).strip() for v in x if pd.notna(v) and str(v).strip() not in ["","nan","None"]}))
