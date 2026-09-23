@@ -310,6 +310,46 @@ def parsear_columna_fecha_robusta(serie_raw: pd.Series) -> pd.Series:
     return serie_res
 
 
+def aplicar_dimensiones_productividad(df: pd.DataFrame) -> pd.DataFrame:
+    """Construye las dimensiones operativas exclusivamente con Fecha término.
+
+    Fecha creación se conserva para medir la brecha de reincidencia; no se usa
+    para productividad, eventos completados ni sus filtros Día/Semana/Mes.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    fecha_termino = (
+        pd.to_datetime(df["_datetime_termino"], errors="coerce")
+        if "_datetime_termino" in df.columns
+        else pd.Series(pd.NaT, index=df.index)
+    )
+    df["Fecha_Productividad"] = fecha_termino
+    semana_termino = pd.to_numeric(
+        fecha_termino.dt.isocalendar().week, errors="coerce"
+    ).fillna(0).astype(int)
+    df["Num_Semana_Productividad"] = semana_termino
+    df["SEMANA_DIM"] = semana_termino.apply(
+        lambda x: f"Sem {int(x)}" if x > 0 else "SIN_FECHA_TERMINO"
+    )
+    df["MES_DIM"] = fecha_termino.dt.month.map(MAPEO_MESES_TEXTO).fillna("SIN_FECHA_TERMINO")
+    df["FECHA_TRUNCADA"] = fecha_termino.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}").fillna("SIN_FECHA_TERMINO")
+    return df
+
+
+def filtrar_eventos_completados(df: pd.DataFrame) -> pd.DataFrame:
+    """Conserva sólo folios terminados con una Fecha término válida."""
+    if df.empty:
+        return df
+    salida = df.copy()
+    if "Estatus_Registro" in salida.columns:
+        estatus = salida["Estatus_Registro"].astype(str).str.upper()
+        salida = salida[estatus.str.contains(r"TERMINAD|COMPLET|CERRAD", regex=True, na=False)]
+    if "_datetime_termino" in salida.columns:
+        salida = salida[pd.to_datetime(salida["_datetime_termino"], errors="coerce").notna()]
+    return salida.copy()
+
+
 def _dias_calendario_para_periodo(dimension: str, valor_dim: str, df_grupo: pd.DataFrame) -> int:
     """
     Dias con actividad real para el denominador de productividad de UN periodo.
@@ -386,8 +426,7 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
 
     Reglas de negocio exactas:
 
-    1. ORDEN: cronológico por (Num_Semana ASC, posición de fila ASC).
-       Sin dependencia de fecha de cierre para ordenar.
+    1. ORDEN: cronológico por fecha de creación del evento actual.
 
     2. ES_REINCIDENCIA = SI cuando:
        a) El evento actual es de tipo SOPORTE.
@@ -396,8 +435,8 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
        c) La brecha entre la FECHA DE CIERRE del antecedente y la FECHA DE
           CREACIÓN del Soporte actual es > 0 y <= 60 días.
           (La instalación "falla" días después de cerrarse, no de crearse.)
-       d) Si no hay fecha de cierre disponible, se usa fecha de creación como
-          aproximación y la brecha máxima pasa a ser 8 semanas.
+       d) Sin ambas fechas no se marca reincidencia: no hay aproximación por
+          semana ni por fecha de creación del antecedente.
 
     3. CONTEO_PREVIO_8_SEM: número acumulado de reincidencias de esa cuenta
        ANTERIORES a la posición actual (incluyendo eventos no reincidentes).
@@ -443,11 +482,17 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
 
     df["_IDX_ORIG"] = range(len(df))
     df["_SEM_TEMP"] = pd.to_numeric(df[col_semana], errors="coerce").fillna(0).astype(int)
+    df["_FECHA_CREACION_ORDEN"] = pd.to_datetime(
+        df[COL_PARSED], errors="coerce"
+    ) if tiene_fechas_creacion else pd.NaT
 
     mask_cta = df["Cuenta_Cliente"].notna() & (
         ~df["Cuenta_Cliente"].astype(str).str.upper().isin(["SIN_CTA","SIN_FOLIO","NAN","NONE",""])
     )
-    df_valid = df[mask_cta].sort_values(["Cuenta_Cliente","_SEM_TEMP","_IDX_ORIG"]).copy()
+    df_valid = df[mask_cta].sort_values(
+        ["Cuenta_Cliente", "_FECHA_CREACION_ORDEN", "_IDX_ORIG"],
+        na_position="last",
+    ).copy()
 
     # Resultados indexados por FOLIO_KEY
     resultados: Dict[str, dict] = {}
@@ -501,20 +546,6 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
                 if pd.notna(f_cierre_prev) and pd.notna(f_crear_act):
                     delta_d = (pd.Timestamp(f_crear_act) - pd.Timestamp(f_cierre_prev)).days
                     es_rein = (0 < delta_d <= 60)
-                elif pd.notna(reg_prev.get(COL_PARSED)) and pd.notna(f_crear_act):
-                    # Fallback: usar fecha creación del antecedente
-                    delta_d = (pd.Timestamp(f_crear_act) - pd.Timestamp(reg_prev[COL_PARSED])).days
-                    es_rein = (0 < delta_d <= 60)
-                else:
-                    # Sin fechas: validar por semana (<= 8)
-                    if pd.notna(semana_origen):
-                        brecha_sem = int(reg_act.get("_SEM_TEMP", 0)) - int(semana_origen)
-                        es_rein = (0 < brecha_sem <= 8)
-            else:
-                # Sin columnas de fecha: validar solo por semana
-                if pd.notna(semana_origen):
-                    brecha_sem = int(reg_act.get("_SEM_TEMP", 0)) - int(semana_origen)
-                    es_rein = (0 < brecha_sem <= 8)
 
             if not es_rein:
                 continue
@@ -564,7 +595,7 @@ def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
                 lambda k: resultados.get(k, {}).get("Semana_Origen", np.nan)
             )
 
-    df.drop(columns=["_IDX_ORIG","_SEM_TEMP"], errors="ignore", inplace=True)
+    df.drop(columns=["_IDX_ORIG","_SEM_TEMP","_FECHA_CREACION_ORDEN"], errors="ignore", inplace=True)
     return df
 
 
@@ -717,16 +748,8 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
         sem_iso
     )
 
-    df["AÑO_DIM"]   = str(ANIO_BASE_ESTRICTO)
-    df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(
-        lambda x: f"Sem {int(x)}" if x > 0 else "SIN_FECHA"
-    )
-    df["MES_DIM"]    = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO).fillna("Enero")
-
-    dates_valid = df["_datetime_parsed"].dropna()
-    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
-    if not dates_valid.empty:
-        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
+    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
+    df = aplicar_dimensiones_productividad(df)
 
     # ------------------------------------------------------------------
     # FILTROS DE CALIDAD (reglas 8-11)
@@ -864,13 +887,8 @@ def transformar_dataset_base(df: pd.DataFrame) -> pd.DataFrame:
         pd.to_numeric(sem_arch, errors="coerce").fillna(0) > 0,
         pd.to_numeric(sem_arch, errors="coerce").fillna(0).astype(int), sem_iso
     )
-    df["AÑO_DIM"]    = str(ANIO_BASE_ESTRICTO)
-    df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(lambda x: f"Sem {int(x)}" if x > 0 else "SIN_FECHA")
-    df["MES_DIM"]    = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO).fillna("Enero")
-    dates_valid = df["_datetime_parsed"].dropna()
-    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
-    if not dates_valid.empty:
-        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
+    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
+    df = aplicar_dimensiones_productividad(df)
 
     return df
 
@@ -894,7 +912,10 @@ def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
         if resp.status_code == 200:
             df = pd.read_parquet(io.BytesIO(resp.content))
             if not df.empty and "MES_DIM" in df.columns:
-                return _homologar_tipos_df(df)
+                # También corrige parquets generados antes de este cambio: las
+                # dimensiones de productividad se derivan en tiempo de carga de
+                # Fecha término, sin esperar una reconstrucción histórica.
+                return aplicar_dimensiones_productividad(_homologar_tipos_df(df))
         logger.error("Parquet no disponible o incompleto (HTTP %s).", resp.status_code)
     except Exception as e:
         logger.warning(f"No se pudo descargar Parquet consolidado: {e}")
@@ -1169,10 +1190,10 @@ def acotar_fechas_a_semanas_seleccionadas(
     La operación considera lunes a domingo, como se maneja en el cierre
     operativo (por ejemplo Sem 38 = 14 a 20 de septiembre de 2026).
     """
-    if df.empty or not semanas or "_datetime_parsed" not in df.columns:
+    if df.empty or not semanas or "Fecha_Productividad" not in df.columns:
         return df, []
 
-    fechas = pd.to_datetime(df["_datetime_parsed"], errors="coerce").dt.normalize()
+    fechas = pd.to_datetime(df["Fecha_Productividad"], errors="coerce").dt.normalize()
     mascara = pd.Series(False, index=df.index)
     etiquetas: List[str] = []
     for semana in sorted({_num_sem(s) for s in semanas if _num_sem(s) != 999}):
@@ -3225,6 +3246,10 @@ def main():
     st.sidebar.metric("Registros activos", f"{len(df_t):,}", f"de {len(df_raw):,} totales")
 
     df_folios = df_t.drop_duplicates(subset=["FOLIO_KEY"], keep="first")
+    # Productividad, eventos y ranking usan únicamente OTs terminadas y con
+    # Fecha término válida. Reincidencias conserva el universo filtrado para
+    # relacionar término del antecedente contra creación del evento posterior.
+    df_eventos_completados = filtrar_eventos_completados(df_folios)
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "Pólizas y Cuadrillas",
@@ -3235,7 +3260,7 @@ def main():
 
     with tab1:
         renderizar_pestana_polizas_cuadrillas(
-            df_folios, df_raw, dimension_sel,
+            df_eventos_completados, df_raw, dimension_sel,
             semanas_filtradas=sel_sems,
             meses_filtrados=sel_meses,
         )
