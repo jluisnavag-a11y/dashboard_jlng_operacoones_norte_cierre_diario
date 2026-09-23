@@ -71,7 +71,9 @@ TIPOS_ELEGIBLES_EFECTIVIDAD = frozenset(["INSTALACION", "INSTALACIÓN", "SOPORTE
 # Pólizas válidas para el sistema (generación "25" = planta externa: excluida en pipeline)
 POLIZAS_VALIDAS: frozenset = frozenset(["D1","D6","E3","M3","M4","MT","R3"])
 # Pólizas excluidas por DEFAULT en filtros UI (el usuario puede activarlas manualmente)
-POLIZAS_DEFAULT_EXCLUIDAS: frozenset = frozenset(["MT","R3"])
+# La vista operativa parte de todas las pólizas, salvo MTTO PI.  R3 se conserva
+# porque también forma parte del volumen real cuando no se excluye expresamente.
+POLIZAS_DEFAULT_EXCLUIDAS: frozenset = frozenset(["MT"])
 
 MAPEO_POLIZAS: Dict[str, str] = {
     "R3": "RECOLECCIÓN",
@@ -1038,12 +1040,29 @@ def calcular_dias_cuadrilla_ponderados(
     """
     if df.empty or col_usuario not in df.columns or col_fecha not in df.columns:
         return 1
+    # Sólo cuentan jornadas con técnico y fecha reales.  La fecha de relleno
+    # 01.01.2026 se usa internamente cuando una fuente no trae fecha y no debe
+    # convertir registros sin fecha en una jornada operativa.
+    jornadas = df[[col_usuario, col_fecha]].copy()
+    jornadas[col_usuario] = jornadas[col_usuario].astype(str).str.strip()
+    fechas = pd.to_datetime(jornadas[col_fecha], format="%d.%m.%Y", errors="coerce")
+    if fechas.isna().all():
+        fechas = pd.to_datetime(jornadas[col_fecha], dayfirst=True, errors="coerce")
+    jornadas["_fecha_operativa"] = fechas.dt.normalize()
+    jornadas = jornadas[
+        jornadas[col_usuario].notna()
+        & ~jornadas[col_usuario].str.upper().isin(["", "NAN", "NONE", "SIN ESPECIFICAR"])
+        & jornadas["_fecha_operativa"].notna()
+        & (jornadas["_fecha_operativa"] != pd.Timestamp(f"{ANIO_BASE_ESTRICTO}-01-01"))
+    ]
+    if jornadas.empty:
+        return 0
     dias_por_tecnico = (
-        df.groupby(col_usuario, observed=True)[col_fecha]
+        jornadas.groupby(col_usuario, observed=True)["_fecha_operativa"]
         .nunique()
         .sum()
     )
-    return max(1, int(dias_por_tecnico))
+    return int(dias_por_tecnico)
 
 
 def calcular_tendencia_lineal_robusta(valores: List[float]) -> List[float]:
@@ -1133,6 +1152,30 @@ def _num_sem(val) -> int:
         return int(float(str(val).replace("Sem","").replace("Semana","").strip()))
     except (ValueError, TypeError):
         return 999
+
+
+def acotar_fechas_a_semanas_seleccionadas(
+    df: pd.DataFrame, semanas: List[str]
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Restringe los registros a la ventana calendario de la semana de archivo.
+
+    El nombre del CSV asigna ``SEMANA_DIM``; sin este paso una semana podía
+    contener registros con fechas de otras semanas al cambiar la gráfica a Día.
+    La operación considera lunes a lunes, ambos incluidos, como se maneja en el
+    cierre operativo (por ejemplo Sem 38 = 14 a 21 de septiembre de 2026).
+    """
+    if df.empty or not semanas or "_datetime_parsed" not in df.columns:
+        return df, []
+
+    fechas = pd.to_datetime(df["_datetime_parsed"], errors="coerce").dt.normalize()
+    mascara = pd.Series(False, index=df.index)
+    etiquetas: List[str] = []
+    for semana in sorted({_num_sem(s) for s in semanas if _num_sem(s) != 999}):
+        inicio = pd.Timestamp(datetime.fromisocalendar(ANIO_BASE_ESTRICTO, semana, 1))
+        fin = inicio + pd.Timedelta(days=7)  # lunes siguiente, incluido
+        mascara |= fechas.between(inicio, fin, inclusive="both")
+        etiquetas.append(f"Sem {semana}: {inicio:%d/%m}–{fin:%d/%m}")
+    return df.loc[mascara].copy(), etiquetas
 
 
 def generar_figura_evolucion_temporal(
@@ -3106,7 +3149,15 @@ def main():
     sel_sems   = st.sidebar.multiselect(
         f"Semana: ({len(sems_disp)} disponibles)", sems_disp, key="f_sem"
     )
-    if sel_sems: df_t = df_t[df_t["SEMANA_DIM"].isin(sel_sems)]
+    if sel_sems:
+        # Primero se identifica el cierre semanal y enseguida se valida la fecha
+        # real de cada orden. Así, en la vista Día, Sem 38 sólo puede mostrar
+        # 14–21 de septiembre; productividad y días-cuadrilla usan ese mismo
+        # subconjunto, además de Distrito y Póliza seleccionados más abajo.
+        df_t = df_t[df_t["SEMANA_DIM"].isin(sel_sems)]
+        df_t, rangos_semana = acotar_fechas_a_semanas_seleccionadas(df_t, sel_sems)
+        if rangos_semana:
+            st.sidebar.caption("Fechas operativas: " + " · ".join(rangos_semana))
 
     # ── 3. PÓLIZA ─────────────────────────────────────────────────────────────
     pols_disp   = sorted([k for k in df_t["Codigo_Poliza"].dropna().unique() if k in MAPEO_POLIZAS])
