@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 15.0.0-MASTER
+# Archivo: app.py | Versión: 15.0.2-DIAS-CUADRILLA-FECHA-TERMINO
 # ==============================================================================
 
 import os
@@ -63,7 +63,7 @@ GITHUB_RAW_BASE_SOPORTE= f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITH
 ANIO_BASE_ESTRICTO: int       = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str           = "TOTALPLAY / OPERACIONES — REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str          = "15.0.0-MASTER"
+VERSION_SISTEMA: str          = "15.0.1-PRODUCTIVIDAD-DINAMICA"
 
 # Tipos elegibles para denominador de efectividad y para el cálculo de productividad
 TIPOS_ELEGIBLES_EFECTIVIDAD = frozenset(["INSTALACION", "INSTALACIÓN", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO"])
@@ -1046,29 +1046,45 @@ def calcular_dias_cuadrilla_ponderados(
     dias_activos: Optional[int] = None,
 ) -> int:
     """
-    Días-Cuadrilla = suma de días reales trabajados por cada cuadrilla.
+    Días-Cuadrilla = suma de días reales CON EVENTOS COMPLETADOS por cuadrilla.
 
-    Al filtrar un Distrito, Empresa o Usuario se recalcula sobre ese mismo
-    subconjunto. Ejemplo: un usuario con órdenes en 6 días aporta 6, aunque la
-    semana tenga 7 días calendario. En una semana completa, si 62 cuadrillas
-    trabajaron los 7 días, el resultado es 62 × 7 = 434.
+    La fecha operativa se toma exclusivamente de Fecha término. La dimensión
+    seleccionada (Día/Semana/Mes/Año) sólo agrupa la visualización y nunca
+    agrega días calendario sin actividad.
+
+    Ejemplo: 1 técnico, 12 eventos completados en 4 fechas de término distintas
+    => Días-Cuadrilla = 4 y Productividad = 12 / 4 = 3.00.
+
+    _datetime_parsed corresponde a Fecha creación y NO interviene aquí.
     """
     if df.empty or col_usuario not in df.columns:
         return 0
 
     jornadas = df[[col_usuario]].copy()
-    # El parquet conserva la fecha parseada. Se usa antes que FECHA_TRUNCADA
-    # para evitar depender del texto mostrado en tablas o gráficas.
-    if "_datetime_parsed" in df.columns:
-        fechas = pd.to_datetime(df["_datetime_parsed"], errors="coerce")
-    else:
-        fechas = pd.Series(pd.NaT, index=df.index)
-    if fechas.isna().all() and col_fecha in df.columns:
+
+    # Fuente primaria: la MISMA fecha operativa que usa la gráfica diaria.
+    # FECHA_TRUNCADA se construye desde Fecha término, por lo que el KPI y
+    # la gráfica quedan obligatoriamente alineados. Si la gráfica muestra
+    # actividad en 4 fechas, una cuadrilla no puede aportar 7 días al KPI.
+    fechas = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    if col_fecha in df.columns:
         fechas = pd.to_datetime(df[col_fecha], format="%d.%m.%Y", errors="coerce")
-        if fechas.isna().all():
-            fechas = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce")
+        fechas_alt = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce")
+        fechas = fechas.fillna(fechas_alt)
+
+    # Fallback fila por fila a Fecha término parseada.
+    if "_datetime_termino" in df.columns:
+        fechas_termino = pd.to_datetime(df["_datetime_termino"], errors="coerce")
+        fechas = fechas.fillna(fechas_termino)
+
+    # Último fallback: dimensión de productividad, también derivada de Fecha término.
+    if "Fecha_Productividad" in df.columns:
+        fechas_prod = pd.to_datetime(df["Fecha_Productividad"], errors="coerce")
+        fechas = fechas.fillna(fechas_prod)
+
     if fechas.isna().all():
         return 0
+
     jornadas["_fecha_operativa"] = fechas.dt.normalize()
     jornadas[col_usuario] = jornadas[col_usuario].astype(str).str.strip()
     jornadas = jornadas[
@@ -1078,6 +1094,9 @@ def calcular_dias_cuadrilla_ponderados(
     ]
     if jornadas.empty:
         return 0
+
+    # Una cuadrilla aporta como máximo 1 día por cada fecha término distinta,
+    # aunque haya completado varias OTs ese mismo día.
     return int(jornadas.drop_duplicates([col_usuario, "_fecha_operativa"]).shape[0])
 
 
@@ -1135,16 +1154,14 @@ def extraer_metricas_kpi_totales(
     df_raw_completo se reserva para futuras comparativas; el cálculo
     de productividad opera sobre el subconjunto filtrado.
 
-    POR DÍA  : Eventos / Técnicos
-    POR SEMANA: Eventos / (Cuadrillas activas × 7 días)
-    POR MES  : Eventos / (Técnicos × días del mes calendario)
-    POR AÑO  : Eventos / (Técnicos × días del año)
+    Regla única para Día / Semana / Mes / Año:
+      Días-Cuadrilla = combinaciones únicas (Técnico, Fecha término)
+      con al menos un evento completado dentro del resultado filtrado.
 
-    Tarjeta "Dias Cuadrilla" muestra:
-      - SEMANA: cuadrillas activas × 7 días por cada semana seleccionada
-      - MES   : días del mes calendario
-      - DÍA   : 1
-      - AÑO   : 365/366
+      Productividad / Día = Eventos completados únicos / Días-Cuadrilla.
+
+    La dimensión temporal sólo agrupa la visualización; no agrega días
+    calendario sin actividad.
     """
     # Numerador único para todo el módulo: eventos/folios completados únicos
     # después de Semana, Distrito, Empresa, Póliza y Técnico.
@@ -1256,8 +1273,8 @@ def generar_figura_evolucion_temporal(
             vals_ev.append(float(ev))  # total eventos
 
         dias_cuad = calcular_capacidad_cuadrilla(
-            # En la gráfica cada punto se calcula por su propia dimensión:
-            # un día = 1 día, una semana = 7 y un mes = sus días calendario.
+            # Cada punto usa sólo días-cuadrilla con eventos completados,
+            # calculados por Fecha término dentro de su propio período.
             grupo, dimension_temporal
         )
         prod_val = round(ev / dias_cuad, 2) if dias_cuad > 0 else 0.0
@@ -2565,14 +2582,25 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             .size().reset_index(name="Reincidencias")
         )
 
-        # Paleta de colores rotativa para los tipos
-        colores_tipos = [
-            PALETA_COLOR["naranja_desierto"], PALETA_COLOR["turquesa_cyan"],
-            PALETA_COLOR["amarillo_sol"],     PALETA_COLOR["verde_montana"],
-            PALETA_COLOR["azul_marina"],      "#A78BFA", "#F43F5E", "#06B6D4"
-        ]
+        # Paleta semántica estable: un mismo tipo conserva el mismo color
+        # aunque cambien filtros, semanas o categorías visibles.
+        colores_semanticos_rein = {
+            "SOPORTE":             PALETA_COLOR["naranja_desierto"],
+            "INSTALACION":         PALETA_COLOR["azul_marina"],
+            "INSTALACIÓN":         PALETA_COLOR["azul_marina"],
+            "CAMBIO DE EQUIPO":    "#F43F5E",
+            "CAMBIO DE DOMICILIO": PALETA_COLOR["verde_montana"],
+            "RECOLECCION PI":      "#A78BFA",
+            "RECOLECCIÓN PI":      "#A78BFA",
+        }
         tipos_unicos = sorted(df_graf_agg["_TIPO_REIN"].unique())
-        mapa_color   = {t: colores_tipos[i % len(colores_tipos)] for i, t in enumerate(tipos_unicos)}
+        mapa_color = {
+            t: colores_semanticos_rein.get(
+                str(t).strip().upper(),
+                PALETA_COLOR["turquesa_cyan"]
+            )
+            for t in tipos_unicos
+        }
 
         fig_rein = go.Figure()
         for tipo in tipos_unicos:
