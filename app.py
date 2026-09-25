@@ -1823,10 +1823,11 @@ def renderizar_pestana_polizas_cuadrillas(
         df_folios, df_raw, dimension_sel, semanas_filtradas, meses_filtrados
     )
 
-    sub_tab1, sub_tab2, sub_tab3 = st.tabs([
+    sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
         "Evolución y Productividad",
         "Desglose por Pólizas",
         "Ranking de Cuadrillas / Técnicos",
+        "Carga de Eventos",
     ])
 
     # --- SUBTAB 1: EVOLUCIÓN & PRODUCTIVIDAD ---
@@ -2060,7 +2061,7 @@ def renderizar_pestana_polizas_cuadrillas(
                     )
                     df_resumen_pol["Balance"] = df_resumen_pol["Vivo"] - df_resumen_pol["Sugerido"]
 
-                    st.markdown("#### Resumen por póliza")
+                    st.markdown("<h4 style='color:#FFFFFF !important; margin:8px 0 2px 0;'>Resumen por póliza</h4>", unsafe_allow_html=True)
                     st.caption("Formato: **Vivo / Sugerido**. El balance positivo indica cuadrillas disponibles por encima de la meta.")
                     tarjetas = st.columns(len(df_resumen_pol))
                     for tarjeta, (_, fila) in zip(tarjetas, df_resumen_pol.iterrows()):
@@ -2215,6 +2216,91 @@ def renderizar_pestana_polizas_cuadrillas(
                 df_rk.to_csv(index=False).encode("utf-8"),
                 "Ranking_Cuadrillas.csv","text/csv"
             )
+
+    # --- SUBTAB 4: CARGA DE EVENTOS ---
+    with sub_tab4:
+        st.markdown("### Carga de Eventos por Póliza")
+        st.caption("Eventos asignados, completados y participación de MTTO con filtros independientes del sidebar.")
+
+        if not df_raw.empty and "SEMANA_DIM" in df_raw.columns:
+            sems_carga = sorted(df_raw["SEMANA_DIM"].dropna().unique(), key=_num_sem)
+            sem_def_carga = [sems_carga[-1]] if sems_carga else []
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            with cc1:
+                sem_sel_carga = st.multiselect("Semana:", sems_carga, default=sem_def_carga, key="carga_sem_sel")
+            with cc2:
+                dist_sel_carga = st.multiselect("Distrito:", sorted(df_raw["Distrito"].dropna().unique()), key="carga_dist_sel")
+            with cc3:
+                emp_sel_carga = st.multiselect("Empresa / Proveedor:", sorted(df_raw["Empresa"].dropna().unique()), key="carga_emp_sel")
+            with cc4:
+                pols_carga = sorted([p for p in df_raw["Codigo_Poliza"].dropna().unique() if p in MAPEO_POLIZAS])
+                pol_sel_carga = st.multiselect("Póliza:", pols_carga, key="carga_pol_sel")
+
+            df_carga = df_raw.copy()
+            if sem_sel_carga: df_carga = df_carga[df_carga["SEMANA_DIM"].isin(sem_sel_carga)]
+            if dist_sel_carga: df_carga = df_carga[df_carga["Distrito"].isin(dist_sel_carga)]
+            if emp_sel_carga: df_carga = df_carga[df_carga["Empresa"].isin(emp_sel_carga)]
+            if pol_sel_carga: df_carga = df_carga[df_carga["Codigo_Poliza"].isin(pol_sel_carga)]
+
+            if df_carga.empty:
+                st.info("Sin eventos para los filtros seleccionados.")
+            else:
+                df_carga["_COMPLETADO"] = False
+                if "Estatus_Registro" in df_carga.columns:
+                    df_carga["_COMPLETADO"] = df_carga["Estatus_Registro"].astype(str).str.upper().str.contains(
+                        r"TERMINAD|COMPLET|CERRAD", regex=True, na=False
+                    )
+                if "_datetime_termino" in df_carga.columns:
+                    df_carga["_COMPLETADO"] = df_carga["_COMPLETADO"] | pd.to_datetime(
+                        df_carga["_datetime_termino"], errors="coerce"
+                    ).notna()
+                df_carga["_ES_MTTO"] = df_carga["Codigo_Poliza"].eq("MT")
+
+                df_carga_pol = (
+                    df_carga.groupby(["Distrito", "Empresa", "Codigo_Poliza", "Nombre_Poliza"], observed=True)
+                    .agg(
+                        Asignados=("FOLIO_KEY", "nunique"),
+                        Completados=("_COMPLETADO", "sum"),
+                        Completados_MTTO=("_ES_MTTO", lambda s: int((s & df_carga.loc[s.index, "_COMPLETADO"]).sum())),
+                    )
+                    .reset_index()
+                    .rename(columns={"Codigo_Poliza": "Póliza", "Nombre_Poliza": "Modalidad", "Completados_MTTO": "MTTO completados"})
+                )
+                df_carga_pol["% completado"] = np.where(
+                    df_carga_pol["Asignados"] > 0,
+                    np.round(df_carga_pol["Completados"] / df_carga_pol["Asignados"] * 100, 1), 0.0
+                )
+
+                resumen_carga = (
+                    df_carga_pol.groupby("Póliza", observed=True)
+                    .agg(Asignados=("Asignados", "sum"), Completados=("Completados", "sum"), MTTO=("MTTO completados", "sum"))
+                    .reset_index().sort_values("Póliza")
+                )
+                st.markdown("<h4 style='color:#FFFFFF !important; margin:8px 0 2px 0;'>Carga por póliza</h4>", unsafe_allow_html=True)
+                st.caption("Formato: **Asignados / Completados** · MTTO indica los completados pertenecientes a la póliza MT.")
+                cards_carga = st.columns(len(resumen_carga))
+                for card, (_, fila) in zip(cards_carga, resumen_carga.iterrows()):
+                    mtto_txt = f"MTTO: {int(fila['MTTO'])}" if fila["Póliza"] == "MT" else ""
+                    card.markdown(f"""
+                    <div style="border:1px solid #26354D;border-radius:8px;padding:8px 10px;background:#101A2E;min-height:82px;">
+                        <div style="font-size:13px;color:#CBD5E1;font-weight:700;">Póliza {fila['Póliza']}</div>
+                        <div style="font-size:24px;line-height:1.15;color:#00D2C8;font-weight:800;">{int(fila['Asignados'])} <span style="font-size:16px;">/ {int(fila['Completados'])}</span></div>
+                        <div style="font-size:12px;color:#FBBF24;font-weight:700;">{mtto_txt}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                st.dataframe(
+                    df_carga_pol[["Distrito", "Empresa", "Póliza", "Modalidad", "Asignados", "Completados", "MTTO completados", "% completado"]],
+                    use_container_width=True, hide_index=True, height=500,
+                    column_config={"% completado": st.column_config.NumberColumn(format="%.1f%%")},
+                )
+                st.download_button(
+                    "Descargar carga de eventos (CSV)",
+                    df_carga_pol.to_csv(index=False).encode("utf-8"),
+                    "Carga_Eventos_Poliza.csv", "text/csv", key="dl_carga_eventos_poliza",
+                )
+        else:
+            st.info("Sin datos disponibles en el repositorio.")
 
 
 
