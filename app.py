@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 15.0.2-DIAS-CUADRILLA-FECHA-TERMINO
+# Archivo: app.py | Versión: 15.0.0-MASTER
 # ==============================================================================
 
 import os
@@ -63,7 +63,7 @@ GITHUB_RAW_BASE_SOPORTE= f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITH
 ANIO_BASE_ESTRICTO: int       = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str           = "TOTALPLAY / OPERACIONES — REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str          = "15.0.1-PRODUCTIVIDAD-DINAMICA"
+VERSION_SISTEMA: str          = "15.0.0-MASTER"
 
 # Tipos elegibles para denominador de efectividad y para el cálculo de productividad
 TIPOS_ELEGIBLES_EFECTIVIDAD = frozenset(["INSTALACION", "INSTALACIÓN", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO"])
@@ -1046,45 +1046,29 @@ def calcular_dias_cuadrilla_ponderados(
     dias_activos: Optional[int] = None,
 ) -> int:
     """
-    Días-Cuadrilla = suma de días reales CON EVENTOS COMPLETADOS por cuadrilla.
+    Días-Cuadrilla = suma de días reales trabajados por cada cuadrilla.
 
-    La fecha operativa se toma exclusivamente de Fecha término. La dimensión
-    seleccionada (Día/Semana/Mes/Año) sólo agrupa la visualización y nunca
-    agrega días calendario sin actividad.
-
-    Ejemplo: 1 técnico, 12 eventos completados en 4 fechas de término distintas
-    => Días-Cuadrilla = 4 y Productividad = 12 / 4 = 3.00.
-
-    _datetime_parsed corresponde a Fecha creación y NO interviene aquí.
+    Al filtrar un Distrito, Empresa o Usuario se recalcula sobre ese mismo
+    subconjunto. Ejemplo: un usuario con órdenes en 6 días aporta 6, aunque la
+    semana tenga 7 días calendario. En una semana completa, si 62 cuadrillas
+    trabajaron los 7 días, el resultado es 62 × 7 = 434.
     """
     if df.empty or col_usuario not in df.columns:
         return 0
 
     jornadas = df[[col_usuario]].copy()
-
-    # Fuente primaria: la MISMA fecha operativa que usa la gráfica diaria.
-    # FECHA_TRUNCADA se construye desde Fecha término, por lo que el KPI y
-    # la gráfica quedan obligatoriamente alineados. Si la gráfica muestra
-    # actividad en 4 fechas, una cuadrilla no puede aportar 7 días al KPI.
-    fechas = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
-    if col_fecha in df.columns:
+    # El parquet conserva la fecha parseada. Se usa antes que FECHA_TRUNCADA
+    # para evitar depender del texto mostrado en tablas o gráficas.
+    if "_datetime_parsed" in df.columns:
+        fechas = pd.to_datetime(df["_datetime_parsed"], errors="coerce")
+    else:
+        fechas = pd.Series(pd.NaT, index=df.index)
+    if fechas.isna().all() and col_fecha in df.columns:
         fechas = pd.to_datetime(df[col_fecha], format="%d.%m.%Y", errors="coerce")
-        fechas_alt = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce")
-        fechas = fechas.fillna(fechas_alt)
-
-    # Fallback fila por fila a Fecha término parseada.
-    if "_datetime_termino" in df.columns:
-        fechas_termino = pd.to_datetime(df["_datetime_termino"], errors="coerce")
-        fechas = fechas.fillna(fechas_termino)
-
-    # Último fallback: dimensión de productividad, también derivada de Fecha término.
-    if "Fecha_Productividad" in df.columns:
-        fechas_prod = pd.to_datetime(df["Fecha_Productividad"], errors="coerce")
-        fechas = fechas.fillna(fechas_prod)
-
+        if fechas.isna().all():
+            fechas = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce")
     if fechas.isna().all():
         return 0
-
     jornadas["_fecha_operativa"] = fechas.dt.normalize()
     jornadas[col_usuario] = jornadas[col_usuario].astype(str).str.strip()
     jornadas = jornadas[
@@ -1094,9 +1078,6 @@ def calcular_dias_cuadrilla_ponderados(
     ]
     if jornadas.empty:
         return 0
-
-    # Una cuadrilla aporta como máximo 1 día por cada fecha término distinta,
-    # aunque haya completado varias OTs ese mismo día.
     return int(jornadas.drop_duplicates([col_usuario, "_fecha_operativa"]).shape[0])
 
 
@@ -1154,14 +1135,16 @@ def extraer_metricas_kpi_totales(
     df_raw_completo se reserva para futuras comparativas; el cálculo
     de productividad opera sobre el subconjunto filtrado.
 
-    Regla única para Día / Semana / Mes / Año:
-      Días-Cuadrilla = combinaciones únicas (Técnico, Fecha término)
-      con al menos un evento completado dentro del resultado filtrado.
+    POR DÍA  : Eventos / Técnicos
+    POR SEMANA: Eventos / (Cuadrillas activas × 7 días)
+    POR MES  : Eventos / (Técnicos × días del mes calendario)
+    POR AÑO  : Eventos / (Técnicos × días del año)
 
-      Productividad / Día = Eventos completados únicos / Días-Cuadrilla.
-
-    La dimensión temporal sólo agrupa la visualización; no agrega días
-    calendario sin actividad.
+    Tarjeta "Dias Cuadrilla" muestra:
+      - SEMANA: cuadrillas activas × 7 días por cada semana seleccionada
+      - MES   : días del mes calendario
+      - DÍA   : 1
+      - AÑO   : 365/366
     """
     # Numerador único para todo el módulo: eventos/folios completados únicos
     # después de Semana, Distrito, Empresa, Póliza y Técnico.
@@ -1273,8 +1256,8 @@ def generar_figura_evolucion_temporal(
             vals_ev.append(float(ev))  # total eventos
 
         dias_cuad = calcular_capacidad_cuadrilla(
-            # Cada punto usa sólo días-cuadrilla con eventos completados,
-            # calculados por Fecha término dentro de su propio período.
+            # En la gráfica cada punto se calcula por su propia dimensión:
+            # un día = 1 día, una semana = 7 y un mes = sus días calendario.
             grupo, dimension_temporal
         )
         prod_val = round(ev / dias_cuad, 2) if dias_cuad > 0 else 0.0
@@ -2003,7 +1986,7 @@ def renderizar_pestana_polizas_cuadrillas(
             "Filtros independientes del sidebar. "
             "Vivo = cuadrillas únicas (técnicos únicos con actividad en la combinación "
             "Distrito × Empresa × Póliza para la semana seleccionada). "
-            "Balance = Sugerido − Vivo."
+            "Balance = Vivo − Sugerido."
         )
 
         if not df_raw.empty and "SEMANA_DIM" in df_raw.columns:
@@ -2054,32 +2037,102 @@ def renderizar_pestana_polizas_cuadrillas(
                 if clave_sug not in st.session_state:
                     st.session_state[clave_sug] = {}
 
-                col_tbl, col_sug = st.columns([0.72, 0.28])
-                with col_sug:
-                    st.markdown("**Cuadrillas Sugeridas**")
-                    st.caption("Meta por Distrito · Empresa · Póliza.")
-                    for _, row in df_base_pol.iterrows():
-                        fila_key  = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
-                        val_prev  = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
+                with st.popover("Configurar cuadrillas sugeridas", use_container_width=True):
+                    st.markdown("**Metas sugeridas por proveedor**")
+                    st.caption("Selecciona un proveedor y captura todas sus pólizas disponibles en el período filtrado.")
+                    empresas_sug = sorted(df_base_pol["Empresa"].dropna().unique().tolist())
+                    empresa_sug_sel = st.radio(
+                        "Proveedor",
+                        empresas_sug,
+                        horizontal=True,
+                        key="empresa_sugeridos_poliza",
+                    )
+                    filas_empresa_sug = df_base_pol[df_base_pol["Empresa"] == empresa_sug_sel]
+                    for _, row in filas_empresa_sug.iterrows():
+                        fila_key = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
+                        val_prev = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
                         nuevo_val = st.number_input(
-                            f"{row['Distrito'][:10]} · {row['Empresa'][:12]} · {row['Nomenclatura']}",
-                            min_value=0, value=val_prev,
-                            key=f"sug_{fila_key}", label_visibility="visible"
+                            f"{row['Nomenclatura']} · {row['Modalidad']} · {row['Distrito']}",
+                            min_value=0,
+                            value=val_prev,
+                            key=f"sug_{fila_key}",
                         )
                         st.session_state[clave_sug][fila_key] = nuevo_val
 
-                with col_tbl:
+                with st.container():
                     def _get_sug(row):
                         k = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
                         return st.session_state[clave_sug].get(k, int(row["Vivo"]))
 
                     df_base_pol["Sugerido"] = df_base_pol.apply(_get_sug, axis=1)
-                    df_base_pol["Balance"]  = df_base_pol["Sugerido"] - df_base_pol["Vivo"]
+                    # Un balance positivo representa cuadrillas vivas por encima de la sugerencia.
+                    df_base_pol["Balance"]  = df_base_pol["Vivo"] - df_base_pol["Sugerido"]
 
                     def _color_balance(val):
                         if val < 0:  return "color:#EF4444;font-weight:700;"
                         if val == 0: return "color:#FBBF24;font-weight:700;"
                         return "color:#10B981;font-weight:700;"
+
+                    # Resumen ejecutivo por póliza: Vivo / Sugerido y su balance total.
+                    df_resumen_pol = (
+                        df_base_pol.groupby("Nomenclatura", observed=True)
+                        .agg(Vivo=("Vivo", "sum"), Sugerido=("Sugerido", "sum"), Eventos=("Eventos", "sum"))
+                        .reset_index()
+                        .sort_values("Nomenclatura")
+                    )
+                    df_resumen_pol["Balance"] = df_resumen_pol["Vivo"] - df_resumen_pol["Sugerido"]
+
+                    st.markdown("#### Resumen por póliza")
+                    st.caption("Formato: **Vivo / Sugerido**. El balance positivo indica cuadrillas disponibles por encima de la meta.")
+                    for inicio in range(0, len(df_resumen_pol), 4):
+                        bloque = df_resumen_pol.iloc[inicio:inicio + 4]
+                        tarjetas = st.columns(4)
+                        for tarjeta, (_, fila) in zip(tarjetas, bloque.iterrows()):
+                            tarjeta.metric(
+                                label=f"Póliza {fila['Nomenclatura']}",
+                                value=f"{int(fila['Vivo'])} / {int(fila['Sugerido'])}",
+                                delta=f"Balance {int(fila['Balance']):+d}",
+                                delta_color="normal",
+                                help=f"{int(fila['Eventos'])} eventos en los filtros seleccionados.",
+                            )
+
+                    with st.popover("Ver detalle de técnicos y días trabajados", use_container_width=True):
+                        pol_detalle = st.selectbox(
+                            "Póliza a revisar",
+                            df_resumen_pol["Nomenclatura"].tolist(),
+                            key="poliza_detalle_tecnicos",
+                        )
+                        df_detalle_tecnicos = (
+                            df_pol_base[df_pol_base["Codigo_Poliza"] == pol_detalle]
+                            .groupby(["Usuario_Tecnico", "Distrito", "Empresa"], observed=True)
+                            .agg(
+                                Eventos=("FOLIO_KEY", "count"),
+                                Dias_Trabajados=("FECHA_TRUNCADA", "nunique"),
+                            )
+                            .reset_index()
+                            .sort_values(["Eventos", "Dias_Trabajados"], ascending=False)
+                            .rename(columns={"Usuario_Tecnico": "Técnico", "Dias_Trabajados": "Días trabajados"})
+                        )
+                        st.caption("El detalle respeta los filtros de semana, distrito, proveedor y póliza aplicados arriba.")
+                        st.dataframe(
+                            df_detalle_tecnicos,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Técnico": st.column_config.Column(width="medium", pinned=True),
+                                "Distrito": st.column_config.Column(width="small"),
+                                "Empresa": st.column_config.Column(width="medium"),
+                                "Eventos": st.column_config.NumberColumn(width="small"),
+                                "Días trabajados": st.column_config.NumberColumn(width="small"),
+                            },
+                        )
+                        st.download_button(
+                            "Descargar detalle de técnicos (CSV)",
+                            df_detalle_tecnicos.to_csv(index=False).encode("utf-8"),
+                            f"Detalle_Tecnicos_{pol_detalle}.csv",
+                            "text/csv",
+                            key="dl_detalle_tecnicos_poliza",
+                        )
 
                     df_show_pol = df_base_pol[
                         ["Distrito","Empresa","Nomenclatura","Modalidad","Sugerido","Vivo","Balance","Eventos"]
@@ -2582,25 +2635,9 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             .size().reset_index(name="Reincidencias")
         )
 
-        # Paleta semántica estable: un mismo tipo conserva el mismo color
-        # aunque cambien filtros, semanas o categorías visibles.
-        colores_semanticos_rein = {
-            "SOPORTE":             PALETA_COLOR["naranja_desierto"],
-            "INSTALACION":         PALETA_COLOR["azul_marina"],
-            "INSTALACIÓN":         PALETA_COLOR["azul_marina"],
-            "CAMBIO DE EQUIPO":    "#F43F5E",
-            "CAMBIO DE DOMICILIO": PALETA_COLOR["verde_montana"],
-            "RECOLECCION PI":      "#A78BFA",
-            "RECOLECCIÓN PI":      "#A78BFA",
-        }
         tipos_unicos = sorted(df_graf_agg["_TIPO_REIN"].unique())
-        mapa_color = {
-            t: colores_semanticos_rein.get(
-                str(t).strip().upper(),
-                PALETA_COLOR["turquesa_cyan"]
-            )
-            for t in tipos_unicos
-        }
+        # Misma identidad visual que Productividad: barras azul marina y tendencia turquesa.
+        mapa_color = {t: PALETA_COLOR["azul_marina"] for t in tipos_unicos}
 
         fig_rein = go.Figure()
         for tipo in tipos_unicos:
@@ -2617,7 +2654,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             fig_rein.add_trace(go.Scatter(
                 x=sub[dim_col], y=tend, name=f"Tendencia {tipo}",
                 mode="lines", showlegend=False,
-                line=dict(color=mapa_color[tipo], width=1.5, dash="dot"),
+                line=dict(color=PALETA_COLOR["turquesa_cyan"], width=1.5, dash="dot"),
             ))
 
         fig_rein.update_layout(
