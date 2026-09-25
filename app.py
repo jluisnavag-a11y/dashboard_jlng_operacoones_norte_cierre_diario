@@ -2037,28 +2037,6 @@ def renderizar_pestana_polizas_cuadrillas(
                 if clave_sug not in st.session_state:
                     st.session_state[clave_sug] = {}
 
-                with st.popover("Configurar cuadrillas sugeridas", use_container_width=True):
-                    st.markdown("**Metas sugeridas por proveedor**")
-                    st.caption("Selecciona un proveedor y captura todas sus pólizas disponibles en el período filtrado.")
-                    empresas_sug = sorted(df_base_pol["Empresa"].dropna().unique().tolist())
-                    empresa_sug_sel = st.radio(
-                        "Proveedor",
-                        empresas_sug,
-                        horizontal=True,
-                        key="empresa_sugeridos_poliza",
-                    )
-                    filas_empresa_sug = df_base_pol[df_base_pol["Empresa"] == empresa_sug_sel]
-                    for _, row in filas_empresa_sug.iterrows():
-                        fila_key = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
-                        val_prev = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
-                        nuevo_val = st.number_input(
-                            f"{row['Nomenclatura']} · {row['Modalidad']} · {row['Distrito']}",
-                            min_value=0,
-                            value=val_prev,
-                            key=f"sug_{fila_key}",
-                        )
-                        st.session_state[clave_sug][fila_key] = nuevo_val
-
                 with st.container():
                     def _get_sug(row):
                         k = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
@@ -2084,19 +2062,35 @@ def renderizar_pestana_polizas_cuadrillas(
 
                     st.markdown("#### Resumen por póliza")
                     st.caption("Formato: **Vivo / Sugerido**. El balance positivo indica cuadrillas disponibles por encima de la meta.")
-                    for inicio in range(0, len(df_resumen_pol), 4):
-                        bloque = df_resumen_pol.iloc[inicio:inicio + 4]
-                        tarjetas = st.columns(4)
-                        for tarjeta, (_, fila) in zip(tarjetas, bloque.iterrows()):
-                            tarjeta.metric(
-                                label=f"Póliza {fila['Nomenclatura']}",
-                                value=f"{int(fila['Vivo'])} / {int(fila['Sugerido'])}",
-                                delta=f"Balance {int(fila['Balance']):+d}",
-                                delta_color="normal",
-                                help=f"{int(fila['Eventos'])} eventos en los filtros seleccionados.",
+                    tarjetas = st.columns(len(df_resumen_pol))
+                    for tarjeta, (_, fila) in zip(tarjetas, df_resumen_pol.iterrows()):
+                        balance = int(fila["Balance"])
+                        color_balance = "#10B981" if balance > 0 else ("#EF4444" if balance < 0 else "#FBBF24")
+                        tarjeta.markdown(f"""
+                        <div style="border:1px solid #26354D;border-radius:8px;padding:8px 10px;background:#101A2E;min-height:82px;">
+                            <div style="font-size:13px;color:#CBD5E1;font-weight:700;">Póliza {fila['Nomenclatura']}</div>
+                            <div style="font-size:24px;line-height:1.15;color:#00D2C8;font-weight:800;">{int(fila['Vivo'])} <span style="font-size:16px;">/ {int(fila['Sugerido'])}</span></div>
+                            <div style="font-size:12px;color:{color_balance};font-weight:700;">Balance {balance:+d}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    empresas_sug = sorted(df_base_pol["Empresa"].dropna().unique().tolist())
+
+                    @st.dialog("Cuadrillas sugeridas por proveedor")
+                    def _dialog_sugeridos_poliza():
+                        st.caption("Selecciona el proveedor y captura todas sus pólizas disponibles dentro del período filtrado.")
+                        empresa_sug_sel = st.radio("Proveedor", empresas_sug, horizontal=True, key="empresa_sugeridos_poliza")
+                        filas_empresa_sug = df_base_pol[df_base_pol["Empresa"] == empresa_sug_sel]
+                        for _, row in filas_empresa_sug.iterrows():
+                            fila_key = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
+                            val_prev = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
+                            st.session_state[clave_sug][fila_key] = st.number_input(
+                                f"{row['Nomenclatura']} · {row['Modalidad']} · {row['Distrito']}",
+                                min_value=0, value=val_prev, key=f"sug_{fila_key}",
                             )
 
-                    with st.popover("Ver detalle de técnicos y días trabajados", use_container_width=True):
+                    @st.dialog("Detalle de técnicos y días trabajados")
+                    def _dialog_detalle_tecnicos():
                         pol_detalle = st.selectbox(
                             "Póliza a revisar",
                             df_resumen_pol["Nomenclatura"].tolist(),
@@ -2133,6 +2127,12 @@ def renderizar_pestana_polizas_cuadrillas(
                             "text/csv",
                             key="dl_detalle_tecnicos_poliza",
                         )
+
+                    boton_sug, boton_det = st.columns(2)
+                    if boton_sug.button("Configurar cuadrillas sugeridas", type="primary", use_container_width=True):
+                        _dialog_sugeridos_poliza()
+                    if boton_det.button("Ver detalle de técnicos y días trabajados", use_container_width=True):
+                        _dialog_detalle_tecnicos()
 
                     df_show_pol = df_base_pol[
                         ["Distrito","Empresa","Nomenclatura","Modalidad","Sugerido","Vivo","Balance","Eventos"]
