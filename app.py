@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 15.0.0-MASTER
+# Archivo: app.py | Versión: 15.2.0-PRODUCTIVIDAD-POLIZAS
 # ==============================================================================
 
 import os
@@ -52,38 +52,25 @@ HEADERS          = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN el
 GITHUB_API_URL   = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_FOLDER}?ref={GITHUB_BRANCH}"
 GITHUB_RAW_BASE  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER}"
 
-# Carpeta de ingresos de soporte (estructura separada, se integra al parquet consolidado)
-GITHUB_FOLDER_SOPORTE  = gh_cfg.get("folder_soporte", "ingreso_soporte")
-GITHUB_API_URL_SOPORTE = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{GITHUB_FOLDER_SOPORTE}?ref={GITHUB_BRANCH}"
-GITHUB_RAW_BASE_SOPORTE= f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{GITHUB_FOLDER_SOPORTE}"
-
 # ==============================================================================
 # 2. CONSTANTES GLOBALES
 # ==============================================================================
 ANIO_BASE_ESTRICTO: int       = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str           = "TOTALPLAY / OPERACIONES — REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str          = "15.0.0-MASTER"
+VERSION_SISTEMA: str          = "15.2.0-PRODUCTIVIDAD-POLIZAS"
 
 # Tipos elegibles para denominador de efectividad y para el cálculo de productividad
 TIPOS_ELEGIBLES_EFECTIVIDAD = frozenset(["INSTALACION", "INSTALACIÓN", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO"])
 
-# Pólizas válidas para el sistema (generación "25" = planta externa: excluida en pipeline)
-POLIZAS_VALIDAS: frozenset = frozenset(["D1","D6","E3","M3","M4","MT","R3"])
-# Pólizas excluidas por DEFAULT en filtros UI (el usuario puede activarlas manualmente)
-# La vista operativa parte de todas las pólizas, salvo MTTO PI.  R3 se conserva
-# porque también forma parte del volumen real cuando no se excluye expresamente.
-POLIZAS_DEFAULT_EXCLUIDAS: frozenset = frozenset(["MT"])
-
 MAPEO_POLIZAS: Dict[str, str] = {
-    "R3": "RECOLECCIÓN",
-    "E3": "PÓLIZA 3",
-    "M3": "MULTIDISTRITO",
-    "M4": "MULTIDISTRITO FLOTANTE",
-    "MT": "MTTO PI",
-    "D1": "DESTAJO",
-    "D6": "DESTAJO 6",
+    "R3": "RECOLECCIÓN", "E3": "PÓLIZA 3",
+    "M3": "MULTIDISTRITO", "M4": "MULTIDISTRITO FLOTANTE",
+    "MT": "MTTO PI", "D1": "DESTAJO", "D6": "MULTIDISTRITO FLOTANTE"
 }
+# D6 se reporta dentro de M4; las demás pólizas se conservan tal como vienen.
+POLIZAS_PRODUCTIVIDAD = frozenset(["D1", "D6", "E3", "M3", "M4", "MT", "R3"])
+NORMALIZACION_POLIZA = {"D6": "M4"}
 
 DESCRIPCION_POLIZAS: Dict[str, str] = {
     "R3": "Póliza de Recolección de Equipos y Terminado de Operaciones en Campo",
@@ -91,79 +78,7 @@ DESCRIPCION_POLIZAS: Dict[str, str] = {
     "M3": "Póliza Multi-Distrito Operativa asignada a Zonas Urbanas de Alta Densidad",
     "M4": "Póliza Multi-Distrito Flotante para Cuadrillas de Respaldo Inter-Zona",
     "MT": "Póliza de Mantenimiento PI separada del cálculo estándar de volumen",
-    "D1": "Póliza por Destajo asignada a Cuadrillas Contratistas Externas",
-    "D6": "Póliza por Destajo Tipo 6 para Cuadrillas Contratistas Especializadas",
-}
-
-# Proveedores excluidos permanentemente del sistema (ruido / planta ajena)
-PROVEEDORES_EXCLUIDOS: frozenset = frozenset([
-    "TOTALBOX","TOTALPLAY","ITAI",
-    # Variantes con sufijos numéricos (ej. "ITAI 3", "TOTALBOX 2") se detectan por contains
-])
-PREFIJOS_PROVEEDOR_EXCLUIDO: tuple = ("TOTALBOX","TOTALPLAY","ITAI")
-
-# Tipos de evento NO válidos cuando el cierre viene de póliza generación "25" (planta externa)
-TIPOS_EXCLUIDOS_POLIZA25: frozenset = frozenset([
-    "CIERRE","DETENCIONES","ETIQUETADO","GASA","POSTE",
-    "RED NUEVA","RUTA","TEN GIGA",
-])
-
-# Todos los tipos elegibles para conteo en el sistema (incluyendo los que homologan a INSTALACION)
-TIPOS_VALIDOS_SISTEMA: frozenset = frozenset([
-    "ADDON WIFI EXTENDER","ADDONS","CAMBIO DE DOMICILIO","CAMBIO DE EQUIPO",
-    "CAMBIO DE PLAN","EMPRESARIAL","FACTIBILIDAD","HALLAZGO EMPRESARIAL",
-    "INSTALACION","INSTALACIÓN",
-    "MANTENIMIENTO MAYOR","MANTENIMIENTO MENOR","MANTENIMIENTO PREVENTIVO",
-    "RECOLECCION EMPRESARIAL","RECOLECCIÓN EMPRESARIAL",
-    "RECOLECCION PI","RECOLECCIÓN PI",
-    "SOPORTE",
-    # Los siguientes solo para pólizas válidas (no-25)
-    "CIERRE","DETENCIONES","ETIQUETADO","GASA","POSTE","RED NUEVA","RUTA","TEN GIGA",
-])
-
-# Catálogo canónico de homologación de tipos.
-# Clave = valor tal como puede llegar del CSV (incluyendo variantes con
-# caracteres corruptos por encoding). Valor = forma canónica del sistema.
-# Catálogo de homologación de tipos — se aplica sobre str.upper().strip()
-# Por eso todas las claves están en mayúsculas.
-# El bloque de contains posterior cubre variantes residuales no listadas.
-HOMOLOGACION_TIPOS: Dict[str, str] = {
-    "SOPORTE":                      "SOPORTE",
-    "EMPRESARIAL":                  "EMPRESARIAL",
-    "CAMBIO DE EQUIPO":             "CAMBIO DE EQUIPO",
-    "CAMBIO DE DOMICILIO":          "CAMBIO DE DOMICILIO",
-    "CAMBIO DE PLAN":               "CAMBIO DE PLAN",
-    "ADDONS":                       "ADDONS",
-    "ADDON WIFI EXTENDER":          "ADDON WIFI EXTENDER",
-    "MANTENIMIENTO MENOR":          "MANTENIMIENTO MENOR",
-    "MANTENIMIENTO MAYOR":          "MANTENIMIENTO MAYOR",
-    "MANTENIMIENTO PREVENTIVO":     "MANTENIMIENTO PREVENTIVO",
-    "HALLAZGO EMPRESARIAL":         "HALLAZGO EMPRESARIAL",
-    "FACTIBILIDAD":                 "FACTIBILIDAD",
-    "CIERRE":                       "CIERRE",
-    "GASA":                         "GASA",
-    "ETIQUETADO":                   "ETIQUETADO",
-    "POSTE":                        "POSTE",
-    "DETENCIONES":                  "DETENCIONES",
-    "RUTA":                         "RUTA",
-    "TEN GIGA":                     "TEN GIGA",
-    "RED NUEVA":                    "RED NUEVA",
-    # Instalación — todas las variantes posibles de encoding
-    "INSTALACION":                  "INSTALACION",
-    "INSTALACIÓN":                  "INSTALACION",
-    "INSTALACIÃƒâ€šN": "INSTALACION",
-    "INSTALACI‚Ã‚Ã¶N": "INSTALACION",
-    "INSTALACI‚Äö√†√∂‚Äö√¢‚Ä¢N": "INSTALACION",
-    # Recolección PI
-    "RECOLECCION PI":               "RECOLECCION PI",
-    "RECOLECCIÓN PI":               "RECOLECCION PI",
-    "RECOLECCIÃƒâ€šN PI": "RECOLECCION PI",
-    "RECOLECCI‚Äö√†√∂‚Äö√¢‚Ä¢N PI": "RECOLECCION PI",
-    # Recolección Empresarial
-    "RECOLECCION EMPRESARIAL":      "RECOLECCION EMPRESARIAL",
-    "RECOLECCIÓN EMPRESARIAL":      "RECOLECCION EMPRESARIAL",
-    "RECOLECCIÃƒâ€šN EMPRESARIAL": "RECOLECCION EMPRESARIAL",
-    "RECOLECCI‚Äö√†√∂‚Äö√¢‚Ä¢N EMPRESARIAL": "RECOLECCION EMPRESARIAL",
+    "D1": "Póliza por Destajo asignada a Cuadrillas Contratistas Externas"
 }
 
 MAPEO_MESES_TEXTO: Dict[int, str] = {
@@ -190,8 +105,7 @@ LISTA_ALIAS_FALLA:    List[str] = ["falla","observaciones","descripcion"]
 LISTA_ALIAS_CAUSA:    List[str] = ["causa","motivo","subtipo","diagnostico"]
 LISTA_ALIAS_SOLUCION: List[str] = ["solucion","solución","solution","resolucion","resolución"]
 LISTA_ALIAS_ESTATUS:  List[str] = ["estatus","status","estado"]
-LISTA_ALIAS_LAT:      List[str] = ["latitud","latitude","lat","coordenada_y","coord_lat","y_coord"]
-LISTA_ALIAS_LON:      List[str] = ["longitud","longitude","lon","lng","coordenada_x","coord_lon","x_coord"]
+LISTA_ALIAS_POLIZA:   List[str] = ["poliza","póliza","codigo poliza","código póliza","cod poliza","cod_póliza"]
 
 PALETA_COLOR: Dict[str, str] = {
     "azul_noche":      "#0B192C",
@@ -225,7 +139,8 @@ class MetricasResumenKPI:
     total_eventos:      int
     total_usuarios:     int
     dias_operativos:    int
-    productividad_diaria: float
+    eventos_diarios_equipo: int
+    productividad_cuadrilla: float
     eventos_r3:         int
     eventos_mt:         int
 
@@ -247,6 +162,30 @@ def sanitizar_folio_identificador(val: Any) -> str:
         return "SIN_FOLIO"
     txt = re.sub(r"[^A-Z0-9\-_]", "", str(val).strip().upper())
     return txt if txt else "SIN_FOLIO"
+
+
+def normalizar_codigo_poliza(valor: Any) -> str:
+    """Devuelve un código válido; D6 se consolida operativamente como M4."""
+    codigo = sanitizar_folio_identificador(valor).replace("-", "")
+    if codigo in POLIZAS_PRODUCTIVIDAD:
+        return NORMALIZACION_POLIZA.get(codigo, codigo)
+    return ""
+
+
+def extraer_codigo_poliza(usuario: Any, poliza_explicita: Any = None) -> str:
+    """Prioriza una columna de póliza y, si no existe, busca un código real en Usuario.
+
+    Un identificador como XXX25XXXXXXXX se conserva íntegro como Usuario; 25 no se
+    interpreta como póliza porque no pertenece al catálogo autorizado.
+    """
+    directo = normalizar_codigo_poliza(poliza_explicita)
+    if directo:
+        return directo
+    texto = sanitizar_folio_identificador(usuario).replace("-", "")
+    for codigo in sorted(POLIZAS_PRODUCTIVIDAD, key=len, reverse=True):
+        if codigo in texto:
+            return NORMALIZACION_POLIZA.get(codigo, codigo)
+    return ""
 
 
 def extraer_numero_semana_archivo(nombre_archivo) -> Optional[int]:
@@ -310,63 +249,38 @@ def parsear_columna_fecha_robusta(serie_raw: pd.Series) -> pd.Series:
     return serie_res
 
 
-def aplicar_dimensiones_productividad(df: pd.DataFrame) -> pd.DataFrame:
-    """Construye las dimensiones operativas exclusivamente con Fecha término.
-
-    Fecha creación se conserva para medir la brecha de reincidencia; no se usa
-    para productividad, eventos completados ni sus filtros Día/Semana/Mes.
-    """
-    if df.empty:
-        return df
-    df = df.copy()
-    fecha_termino = (
-        pd.to_datetime(df["_datetime_termino"], errors="coerce")
-        if "_datetime_termino" in df.columns
-        else pd.Series(pd.NaT, index=df.index)
-    )
-    df["Fecha_Productividad"] = fecha_termino
-    semana_termino = pd.to_numeric(
-        fecha_termino.dt.isocalendar().week, errors="coerce"
-    ).fillna(0).astype(int)
-    df["Num_Semana_Productividad"] = semana_termino
-    df["SEMANA_DIM"] = semana_termino.apply(
-        lambda x: f"Sem {int(x)}" if x > 0 else "SIN_FECHA_TERMINO"
-    )
-    df["MES_DIM"] = fecha_termino.dt.month.map(MAPEO_MESES_TEXTO).fillna("SIN_FECHA_TERMINO")
-    df["FECHA_TRUNCADA"] = fecha_termino.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}").fillna("SIN_FECHA_TERMINO")
-    return df
-
-
-def filtrar_eventos_completados(df: pd.DataFrame) -> pd.DataFrame:
-    """Conserva sólo folios terminados con una Fecha término válida."""
-    if df.empty:
-        return df
-    salida = df.copy()
-    if "Estatus_Registro" in salida.columns:
-        estatus = salida["Estatus_Registro"].astype(str).str.upper()
-        salida = salida[estatus.str.contains(r"TERMINAD|COMPLET|CERRAD", regex=True, na=False)]
-    if "_datetime_termino" in salida.columns:
-        salida = salida[pd.to_datetime(salida["_datetime_termino"], errors="coerce").notna()]
-    return salida.copy()
-
-
 def _dias_calendario_para_periodo(dimension: str, valor_dim: str, df_grupo: pd.DataFrame) -> int:
     """
-    Dias con actividad real para el denominador de productividad de UN periodo.
-    SEMANA_DIM -> fechas unicas reales (1..7), sin cap artificial.
-    Si el archivo fue subido el martes, hay 2 dias y se divide entre 2.
+    Denominador calendario fijo para productividad. Las faltas reducen eventos,
+    no reducen días: día=1, semana=7 y mes=28..31 según su año real.
     """
     if dimension == "FECHA_TRUNCADA":
         return 1
-    if "FECHA_TRUNCADA" in df_grupo.columns:
-        dias_obs = int(df_grupo["FECHA_TRUNCADA"].nunique())
-        return max(1, dias_obs)
+    if dimension == "SEMANA_DIM":
+        return 7
     if dimension == "AÑO_DIM":
-        return 366 if calendar.isleap(ANIO_BASE_ESTRICTO) else 365
+        try:
+            anio = int(str(valor_dim))
+        except (ValueError, TypeError):
+            anio = ANIO_BASE_ESTRICTO
+        return 366 if calendar.isleap(anio) else 365
     if dimension == "MES_DIM":
+        fecha = pd.to_datetime(df_grupo.get("_datetime_parsed", pd.Series(dtype="datetime64[ns]")), errors="coerce").dropna()
+        if not fecha.empty:
+            return calendar.monthrange(int(fecha.iloc[0].year), int(fecha.iloc[0].month))[1]
         num_mes = MAPEO_MESES_NUM.get(str(valor_dim).strip().capitalize(), 1)
         return calendar.monthrange(ANIO_BASE_ESTRICTO, num_mes)[1]
     return 7
+
+
+def dias_calendario_de_seleccion(df: pd.DataFrame, dimension: str) -> int:
+    """Suma el denominador de cada período incluido por los filtros activos."""
+    if df.empty or dimension not in df.columns:
+        return 1
+    return max(1, sum(
+        _dias_calendario_para_periodo(dimension, valor, grupo)
+        for valor, grupo in df.groupby(dimension, observed=True)
+    ))
 
 
 # ==============================================================================
@@ -379,31 +293,18 @@ TIPOS_ANTECEDENTE_VALIDO = frozenset([
     "CAMBIO DE DOMICILIO","CAMBIO DE EQUIPO"
 ])
 
-# Fragmentos que identifican cada tipo elegible de forma robusta
-# (resisten variantes con encoding corrupto porque buscan subcadenas cortas)
-_FRAGS_SOPORTE     = ("SOPORTE",)
-_FRAGS_ANTECEDENTE = ("INSTALA", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO")
-
 
 def _tipo_es_soporte(tipo_str: str) -> bool:
     if pd.isna(tipo_str):
         return False
-    t = str(tipo_str).strip().upper()
-    return any(f in t for f in _FRAGS_SOPORTE)
+    return "SOPORTE" in str(tipo_str).upper()
 
 
 def _tipo_es_antecedente_valido(tipo_str: str) -> bool:
-    """
-    Devuelve True si el tipo del evento previo califica como antecedente.
-    Usa contains robusto (fragmentos cortos) en vez de comparación exacta,
-    para resistir variantes con encoding corrupto (ej: Instalaci‚àö‚â•n).
-    Elegibles: INSTALACION (cualquier variante), SOPORTE, CAMBIO DE DOMICILIO,
-               CAMBIO DE EQUIPO.
-    """
     if pd.isna(tipo_str):
         return False
     t = str(tipo_str).strip().upper()
-    return any(f in t for f in _FRAGS_ANTECEDENTE)
+    return any(elegible in t for elegible in TIPOS_ANTECEDENTE_VALIDO)
 
 
 def obtener_valor_tipo2(valor_causa, valor_tipo_orden) -> str:
@@ -422,180 +323,62 @@ def obtener_valor_tipo2(valor_causa, valor_tipo_orden) -> str:
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=2)
 def calcular_reincidencias_vectorizadas(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Motor de reincidencias — v2 corregido.
+    Motor de reincidencias enterprise.
 
-    Reglas de negocio exactas:
-
-    1. ORDEN: cronológico por fecha de creación del evento actual.
-
-    2. ES_REINCIDENCIA = SI cuando:
-       a) El evento actual es de tipo SOPORTE.
-       b) Existe algún antecedente previo en la misma cuenta cuyo tipo sea
-          elegible: INSTALACION, SOPORTE, CAMBIO DE DOMICILIO, CAMBIO DE EQUIPO.
-       c) La brecha entre la FECHA DE CIERRE del antecedente y la FECHA DE
-          CREACIÓN del Soporte actual es > 0 y <= 60 días.
-          (La instalación "falla" días después de cerrarse, no de crearse.)
-       d) Sin ambas fechas no se marca reincidencia: no hay aproximación por
-          semana ni por fecha de creación del antecedente.
-
-    3. CONTEO_PREVIO_8_SEM: número acumulado de reincidencias de esa cuenta
-       ANTERIORES a la posición actual (incluyendo eventos no reincidentes).
-       Ejemplo cuenta 142838878:
-         OT 34165545 Instalación → conteo=0 (no es reincidencia)
-         OT 35638804 Soporte     → conteo=1 (1ª reincidencia; brecha 52 días de instalación)
-         OT 37420992 Cambio Dom  → conteo=2 (no es reincidencia pero acumula 2)
-         OT 37805036 Soporte     → conteo=3 (2ª reincidencia; brecha del cambio domicilio)
-
-    4. TIPO_2: si causa del antecedente es N/A → usar Tipo_Orden del antecedente.
-
-    5. ID primario del técnico: código de usuario (antes del " | ").
+    Reglas: el soporte debe ser la visita inmediata posterior de la misma cuenta
+    y su antecedente puede ser instalación, soporte, cambio de domicilio o de
+    equipo. La secuencia se ordena por fecha de cierre y aplica una brecha máxima
+    de 60 días. Si la causa es NA, se muestra el tipo del antecedente.
     """
+    # Inicialización de columnas de salida
     df = df.copy()
     for col, val in [
-        ("ES_REINCIDENCIA",           "NO"),
-        ("CONTEO_PREVIO_8_SEM",       0),
-        ("Usuario_Origen_Reincidencia","N/A"),
-        ("Empresa_Origen_Reincidencia","N/A"),
+        ("ES_REINCIDENCIA", "NO"),
+        ("CONTEO_PREVIO_8_SEM", 0),
+        ("Usuario_Origen_Reincidencia", "N/A"),
+        ("Empresa_Origen_Reincidencia", "N/A"),
         ("Semana_Origen_Reincidencia", np.nan),
-        ("Causa_Origen",               "N/A"),
-        ("TIPO_2",                     "N/A"),
-        ("Falla_Nueva",                "N/A"),
-        ("ES_CASO_ESPECIAL",           "NO"),
+        ("Causa_Origen", "N/A"),
+        ("TIPO_2", "N/A"),
+        ("Falla_Nueva", "N/A"),
+        ("ES_CASO_ESPECIAL", "NO"),
+        ("Folio_Anterior", "N/A"),
+        ("Tipo_Anterior", "N/A"),
+        ("Fecha_Cierre_Anterior", pd.NaT),
+        ("Dias_Entre_Visitas", pd.NA),
     ]:
         df[col] = val
 
     if df.empty:
         return df
 
-    cols        = list(df.columns)
-    col_tech    = detectar_columna_por_patrones(cols, ["usuario_tecnico","tecnico","tech","usuario","atendio","nombre_tecnico"]) or "Usuario_Tecnico"
-    col_semana  = detectar_columna_por_patrones(cols, ["num_semana_archivo","semana","sem"]) or "Num_Semana_Archivo"
-    col_causa   = detectar_columna_por_patrones(cols, LISTA_ALIAS_CAUSA) or "Tipo_Orden"
-    col_falla   = detectar_columna_por_patrones(cols, LISTA_ALIAS_FALLA) or "Tipo_Orden"
-    col_empresa = detectar_columna_por_patrones(cols, LISTA_ALIAS_PROVEEDOR) or "Empresa"
-    col_tipo    = "Tipo_Orden" if "Tipo_Orden" in cols else col_causa
+    col_causa = "Causa_Registro" if "Causa_Registro" in df.columns else "Tipo_Orden"
+    col_falla = "Falla_Registro" if "Falla_Registro" in df.columns else "Tipo_Orden"
+    fecha_cierre = df.get("_datetime_termino", pd.Series(pd.NaT, index=df.index))
+    fecha_creacion = df.get("_datetime_parsed", pd.Series(pd.NaT, index=df.index))
+    df["_fecha_orden"] = fecha_cierre.fillna(fecha_creacion)
+    validas = df["Cuenta_Cliente"].notna() & ~df["Cuenta_Cliente"].astype(str).str.upper().isin(["SIN_CTA","SIN_FOLIO","NAN","NONE",""])
+    ordenadas = df.loc[validas & df["_fecha_orden"].notna()].sort_values(["Cuenta_Cliente","_fecha_orden","FOLIO_KEY"])
+    previas = ordenadas.groupby("Cuenta_Cliente", sort=False).shift()
+    dias = (ordenadas["_fecha_orden"].dt.normalize() - previas["_fecha_orden"].dt.normalize()).dt.days
+    cumple = ordenadas["Tipo_Orden"].map(_tipo_es_soporte) & previas["Tipo_Orden"].map(_tipo_es_antecedente_valido) & dias.between(0,60)
+    idx = ordenadas.index[cumple]
+    if len(idx):
+        df.loc[idx,"ES_REINCIDENCIA"] = "SI"
+        df.loc[idx,"CONTEO_PREVIO_8_SEM"] = 1
+        df.loc[idx,"Usuario_Origen_Reincidencia"] = previas.loc[idx,"Usuario_Tecnico"].fillna("SIN ESPECIFICAR")
+        df.loc[idx,"Empresa_Origen_Reincidencia"] = previas.loc[idx,"Empresa"].fillna("SIN EMPRESA")
+        df.loc[idx,"Semana_Origen_Reincidencia"] = previas.loc[idx,"Num_Semana_Archivo"]
+        df.loc[idx,"Folio_Anterior"] = previas.loc[idx,"FOLIO_KEY"]
+        df.loc[idx,"Tipo_Anterior"] = previas.loc[idx,"Tipo_Orden"]
+        df.loc[idx,"Fecha_Cierre_Anterior"] = previas.loc[idx,"_fecha_orden"]
+        df.loc[idx,"Dias_Entre_Visitas"] = dias.loc[idx].astype("Int64")
+        causa_previa = previas.loc[idx,col_causa]
+        df.loc[idx,"Causa_Origen"] = causa_previa.fillna("N/A")
+        df.loc[idx,"TIPO_2"] = [obtener_valor_tipo2(c,t) for c,t in zip(causa_previa,previas.loc[idx,"Tipo_Orden"])]
+        df.loc[idx,"Falla_Nueva"] = ordenadas.loc[idx,col_falla].fillna("N/A")
 
-    COL_PARSED  = "_datetime_parsed"   # fecha de creación parseada
-    COL_TERMINO = "_datetime_termino"  # fecha de cierre parseada
-    tiene_fechas_creacion = COL_PARSED  in df.columns
-    tiene_fechas_cierre   = COL_TERMINO in df.columns
-
-    df["_IDX_ORIG"] = range(len(df))
-    df["_SEM_TEMP"] = pd.to_numeric(df[col_semana], errors="coerce").fillna(0).astype(int)
-    df["_FECHA_CREACION_ORDEN"] = pd.to_datetime(
-        df[COL_PARSED], errors="coerce"
-    ) if tiene_fechas_creacion else pd.NaT
-
-    mask_cta = df["Cuenta_Cliente"].notna() & (
-        ~df["Cuenta_Cliente"].astype(str).str.upper().isin(["SIN_CTA","SIN_FOLIO","NAN","NONE",""])
-    )
-    df_valid = df[mask_cta].sort_values(
-        ["Cuenta_Cliente", "_FECHA_CREACION_ORDEN", "_IDX_ORIG"],
-        na_position="last",
-    ).copy()
-
-    # Resultados indexados por FOLIO_KEY
-    resultados: Dict[str, dict] = {}
-
-    for cuenta, g in df_valid.groupby("Cuenta_Cliente"):
-        registros  = g.to_dict("records")
-        n          = len(registros)
-        conteo_acc = 0   # reincidencias acumuladas hasta el evento i
-
-        for i in range(n):
-            reg_act   = registros[i]
-            key_act   = reg_act.get("FOLIO_KEY")
-            tipo_act  = str(reg_act.get(col_tipo, "")).strip().upper()
-            es_soporte = _tipo_es_soporte(tipo_act)
-
-            # Guardar el conteo acumulado ANTES de procesar este evento
-            resultados[key_act] = {
-                "CONTEO": conteo_acc,
-                "ES_REIN": "NO",
-                "Usuario_Origen":  "N/A",
-                "Empresa_Origen":  "N/A",
-                "Semana_Origen":   np.nan,
-                "Causa_Origen":    "N/A",
-                "TIPO_2":          "N/A",
-                "Falla_Nueva":     "N/A",
-            }
-
-            if not es_soporte or i == 0:
-                continue
-
-            # Buscar antecedente elegible más reciente hacia atrás
-            reg_prev = None
-            for j in range(i - 1, -1, -1):
-                t_prev = str(registros[j].get(col_tipo, "")).strip().upper()
-                if _tipo_es_antecedente_valido(t_prev):
-                    reg_prev = registros[j]
-                    break
-
-            if reg_prev is None:
-                continue
-
-            # -------------------------------------------------------
-            # Brecha: fecha_cierre_antecedente → fecha_creacion_actual
-            # -------------------------------------------------------
-            es_rein = False
-            semana_origen = reg_prev.get("_SEM_TEMP", np.nan)
-
-            if tiene_fechas_creacion and tiene_fechas_cierre:
-                f_cierre_prev = reg_prev.get(COL_TERMINO)   # cierre del antecedente
-                f_crear_act   = reg_act.get(COL_PARSED)     # creación del soporte actual
-                if pd.notna(f_cierre_prev) and pd.notna(f_crear_act):
-                    delta_d = (pd.Timestamp(f_crear_act) - pd.Timestamp(f_cierre_prev)).days
-                    es_rein = (0 < delta_d <= 60)
-
-            if not es_rein:
-                continue
-
-            # ---- Es reincidencia ----
-            conteo_acc += 1   # incrementar ANTES de guardar en este evento
-
-            tech_prev = str(reg_prev.get(col_tech, "SIN ESPECIFICAR"))
-            if tech_prev.upper() in ["NAN","NONE","","N/A","NULL"]:
-                tech_prev = "SIN ESPECIFICAR"
-            emp_prev = str(reg_prev.get(col_empresa, "SIN EMPRESA"))
-            if emp_prev.upper() in ["NAN","NONE","","N/A","NULL"]:
-                emp_prev = "SIN EMPRESA"
-
-            causa_raw = reg_prev.get(col_causa)
-            tipo_raw  = reg_prev.get(col_tipo)
-
-            resultados[key_act].update({
-                "CONTEO":         conteo_acc,
-                "ES_REIN":        "SI",
-                "Usuario_Origen": tech_prev,
-                "Empresa_Origen": emp_prev,
-                "Semana_Origen":  semana_origen,
-                "Causa_Origen":   str(causa_raw) if pd.notna(causa_raw) else "N/A",
-                "TIPO_2":         obtener_valor_tipo2(causa_raw, tipo_raw),
-                "Falla_Nueva":    str(reg_act.get(col_falla, "N/A")),
-            })
-
-    # Asignar resultados al DataFrame original
-    if resultados:
-        folio_series = df["FOLIO_KEY"]
-        df["CONTEO_PREVIO_8_SEM"]        = folio_series.map(lambda k: resultados.get(k,{}).get("CONTEO", 0))
-        df["ES_REINCIDENCIA"]            = folio_series.map(lambda k: resultados.get(k,{}).get("ES_REIN","NO"))
-        mask_r = df["ES_REINCIDENCIA"] == "SI"
-        if mask_r.any():
-            for dest, campo in [
-                ("Usuario_Origen_Reincidencia", "Usuario_Origen"),
-                ("Empresa_Origen_Reincidencia", "Empresa_Origen"),
-                ("Causa_Origen",                "Causa_Origen"),
-                ("TIPO_2",                      "TIPO_2"),
-                ("Falla_Nueva",                 "Falla_Nueva"),
-            ]:
-                df.loc[mask_r, dest] = folio_series[mask_r].map(
-                    lambda k, c=campo: resultados.get(k, {}).get(c, "N/A")
-                )
-            df.loc[mask_r, "Semana_Origen_Reincidencia"] = folio_series[mask_r].map(
-                lambda k: resultados.get(k, {}).get("Semana_Origen", np.nan)
-            )
-
-    df.drop(columns=["_IDX_ORIG","_SEM_TEMP","_FECHA_CREACION_ORDEN"], errors="ignore", inplace=True)
+    df.drop(columns=["_fecha_orden"], errors="ignore", inplace=True)
     return df
 
 
@@ -650,24 +433,17 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
     c_ot  = get_col(LISTA_ALIAS_OT);      c_tipo = get_col(LISTA_ALIAS_TIPO)
     c_usr = get_col(LISTA_ALIAS_USUARIO); c_nom  = get_col(LISTA_ALIAS_NOMBRE)
     c_prov= get_col(LISTA_ALIAS_PROVEEDOR);c_dist= get_col(LISTA_ALIAS_DISTRITO)
-    c_clus= get_col(LISTA_ALIAS_CLUSTER)
+    c_clus= get_col(LISTA_ALIAS_CLUSTER); c_poliza = get_col(LISTA_ALIAS_POLIZA)
 
     # Columnas opcionales (causa, falla, solución, estatus)
     c_causa  = get_col(LISTA_ALIAS_CAUSA)
     c_falla  = get_col(LISTA_ALIAS_FALLA)
     c_sol    = get_col(LISTA_ALIAS_SOLUCION)
     c_status = get_col(LISTA_ALIAS_ESTATUS)
-    c_lat    = get_col(LISTA_ALIAS_LAT)
-    c_lon    = get_col(LISTA_ALIAS_LON)
-    if c_causa  and c_causa  in cols: df["Causa_Registro"]   = sanit_txt(df[c_causa])
-    if c_falla  and c_falla  in cols: df["Falla_Registro"]   = sanit_txt(df[c_falla])
-    if c_sol    and c_sol    in cols: df["Solucion_Registro"] = sanit_txt(df[c_sol])
-    if c_status and c_status in cols: df["Estatus_Registro"]  = sanit_txt(df[c_status])
-    # Coordenadas: convertir a float, valores inválidos → NaN
-    if c_lat and c_lat in cols:
-        df["LAT"] = pd.to_numeric(df[c_lat].astype(str).str.replace(",",".",regex=False), errors="coerce")
-    if c_lon and c_lon in cols:
-        df["LON"] = pd.to_numeric(df[c_lon].astype(str).str.replace(",",".",regex=False), errors="coerce")
+    if c_causa  and c_causa  in cols: df["Causa_Registro"]  = sanit_txt(df[c_causa])
+    if c_falla  and c_falla  in cols: df["Falla_Registro"]  = sanit_txt(df[c_falla])
+    if c_sol    and c_sol    in cols: df["Solucion_Registro"]= sanit_txt(df[c_sol])
+    if c_status and c_status in cols: df["Estatus_Registro"] = sanit_txt(df[c_status])
 
     s_os   = sanit_fol(df[c_os])   if c_os   else pd.Series("SIN_OS",  index=df.index)
     s_cta  = sanit_fol(df[c_cta])  if c_cta  else pd.Series("SIN_CTA", index=df.index)
@@ -679,9 +455,12 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
 
     s_u = sanit_txt(df[c_usr]) if c_usr else pd.Series("SIN ESPECIFICAR", index=df.index)
     s_n = sanit_txt(df[c_nom]) if c_nom else pd.Series("SIN ESPECIFICAR", index=df.index)
+    # Usuario es el identificador estable de la cuadrilla: nunca se corta ni se
+    # sustituye por el nombre. Ejemplo válido: XXX25XXXXXXXX.
+    df["Usuario_ID"] = s_u.mask(s_u.isin(["SIN ESPECIFICAR", "NA", "N/A", "NAN", "NONE"]), "")
     df["Usuario_Tecnico"] = np.where(
-        (s_u != "SIN ESPECIFICAR") & (s_n != "SIN ESPECIFICAR"), s_u + " | " + s_n,
-        np.where(s_n != "SIN ESPECIFICAR", s_n, s_u)
+        df["Usuario_ID"].ne("") & (s_n != "SIN ESPECIFICAR"), df["Usuario_ID"] + " | " + s_n,
+        np.where(df["Usuario_ID"].ne(""), df["Usuario_ID"], s_n)
     )
 
     df["Empresa"]      = sanit_txt(df[c_prov]) if c_prov else "SIN PROVEEDOR"
@@ -690,54 +469,11 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
     df["Cluster_Raw"]  = sanit_txt(df[c_clus]) if c_clus else "SIN CLUSTER"
     df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
 
-    # Pólizas: el ID primario es el campo Usuario (primeros 5 chars → posiciones 3-4)
-    c_pol = c_usr or c_nom
-    if c_pol and c_pol in cols:
-        sub_cods = df[c_pol].astype(str).str[3:5]
-        df["Codigo_Poliza"] = np.where(sub_cods.isin(MAPEO_POLIZAS), sub_cods, "")
-        df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("NO VALIDO")
-    else:
-        df["Codigo_Poliza"] = ""; df["Nombre_Poliza"] = "NO VALIDO"
-
-    # ------------------------------------------------------------------
-    # FILTRO DE PLANTA EXTERNA (generación "25")
-    # Un técnico es "planta externa gen-25" si los caracteres 3-4 del
-    # código de usuario son "25" (ej: ITA25TIJT2981, POL25MEXT0108).
-    # Para estos usuarios:
-    #   • Se elimina el registro SI el tipo de evento está en
-    #     TIPOS_EXCLUIDOS_POLIZA25 (Cierre, Detenciones, Gasa, etc.).
-    #   • Si el tipo es uno de los elegibles, el registro SE MANTIENE.
-    # ------------------------------------------------------------------
-    if c_pol and c_pol in df.columns:
-        gen_cod = df[c_pol].astype(str).str[3:5]
-        mask_25 = gen_cod == "25"
-        mask_tipo_excluido = df["Tipo_Orden"].str.upper().isin(TIPOS_EXCLUIDOS_POLIZA25)
-        # Eliminar: es planta externa Y el tipo es de los excluidos
-        df = df[~(mask_25 & mask_tipo_excluido)].copy()
-        cols = list(df.columns)  # refrescar después del filtro
-
-    # ------------------------------------------------------------------
-    # HOMOLOGACIÓN DE TIPOS DE EVENTO
-    # 1. Primero mapa exacto (cubre variantes con encoding corrupto).
-    # 2. Luego contains sobre el resultado normalizado a mayúsculas,
-    #    para cubrir cualquier variante no listada en el catálogo.
-    # ------------------------------------------------------------------
-    if "Tipo_Orden" in df.columns:
-        # Paso 1: mapa exacto (case-insensitive sobre upper())
-        tipo_up = df["Tipo_Orden"].str.upper().str.strip()
-        mapa_upper = {k.upper(): v for k, v in HOMOLOGACION_TIPOS.items()}
-        df["Tipo_Orden"] = tipo_up.map(mapa_upper).fillna(tipo_up)
-
-        # Paso 2: contains para cubrir variantes residuales no en el mapa
-        tipo_up2 = df["Tipo_Orden"].str.upper().str.strip()
-        mask_rec_emp = tipo_up2.str.contains("RECOLE", na=False) & (
-            tipo_up2.str.contains("EMPRE", na=False)
-        )
-        mask_rec_pi  = tipo_up2.str.contains("RECOLE", na=False) & ~mask_rec_emp
-        mask_inst    = tipo_up2.str.contains("INSTALA", na=False) & ~mask_rec_emp & ~mask_rec_pi
-        df.loc[mask_rec_emp, "Tipo_Orden"] = "RECOLECCION EMPRESARIAL"
-        df.loc[mask_rec_pi,  "Tipo_Orden"] = "RECOLECCION PI"
-        df.loc[mask_inst,    "Tipo_Orden"] = "INSTALACION"
+    # La póliza no se deduce por posiciones fijas del Usuario. Se utiliza una
+    # columna explícita si existe o un código válido realmente presente en él.
+    poliza_origen = df[c_poliza] if c_poliza else pd.Series(None, index=df.index)
+    df["Codigo_Poliza"] = [extraer_codigo_poliza(u, p) for u, p in zip(df["Usuario_ID"], poliza_origen)]
+    df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("SIN PÓLIZA VÁLIDA")
 
     # Dimensiones temporales
     sem_arch = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in cols else pd.Series(None, index=df.index)
@@ -748,273 +484,77 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
         sem_iso
     )
 
-    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
-    df = aplicar_dimensiones_productividad(df)
+    df["AÑO_DIM"]   = str(ANIO_BASE_ESTRICTO)
+    df["SEMANA_DIM"] = df["Num_Semana_Archivo"].apply(
+        lambda x: f"Sem {int(x)}" if x > 0 else "SIN_FECHA"
+    )
+    df["MES_DIM"]    = df["_datetime_parsed"].dt.month.fillna(1).astype(int).map(MAPEO_MESES_TEXTO).fillna("Enero")
 
-    # ------------------------------------------------------------------
-    # FILTROS DE CALIDAD (reglas 8-11)
-    # Se aplican DESPUÉS de la homologación y ANTES del motor de
-    # reincidencias para que el análisis histórico ya use el dataset limpio.
-    # ------------------------------------------------------------------
-
-    # Regla 8: Proveedores excluidos permanentemente
-    # Cubre variantes como "ITAI 3", "TOTALBOX 2", "TOTALPLAY TIJUANA", etc.
-    if "Empresa" in df.columns:
-        mask_prov_exc = df["Empresa"].str.upper().str.startswith(PREFIJOS_PROVEEDOR_EXCLUIDO)
-        df = df[~mask_prov_exc].copy()
-
-    # Regla 9 & 10: Usuarios y proveedores con UN SOLO evento en todo el dataset
-    # (ruido estadístico; no aportan a tendencias ni a productividad real).
-    # Se calcula sobre el dataset ya filtrado para no contaminar con los excluidos.
-    if "Usuario_Tecnico" in df.columns:
-        conteo_usr = df["Usuario_Tecnico"].map(df["Usuario_Tecnico"].value_counts())
-        df = df[conteo_usr > 1].copy()
-
-    if "Empresa" in df.columns:
-        conteo_emp = df["Empresa"].map(df["Empresa"].value_counts())
-        df = df[conteo_emp > 1].copy()
+    dates_valid = df["_datetime_parsed"].dropna()
+    df["FECHA_TRUNCADA"] = f"01.01.{ANIO_BASE_ESTRICTO}"
+    if not dates_valid.empty:
+        df.loc[dates_valid.index, "FECHA_TRUNCADA"] = dates_valid.dt.strftime(f"%d.%m.{ANIO_BASE_ESTRICTO}")
 
     # Motor de reincidencias sobre el dataset COMPLETO (sin filtros)
-    # NOTA: cuando se llama desde _regenerar_parquet_consolidado, las
-    # reincidencias se calculan en el consolidado total, no aquí.
-    # El parámetro calcular_rein=True mantiene compatibilidad con el fallback.
     df = calcular_reincidencias_vectorizadas(df)
     return df
 
 
-def transformar_dataset_base(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Igual que transformar_dataset_completo pero SIN calcular reincidencias.
-    Se usa en la regeneración del parquet para que las reincidencias
-    se calculen sobre el consolidado total (histórico + nuevo), no
-    solo sobre el archivo recién subido.
-    """
-    if df is None or df.empty:
-        return df
-
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    cols = list(df.columns)
-
-    get_col   = lambda alias: detectar_columna_por_patrones(cols, alias)
-    sanit_fol = lambda s: s.apply(sanitizar_folio_identificador)
-    sanit_txt = lambda s: s.apply(sanitizar_cadena_texto)
-
-    col_fecha     = get_col(LISTA_ALIAS_CREACION)
-    col_fecha_fin = get_col(LISTA_ALIAS_TERMINO)
-    df["_datetime_parsed"]  = parsear_columna_fecha_robusta(df[col_fecha]) if col_fecha and col_fecha in cols else pd.NaT
-    df["_datetime_termino"] = parsear_columna_fecha_robusta(df[col_fecha_fin]) if col_fecha_fin and col_fecha_fin in cols else pd.NaT
-    delta_h = (df["_datetime_termino"] - df["_datetime_parsed"]).dt.total_seconds() / 3600.0
-    df["Tiempo_Resolucion_Horas"] = delta_h.where(delta_h >= 0)
-
-    c_os  = get_col(LISTA_ALIAS_ORDEN);    c_cta = get_col(LISTA_ALIAS_CUENTA)
-    c_ot  = get_col(LISTA_ALIAS_OT);      c_tipo = get_col(LISTA_ALIAS_TIPO)
-    c_usr = get_col(LISTA_ALIAS_USUARIO); c_nom  = get_col(LISTA_ALIAS_NOMBRE)
-    c_prov= get_col(LISTA_ALIAS_PROVEEDOR);c_dist= get_col(LISTA_ALIAS_DISTRITO)
-    c_clus= get_col(LISTA_ALIAS_CLUSTER)
-    c_causa  = get_col(LISTA_ALIAS_CAUSA);  c_falla = get_col(LISTA_ALIAS_FALLA)
-    c_sol    = get_col(LISTA_ALIAS_SOLUCION); c_status = get_col(LISTA_ALIAS_ESTATUS)
-    c_lat    = get_col(LISTA_ALIAS_LAT);   c_lon = get_col(LISTA_ALIAS_LON)
-
-    if c_causa  and c_causa  in cols: df["Causa_Registro"]    = sanit_txt(df[c_causa])
-    if c_falla  and c_falla  in cols: df["Falla_Registro"]    = sanit_txt(df[c_falla])
-    if c_sol    and c_sol    in cols: df["Solucion_Registro"]  = sanit_txt(df[c_sol])
-    if c_status and c_status in cols: df["Estatus_Registro"]   = sanit_txt(df[c_status])
-    if c_lat    and c_lat    in cols: df["LAT"] = pd.to_numeric(df[c_lat].astype(str).str.replace(",",".",regex=False), errors="coerce")
-    if c_lon    and c_lon    in cols: df["LON"] = pd.to_numeric(df[c_lon].astype(str).str.replace(",",".",regex=False), errors="coerce")
-
-    s_os   = sanit_fol(df[c_os])   if c_os   else pd.Series("SIN_OS",  index=df.index)
-    s_cta  = sanit_fol(df[c_cta])  if c_cta  else pd.Series("SIN_CTA", index=df.index)
-    s_ot   = sanit_fol(df[c_ot])   if c_ot   else pd.Series("SIN_OT",  index=df.index)
-    s_tipo = sanit_txt(df[c_tipo])  if c_tipo else pd.Series("EVENTO GENERAL", index=df.index)
-
-    df["FOLIO_KEY"]      = s_os.astype(str)+"_"+s_cta.astype(str)+"_"+s_ot.astype(str)+"_"+s_tipo.astype(str)
-    df["Cuenta_Cliente"] = s_cta.astype(str)
-
-    s_u = sanit_txt(df[c_usr]) if c_usr else pd.Series("SIN ESPECIFICAR", index=df.index)
-    s_n = sanit_txt(df[c_nom]) if c_nom else pd.Series("SIN ESPECIFICAR", index=df.index)
-    df["Usuario_Tecnico"] = np.where(
-        (s_u != "SIN ESPECIFICAR") & (s_n != "SIN ESPECIFICAR"), s_u+" | "+s_n,
-        np.where(s_n != "SIN ESPECIFICAR", s_n, s_u)
-    )
-    df["Empresa"]      = sanit_txt(df[c_prov]) if c_prov else "SIN PROVEEDOR"
-    df["Distrito"]     = sanit_txt(df[c_dist]) if c_dist else "DISTRITO GENERAL"
-    df["Tipo_Orden"]   = s_tipo
-    df["Cluster_Raw"]  = sanit_txt(df[c_clus]) if c_clus else "SIN CLUSTER"
-    df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
-
-    c_pol = c_usr or c_nom
-    if c_pol and c_pol in cols:
-        sub_cods = df[c_pol].astype(str).str[3:5]
-        df["Codigo_Poliza"] = np.where(sub_cods.isin(MAPEO_POLIZAS), sub_cods, "")
-        df["Nombre_Poliza"] = df["Codigo_Poliza"].map(MAPEO_POLIZAS).fillna("NO VALIDO")
-    else:
-        df["Codigo_Poliza"] = ""; df["Nombre_Poliza"] = "NO VALIDO"
-
-    if c_pol and c_pol in cols:
-        gen_cod = df[c_pol].astype(str).str[3:5]
-        mask_25 = gen_cod == "25"
-        mask_tipo_excluido = df["Tipo_Orden"].str.upper().isin(TIPOS_EXCLUIDOS_POLIZA25)
-        df = df[~(mask_25 & mask_tipo_excluido)].copy()
-        cols = list(df.columns)
-
-    if "Tipo_Orden" in df.columns:
-        tipo_up = df["Tipo_Orden"].str.upper().str.strip()
-        mapa_upper = {k.upper(): v for k, v in HOMOLOGACION_TIPOS.items()}
-        df["Tipo_Orden"] = tipo_up.map(mapa_upper).fillna(tipo_up)
-        tipo_up2 = df["Tipo_Orden"].str.upper().str.strip()
-        mask_rec_emp = tipo_up2.str.contains("RECOLE", na=False) & tipo_up2.str.contains("EMPRE", na=False)
-        mask_rec_pi  = tipo_up2.str.contains("RECOLE", na=False) & ~mask_rec_emp
-        mask_inst    = tipo_up2.str.contains("INSTALA", na=False) & ~mask_rec_emp & ~mask_rec_pi
-        df.loc[mask_rec_emp, "Tipo_Orden"] = "RECOLECCION EMPRESARIAL"
-        df.loc[mask_rec_pi,  "Tipo_Orden"] = "RECOLECCION PI"
-        df.loc[mask_inst,    "Tipo_Orden"] = "INSTALACION"
-
-    if "Empresa" in df.columns:
-        mask_prov_exc = df["Empresa"].str.upper().str.startswith(PREFIJOS_PROVEEDOR_EXCLUIDO)
-        df = df[~mask_prov_exc].copy()
-
-    if "Usuario_Tecnico" in df.columns:
-        conteo_usr = df["Usuario_Tecnico"].map(df["Usuario_Tecnico"].value_counts())
-        df = df[conteo_usr > 1].copy()
-    if "Empresa" in df.columns:
-        conteo_emp = df["Empresa"].map(df["Empresa"].value_counts())
-        df = df[conteo_emp > 1].copy()
-
-    sem_arch = df["Archivo_Origen"].apply(extraer_numero_semana_archivo) if "Archivo_Origen" in df.columns else pd.Series(None, index=df.index)
-    sem_iso  = pd.to_numeric(df["_datetime_parsed"].dt.isocalendar().week, errors="coerce").fillna(0).astype(int)
-    df["Num_Semana_Archivo"] = np.where(
-        pd.to_numeric(sem_arch, errors="coerce").fillna(0) > 0,
-        pd.to_numeric(sem_arch, errors="coerce").fillna(0).astype(int), sem_iso
-    )
-    df["AÑO_DIM"] = str(ANIO_BASE_ESTRICTO)
-    df = aplicar_dimensiones_productividad(df)
-
-    return df
-
-
-@st.cache_data(ttl=900, show_spinner="Cargando dataset consolidado...", max_entries=1)
+@st.cache_data(ttl=86400, show_spinner="Cargando dataset...", max_entries=1)
 def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
     """
-    Fuente exclusiva del dashboard: datos_consolidados.parquet.
-
-    Los CSV son únicamente insumos de respaldo y se consolidan fuera de
-    Streamlit. Nunca se descargan durante la apertura del dashboard: si el
-    Parquet no está disponible o no es válido, se devuelve vacío para mostrar
-    un error inmediato en lugar de activar una carga lenta por archivos.
+    Fuente única: GitHub.
+    1) Ruta rápida: datos_consolidados.parquet (2-5 seg).
+    2) Fallback: descarga en paralelo todos los CSV/parquet de la carpeta.
     """
     cols_base = ["FOLIO_KEY","Cuenta_Cliente","Usuario_Tecnico","Empresa",
                  "Distrito","Tipo_Orden","Cluster_Base","Nombre_Poliza",
                  "Num_Semana_Archivo","SEMANA_DIM","FECHA_TRUNCADA"]
 
+    # Ruta rápida
     try:
         resp = requests.get(f"{GITHUB_RAW_BASE}/datos_consolidados.parquet", headers=HEADERS, timeout=15)
         if resp.status_code == 200:
             df = pd.read_parquet(io.BytesIO(resp.content))
-            if not df.empty and "MES_DIM" in df.columns:
-                # También corrige parquets generados antes de este cambio: las
-                # dimensiones de productividad se derivan en tiempo de carga de
-                # Fecha término, sin esperar una reconstrucción histórica.
-                return aplicar_dimensiones_productividad(_homologar_tipos_df(df))
-        logger.error("Parquet no disponible o incompleto (HTTP %s).", resp.status_code)
+            if not df.empty:
+                # El parquet conserva las columnas fuente. Reprocesarlo aquí evita
+                # presentar dimensiones, pólizas o reincidencias calculadas por una
+                # versión anterior de la aplicación.
+                columnas_fuente = set(df.columns)
+                tiene_usuario = any(c in columnas_fuente for c in ["Usuario", "USUARIO", "Usuario_Tecnico"])
+                tiene_cuenta = any(c in columnas_fuente for c in ["Cuenta", "CUENTA", "Cuenta_Cliente"])
+                if tiene_usuario and tiene_cuenta:
+                    return transformar_dataset_completo(df)
+                if "MES_DIM" in df.columns:
+                    logger.warning("El consolidado no incluye columnas fuente; se usarán sus dimensiones existentes.")
+                    return df
     except Exception as e:
         logger.warning(f"No se pudo descargar Parquet consolidado: {e}")
-    return pd.DataFrame(columns=cols_base)
 
-
-# ==============================================================================
-# PIPELINE INGRESO SOPORTE (estructura preparada — carpeta ingreso_soporte/)
-# ==============================================================================
-# Columnas esperadas en los archivos de ingreso_soporte/ (a confirmar con el
-# equipo cuando el archivo esté disponible).  Las claves de cruce con
-# datos_semanales/ son: OT, OS y/o Cuenta.  Al integrarse, se generará un
-# único parquet consolidado con la información combinada.
-
-COLUMNAS_ESPERADAS_INGRESO_SOPORTE: List[str] = [
-    # Claves de cruce (deben coincidir con datos_semanales)
-    "OT", "OS", "Cuenta",
-    # Columnas propias del ingreso de soporte (pendiente de confirmar)
-    # "Tipo_Ingreso", "Fecha_Ingreso", "Tecnico_Ingreso", ...
-]
-
-
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
-def cargar_ingreso_soporte() -> pd.DataFrame:
-    """
-    Descarga y procesa los archivos de la carpeta ingreso_soporte/ en GitHub.
-    Retorna un DataFrame listo para cruzarse con datos_semanales.
-    Si la carpeta no existe o está vacía, retorna DataFrame vacío sin error.
-
-    TODO: cuando el archivo esté disponible, definir aquí:
-      - Mapeo de columnas al esquema común (FOLIO_KEY, Cuenta_Cliente, Tipo_Orden…)
-      - Reglas de homologación propias del ingreso de soporte
-      - Cruce con datos_semanales por OT / OS / Cuenta
-    """
+    # Fallback
     try:
-        resp = requests.get(GITHUB_API_URL_SOPORTE, headers=HEADERS, timeout=10)
-        if resp.status_code == 404:
-            return pd.DataFrame()   # carpeta aún no existe
-        if resp.status_code != 200:
-            logger.warning(f"ingreso_soporte: HTTP {resp.status_code}")
-            return pd.DataFrame()
-        archivos = [
+        resp = requests.get(GITHUB_API_URL, headers=HEADERS, timeout=10)
+        lista = [
             f["name"] for f in resp.json()
-            if isinstance(f, dict) and f["name"].endswith((".csv", ".parquet"))
-        ]
-        if not archivos:
-            return pd.DataFrame()
-
-        coleccion = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            def _dl(nombre):
-                try:
-                    r = requests.get(f"{GITHUB_RAW_BASE_SOPORTE}/{nombre}",
-                                     headers=HEADERS, timeout=15)
-                    if r.status_code == 200:
-                        bdata = io.BytesIO(r.content)
-                        df_t  = (pd.read_parquet(bdata) if nombre.endswith(".parquet")
-                                 else pd.read_csv(bdata, dtype=str, low_memory=False,
-                                                  encoding="utf-8", on_bad_lines="skip"))
-                        df_t["Archivo_Soporte"] = nombre
-                        return df_t
-                except Exception as e:
-                    logger.error(f"ingreso_soporte/{nombre}: {e}")
-                return None
-            coleccion = [d for d in ex.map(_dl, archivos) if d is not None]
-
-        if not coleccion:
-            return pd.DataFrame()
-
-        df_soporte = pd.concat(coleccion, ignore_index=True)
-        # TODO: aplicar transformaciones específicas de ingreso_soporte aquí
-        return df_soporte
-
+            if isinstance(f, dict) and f["name"].endswith((".csv",".parquet"))
+            and f["name"] != "datos_consolidados.parquet"
+        ] if resp.status_code == 200 else []
     except Exception as e:
-        logger.error(f"Error cargando ingreso_soporte: {e}")
-        return pd.DataFrame()
+        logger.error(f"Error conectando GitHub API: {e}")
+        lista = []
 
+    if not lista:
+        return pd.DataFrame(columns=cols_base)
 
-def _homologar_tipos_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aplica homologación de Tipo_Orden sobre cualquier DataFrame ya cargado.
-    Se llama tanto sobre el parquet consolidado (ruta rápida) como sobre
-    el resultado del fallback, para garantizar que el motor de reincidencias
-    siempre reciba tipos canónicos.
-    """
-    if "Tipo_Orden" not in df.columns:
-        return df
-    tipo_up = df["Tipo_Orden"].str.upper().str.strip()
-    mapa_upper = {k.upper(): v for k, v in HOMOLOGACION_TIPOS.items()}
-    df = df.copy()
-    df["Tipo_Orden"] = tipo_up.map(mapa_upper).fillna(tipo_up)
-    tipo_up2 = df["Tipo_Orden"].str.upper().str.strip()
-    mask_rec_emp = tipo_up2.str.contains("RECOLE", na=False) & tipo_up2.str.contains("EMPRE", na=False)
-    mask_rec_pi  = tipo_up2.str.contains("RECOLE", na=False) & ~mask_rec_emp
-    mask_inst    = tipo_up2.str.contains("INSTALA", na=False) & ~mask_rec_emp & ~mask_rec_pi
-    df.loc[mask_rec_emp, "Tipo_Orden"] = "RECOLECCION EMPRESARIAL"
-    df.loc[mask_rec_pi,  "Tipo_Orden"] = "RECOLECCION PI"
-    df.loc[mask_inst,    "Tipo_Orden"] = "INSTALACION"
-    return df
+    with ThreadPoolExecutor(max_workers=25) as ex:
+        resultados = list(ex.map(descargar_y_procesar_archivo, lista))
+    coleccion = [d for d in resultados if d is not None and not d.empty]
+    if not coleccion:
+        return pd.DataFrame(columns=cols_base)
+
+    df = pd.concat(coleccion, ignore_index=True)
+    coleccion.clear(); gc.collect()
+    return transformar_dataset_completo(df)
 
 
 # ==============================================================================
@@ -1025,93 +565,11 @@ def calcular_indice_productividad_diaria(
     total_eventos: int, total_usuarios: int, dias_operativos: int
 ) -> float:
     """
-    Productividad = (Eventos / Usuarios) / Días.
-    Los días se calculan según la dimensión temporal activa:
-      - Por día   → 1
-      - Por semana→ días únicos reales observados en el grupo (1..7)
-      - Por mes   → días del mes calendario (28-31)
-      - Por año   → 365 / 366
-    El llamador debe pasar el valor correcto de dias_operativos.
-    No se aplica factor de corrección artificial.
+    Productividad por cuadrilla = Eventos / Cuadrillas / Días calendario.
     """
     if total_usuarios <= 0 or dias_operativos <= 0:
         return 0.0
     return round((total_eventos / total_usuarios) / dias_operativos, 2)
-
-
-def calcular_dias_cuadrilla_ponderados(
-    df: pd.DataFrame,
-    col_usuario: str = "Usuario_Tecnico",
-    col_fecha: str = "FECHA_TRUNCADA",
-    dias_activos: Optional[int] = None,
-) -> int:
-    """
-    Días-Cuadrilla = suma de días reales trabajados por cada cuadrilla.
-
-    Al filtrar un Distrito, Empresa o Usuario se recalcula sobre ese mismo
-    subconjunto. Ejemplo: un usuario con órdenes en 6 días aporta 6, aunque la
-    semana tenga 7 días calendario. En una semana completa, si 62 cuadrillas
-    trabajaron los 7 días, el resultado es 62 × 7 = 434.
-    """
-    if df.empty or col_usuario not in df.columns:
-        return 0
-
-    jornadas = df[[col_usuario]].copy()
-    # El parquet conserva la fecha parseada. Se usa antes que FECHA_TRUNCADA
-    # para evitar depender del texto mostrado en tablas o gráficas.
-    if "_datetime_parsed" in df.columns:
-        fechas = pd.to_datetime(df["_datetime_parsed"], errors="coerce")
-    else:
-        fechas = pd.Series(pd.NaT, index=df.index)
-    if fechas.isna().all() and col_fecha in df.columns:
-        fechas = pd.to_datetime(df[col_fecha], format="%d.%m.%Y", errors="coerce")
-        if fechas.isna().all():
-            fechas = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce")
-    if fechas.isna().all():
-        return 0
-    jornadas["_fecha_operativa"] = fechas.dt.normalize()
-    jornadas[col_usuario] = jornadas[col_usuario].astype(str).str.strip()
-    jornadas = jornadas[
-        ~jornadas[col_usuario].str.upper().isin(["", "NAN", "NONE", "SIN ESPECIFICAR"])
-        & jornadas["_fecha_operativa"].notna()
-        & (jornadas["_fecha_operativa"] != pd.Timestamp(f"{ANIO_BASE_ESTRICTO}-01-01"))
-    ]
-    if jornadas.empty:
-        return 0
-    return int(jornadas.drop_duplicates([col_usuario, "_fecha_operativa"]).shape[0])
-
-
-def contar_cuadrillas_activas(df: pd.DataFrame, col_usuario: str = "Usuario_Tecnico") -> int:
-    """Cuenta sólo técnicos/cuadrillas identificables, igual que días-cuadrilla."""
-    if df.empty or col_usuario not in df.columns:
-        return 0
-    tecnicos = df[col_usuario].astype(str).str.strip()
-    tecnicos = tecnicos[~tecnicos.str.upper().isin(["", "NAN", "NONE", "SIN ESPECIFICAR"])]
-    return int(tecnicos.nunique())
-
-
-def contar_eventos_completados(df: pd.DataFrame) -> int:
-    """Cuenta OT/eventos por folio único sobre el subconjunto ya filtrado."""
-    if df.empty:
-        return 0
-    if "FOLIO_KEY" in df.columns:
-        return int(df["FOLIO_KEY"].dropna().nunique())
-    return int(len(df))
-
-
-def calcular_capacidad_cuadrilla(
-    df: pd.DataFrame,
-    dimension: str,
-    semanas_filtradas: Optional[List[str]] = None,
-    meses_filtrados: Optional[List[str]] = None,
-) -> int:
-    """Devuelve días-cuadrilla reales del resultado ya filtrado.
-
-    ``dimension`` y los filtros temporales se mantienen en la firma para que
-    todas las vistas puedan llamarlo igual; las fechas reales del subconjunto
-    determinan el resultado, por lo que no se inventan jornadas no trabajadas.
-    """
-    return calcular_dias_cuadrilla_ponderados(df)
 
 
 def calcular_tendencia_lineal_robusta(valores: List[float]) -> List[float]:
@@ -1126,49 +584,29 @@ def calcular_tendencia_lineal_robusta(valores: List[float]) -> List[float]:
 def extraer_metricas_kpi_totales(
     df_folios: pd.DataFrame,
     df_raw_completo: pd.DataFrame,
-    dimension: str = "SEMANA_DIM",
-    semanas_filtradas: Optional[List[str]] = None,
-    meses_filtrados: Optional[List[str]] = None,
+    dimension: str = "SEMANA_DIM"
 ) -> MetricasResumenKPI:
     """
-    KPIs dinámicos: responden a los filtros activos de UI (df_folios).
-    df_raw_completo se reserva para futuras comparativas; el cálculo
-    de productividad opera sobre el subconjunto filtrado.
-
-    POR DÍA  : Eventos / Técnicos
-    POR SEMANA: Eventos / (Cuadrillas activas × 7 días)
-    POR MES  : Eventos / (Técnicos × días del mes calendario)
-    POR AÑO  : Eventos / (Técnicos × días del año)
-
-    Tarjeta "Dias Cuadrilla" muestra:
-      - SEMANA: cuadrillas activas × 7 días por cada semana seleccionada
-      - MES   : días del mes calendario
-      - DÍA   : 1
-      - AÑO   : 365/366
+    Todos los KPI respetan los filtros activos. La productividad usa solo las
+    pólizas autorizadas y días calendario, sin reducir el denominador por faltas.
     """
-    # Numerador único para todo el módulo: eventos/folios completados únicos
-    # después de Semana, Distrito, Empresa, Póliza y Técnico.
-    total_eventos  = contar_eventos_completados(df_folios)
-    total_usuarios = contar_cuadrillas_activas(df_folios) if total_eventos > 0 else 0
-
-    if total_eventos == 0:
-        return MetricasResumenKPI(
-            total_eventos=0, total_usuarios=0,
-            dias_operativos=0, productividad_diaria=0.0,
-            eventos_r3=0, eventos_mt=0
-        )
-
-    dias_cuad = calcular_capacidad_cuadrilla(
-        df_folios, dimension, semanas_filtradas, meses_filtrados
-    )
-    prod_base = round(total_eventos / dias_cuad, 2) if dias_cuad > 0 else 0.0
-
-    conteo_r3 = (df_folios["Codigo_Poliza"] == "R3").sum() if "Codigo_Poliza" in df_folios.columns else 0
-    conteo_mt = (df_folios["Codigo_Poliza"] == "MT").sum() if "Codigo_Poliza" in df_folios.columns else 0
+    total_eventos  = len(df_folios)
+    productivos = df_folios[df_folios["Codigo_Poliza"].isin(MAPEO_POLIZAS)].copy()
+    ev_prod = len(productivos)
+    usr_prod = productivos["Usuario_ID"].replace("",np.nan).nunique() if ev_prod > 0 else 0
+    dias_op = dias_calendario_de_seleccion(productivos, dimension)
+    # Un evento es una unidad discreta. El promedio diario del equipo se
+    # comunica como entero, mientras que la productividad por cuadrilla sí
+    # conserva precisión decimal para la comparación operativa.
+    eventos_equipo = int(round(ev_prod / dias_op)) if dias_op else 0
+    prod_cuadrilla = calcular_indice_productividad_diaria(ev_prod, usr_prod, dias_op)
+    conteo_r3   = (df_folios["Codigo_Poliza"] == "R3").sum() if "Codigo_Poliza" in df_folios.columns else 0
+    conteo_mt   = (df_folios["Codigo_Poliza"] == "MT").sum() if "Codigo_Poliza" in df_folios.columns else 0
 
     return MetricasResumenKPI(
-        total_eventos=total_eventos, total_usuarios=total_usuarios,
-        dias_operativos=dias_cuad, productividad_diaria=prod_base,
+        total_eventos=total_eventos, total_usuarios=usr_prod,
+        dias_operativos=dias_op, eventos_diarios_equipo=eventos_equipo,
+        productividad_cuadrilla=prod_cuadrilla,
         eventos_r3=int(conteo_r3), eventos_mt=int(conteo_mt)
     )
 
@@ -1180,47 +618,19 @@ def _num_sem(val) -> int:
         return 999
 
 
-def acotar_fechas_a_semanas_seleccionadas(
-    df: pd.DataFrame, semanas: List[str]
-) -> Tuple[pd.DataFrame, List[str]]:
-    """Restringe los registros a la ventana calendario de la semana de archivo.
-
-    El nombre del CSV asigna ``SEMANA_DIM``; sin este paso una semana podía
-    contener registros con fechas de otras semanas al cambiar la gráfica a Día.
-    La operación considera lunes a domingo, como se maneja en el cierre
-    operativo (por ejemplo Sem 38 = 14 a 20 de septiembre de 2026).
+def generar_figura_evolucion_temporal(df_folios: pd.DataFrame, dimension_temporal: str) -> go.Figure:
     """
-    if df.empty or not semanas or "Fecha_Productividad" not in df.columns:
-        return df, []
-
-    fechas = pd.to_datetime(df["Fecha_Productividad"], errors="coerce").dt.normalize()
-    mascara = pd.Series(False, index=df.index)
-    etiquetas: List[str] = []
-    for semana in sorted({_num_sem(s) for s in semanas if _num_sem(s) != 999}):
-        inicio = pd.Timestamp(datetime.fromisocalendar(ANIO_BASE_ESTRICTO, semana, 1))
-        fin = inicio + pd.Timedelta(days=6)  # domingo de la semana operativa
-        mascara |= fechas.between(inicio, fin, inclusive="both")
-        etiquetas.append(f"Sem {semana}: {inicio:%d/%m}–{fin:%d/%m}")
-    return df.loc[mascara].copy(), etiquetas
-
-
-def generar_figura_evolucion_temporal(
-    df_folios: pd.DataFrame,
-    dimension_temporal: str,
-    modo_barras: str = "Eventos Completados",
-    semanas_filtradas: Optional[List[str]] = None,
-    meses_filtrados: Optional[List[str]] = None,
-) -> go.Figure:
-    """
-    Gráfico de barras + línea de productividad con tendencias.
-    modo_barras:
-      "Eventos Completados"              → Y = total de órdenes por período
-      "Cuadrillas Únicas con Actividad"  → Y = técnicos únicos por período
+    Gráfico de barras y productividad de las pólizas autorizadas.
+    Incluye todos los tipos de evento de esas pólizas y divide entre días
+    calendario fijos del período.
+    Eje X: etiquetas cortas (Sem 1, Sem 2…) con ángulo -45° y margen inferior ampliado.
     """
     if df_folios.empty:
         return go.Figure().update_layout(title="Sin datos para la selección actual")
 
-    df_t = df_folios.copy()
+    df_t = df_folios[df_folios["Codigo_Poliza"].isin(MAPEO_POLIZAS)].copy()
+    if df_t.empty:
+        return go.Figure().update_layout(title="Sin órdenes de pólizas válidas para productividad")
 
     if dimension_temporal == "SEMANA_DIM":
         df_t["SEMANA_DIM"] = df_t["SEMANA_DIM"].apply(
@@ -1236,42 +646,29 @@ def generar_figura_evolucion_temporal(
         eje_x_base = [str(ANIO_BASE_ESTRICTO)]
 
     # Agrupaciones
+    mapa_ev    = df_t.groupby(dimension_temporal).size().to_dict()
+    mapa_usr   = df_t[df_t["Usuario_ID"].ne("")].groupby(dimension_temporal)["Usuario_ID"].nunique().to_dict()
     mapa_grp   = dict(tuple(df_t.groupby(dimension_temporal)))
-    usar_cuadrillas = (modo_barras == "Cuadrillas Únicas con Actividad")
 
     eje_x, vals_ev, vals_prod = [], [], []
 
     for cat in eje_x_base:
-        grupo = mapa_grp.get(cat, pd.DataFrame())
-        ev = contar_eventos_completados(grupo)
+        ev = mapa_ev.get(cat, 0)
         if ev <= 0:
             continue
         eje_x.append(str(cat))
-        u     = max(contar_cuadrillas_activas(grupo), 1)
-
-        # Valor Y de la barra según toggle
-        if usar_cuadrillas:
-            vals_ev.append(float(u))   # técnicos únicos con actividad
-        else:
-            vals_ev.append(float(ev))  # total eventos
-
-        dias_cuad = calcular_capacidad_cuadrilla(
-            # En la gráfica cada punto se calcula por su propia dimensión:
-            # un día = 1 día, una semana = 7 y un mes = sus días calendario.
-            grupo, dimension_temporal
-        )
-        prod_val = round(ev / dias_cuad, 2) if dias_cuad > 0 else 0.0
-
-        vals_prod.append(prod_val)
+        vals_ev.append(float(ev))
+        u     = max(mapa_usr.get(cat, 1), 1)
+        grupo = mapa_grp.get(cat, pd.DataFrame())
+        dias  = _dias_calendario_para_periodo(dimension_temporal, cat, grupo)
+        vals_prod.append(calcular_indice_productividad_diaria(ev, u, dias))
 
     if not eje_x:
         return go.Figure().update_layout(title="Sin registros activos en el rango seleccionado")
 
     fig = go.Figure()
-    nombre_barra = "Cuadrillas Únicas" if usar_cuadrillas else "Eventos Completados"
-    titulo_y_izq = "Cuadrillas Únicas (técnicos)" if usar_cuadrillas else "OT / Eventos Completados"
     fig.add_trace(go.Bar(
-        x=eje_x, y=vals_ev, name=nombre_barra,
+        x=eje_x, y=vals_ev, name="Eventos de pólizas válidas",
         marker_color=PALETA_COLOR["azul_marina"], opacity=0.9, yaxis="y"
     ))
     fig.add_trace(go.Scatter(
@@ -1312,12 +709,12 @@ def generar_figura_evolucion_temporal(
             type="category", categoryorder="array", categoryarray=eje_x_base,
         ),
         yaxis=dict(
-            title=dict(text=titulo_y_izq, font=dict(color="#000000", size=11)),
+            title=dict(text="Eventos", font=dict(color="#000000", size=11)),
             showgrid=True, gridcolor="#E2E8F0", linecolor=PALETA_COLOR["azul_marina"],
             tickfont=dict(color="#000000", size=10)
         ),
         yaxis2=dict(
-            title=dict(text="Productividad (Eventos / Técnico / Día)", font=dict(color="#000000", size=11)),
+            title=dict(text="Eventos / cuadrilla / día", font=dict(color="#000000", size=11)),
             overlaying="y", side="right", showgrid=False, linecolor=PALETA_COLOR["azul_marina"],
             tickfont=dict(color="#000000", size=10),
             range=[0, max(vals_prod + [1.0]) * 1.35]
@@ -1443,77 +840,18 @@ def leer_bytes_github(ruta: str) -> bytes:
     return res.content
 
 
-def _leer_csv_historico_github(ruta: str) -> pd.DataFrame:
-    """Lee un CSV del árbol completo del repositorio y conserva su origen."""
-    datos = leer_bytes_github(ruta)
-    try:
-        df = pd.read_csv(io.BytesIO(datos), dtype=str, low_memory=False,
-                         encoding="utf-8", on_bad_lines="skip")
-    except UnicodeDecodeError:
-        df = pd.read_csv(io.BytesIO(datos), dtype=str, low_memory=False,
-                         encoding="latin1", on_bad_lines="skip")
-    if df.empty:
-        raise ValueError(f"El archivo no contiene filas: {ruta}")
-    df["Archivo_Origen"] = ruta
-    return df
-
-
 def _regenerar_parquet_consolidado(nombre_csv: str, df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reconstruye el Parquet desde TODOS los CSV históricos del repositorio.
-
-    Los CSV archivados en ``datos_semanales/archivo/`` también son parte del
-    histórico. No se utiliza el Parquet previo como fuente porque éste podría
-    estar incompleto; de ese modo una regeneración siempre corrige el historial
-    y recalcula las reincidencias sobre la base completa.
-    """
     inventario_repositorio_github.clear()
     inventario = inventario_repositorio_github()
-    prefijo = f"{GITHUB_FOLDER.strip('/')}/"
-
-    rutas_csv = sorted(
-        ruta for ruta, tipo in inventario.items()
-        if tipo == "blob"
-        and ruta.startswith(prefijo)
-        and ruta.lower().endswith(".csv")
-    )
-    if not rutas_csv:
-        raise ValueError("No se encontraron CSV históricos para reconstruir el consolidado.")
-
-    # El CSV recién guardado ya forma parte del árbol. Si GitHub aún no lo
-    # devuelve por latencia, se incorpora la copia recibida por la pantalla.
-    nombre_actual_en_arbol = any(ruta.rsplit("/", 1)[-1] == nombre_csv for ruta in rutas_csv)
-    errores: List[str] = []
-    frames: List[pd.DataFrame] = []
-
-    with ThreadPoolExecutor(max_workers=min(12, len(rutas_csv))) as ex:
-        futuros = {ex.submit(_leer_csv_historico_github, ruta): ruta for ruta in rutas_csv}
-        for futuro, ruta in futuros.items():
-            try:
-                frames.append(futuro.result())
-            except Exception as exc:
-                errores.append(f"{ruta}: {exc}")
-
-    # Nunca crear un Parquet parcial: si un histórico no puede leerse, se
-    # conserva el consolidado vigente y se informa el archivo problemático.
-    if errores:
-        raise ValueError("No se reconstruyó el Parquet porque fallaron archivos históricos: " + " | ".join(errores[:5]))
-
-    if not nombre_actual_en_arbol:
-        nuevo = df_raw.copy()
-        nuevo["Archivo_Origen"] = f"{prefijo}{nombre_csv}"
-        frames.append(nuevo)
-
-    historico_crudo = pd.concat(frames, ignore_index=True)
-    logger.info("Reconstrucción completa: %s CSV y %s filas crudas", len(frames), len(historico_crudo))
-
-    consolidado_base = transformar_dataset_base(historico_crudo)
-    if consolidado_base is None or consolidado_base.empty:
-        raise ValueError("La transformación del histórico produjo un dataset vacío.")
-
-    consolidado_final = calcular_reincidencias_vectorizadas(consolidado_base)
-    logger.info("Parquet reconstruido: %s filas finales", len(consolidado_final))
-    return consolidado_final
+    prefijo    = f"{GITHUB_FOLDER.strip('/')}/"
+    ruta_cons  = prefijo + "datos_consolidados.parquet"
+    nuevo = df_raw.copy(); nuevo["Archivo_Origen"] = nombre_csv
+    if ruta_cons in inventario:
+        anterior = pd.read_parquet(io.BytesIO(leer_bytes_github(ruta_cons)))
+        if "Archivo_Origen" in anterior.columns:
+            anterior = anterior[anterior["Archivo_Origen"] != nombre_csv]
+        return pd.concat([anterior, transformar_dataset_completo(nuevo)], ignore_index=True)
+    return transformar_dataset_completo(nuevo)
 
 
 def guardar_csv_en_carpeta(ruta: str, df: pd.DataFrame, agregar: bool) -> pd.DataFrame:
@@ -1543,12 +881,7 @@ def guardar_csv_en_carpeta(ruta: str, df: pd.DataFrame, agregar: bool) -> pd.Dat
         else:
             final = final.drop_duplicates(keep="last")
     elif res.status_code == 200:
-        # El archivo existe en GitHub aunque el usuario eligió "Crear nuevo".
-        # Esto ocurre cuando el inventario cacheado está desactualizado o cuando
-        # el usuario confirmó explícitamente la sobrescritura en el formulario.
-        # Usamos el SHA para hacer un PUT y sobrescribir el archivo.
-        sha = res.json().get("sha")
-        # final ya tiene los datos nuevos (df), no concatenamos con el anterior
+        raise ValueError("Ya existe un archivo con ese nombre. Selecciona actualizar o escribe otro nombre.")
     elif res.status_code != 404:
         res.raise_for_status()
 
@@ -1664,8 +997,7 @@ def inyectar_estilos_css_enterprise() -> None:
         gap: 6px !important;
         background-color: transparent !important;
         border-bottom: none !important;
-    }}
-    div[data-testid="stTabs"] button[role="tab"] {{
+    }}    div[data-testid="stTabs"] button[role="tab"] {{
         background-color: #1e293b !important;
         border: 1px solid #334155 !important;
         border-radius: 7px !important;
@@ -1744,65 +1076,9 @@ def inyectar_estilos_css_enterprise() -> None:
         font-family: Arial, sans-serif !important; font-weight: 600 !important;
         font-size: 13px !important;
     }}
-    /* Botones de descarga siempre legibles */
-    div[data-testid="stDownloadButton"] > button {{
-        background-color: #FFFFFF !important;
-        color: {p["azul_marina"]} !important;
-        border: 1px solid {p["gris_borde"]} !important;
-        border-radius: 7px !important;
-        font-family: Arial, sans-serif !important;
-        font-weight: 600 !important;
-        font-size: 12px !important;
-        width: auto !important;
-    }}
-    /* Métricas con fondo adaptado */
-    [data-testid="stMetricValue"] {{
-        color: {p["turquesa_cyan"]} !important;
-        font-family: Arial, sans-serif !important;
-        font-weight: 700 !important;
-    }}
-    [data-testid="stMetricLabel"] {{
-        color: {p["gris_borde"]} !important;
-        font-family: Arial, sans-serif !important;
-    }}
-    [data-testid="stMetricDelta"] {{
-        font-family: Arial, sans-serif !important;
-    }}
-    /* Number inputs con texto legible */
-    input[type="number"] {{
-        color: #000000 !important;
-        background: #FFFFFF !important;
-    }}
-    /* Sidebar métrica legible */
-    [data-testid="stSidebar"] [data-testid="stMetricValue"] {{
-        color: {p["turquesa_cyan"]} !important;
-    }}
-    [data-testid="stSidebar"] [data-testid="stMetricLabel"] {{
-        color: #FFFFFF !important;
-    }}
 
-    /* === RESPONSIVO MÓVIL === */
-    .kpi-grid-4 {{
-        display: grid !important;
-        grid-template-columns: repeat(4, 1fr) !important;
-        gap: 10px !important;
-        margin-bottom: 16px !important;
-    }}
-    @media (max-width: 640px) {{
-        .kpi-grid-4 {{ grid-template-columns: repeat(2, 1fr) !important; }}
-        .kpi-card-value {{ font-size: 22px !important; }}
-        .kpi-card-title {{ font-size: 9px !important; }}
-        .kpi-card-subtitle {{ font-size: 9px !important; }}
-        .js-plotly-plot .plotly .drag {{ pointer-events: none !important; }}
-        .js-plotly-plot {{ touch-action: none !important; }}
-        [data-testid="stDataFrame"] {{ overflow-x: auto !important; }}
-    }}
-    /* Deshabilitar pinch-zoom en gráficos en todos los dispositivos */
+    /* Desactivar zoom táctil en gráficos */
     .js-plotly-plot {{ touch-action: pan-y !important; }}
-    /* Sidebar colapsado empuja el contenido a ancho completo */
-    [data-testid="stSidebar"][aria-expanded="false"] ~ .main {{
-        margin-left: 0 !important; width: 100% !important;
-    }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)
@@ -1812,91 +1088,75 @@ def inyectar_estilos_css_enterprise() -> None:
 # 10. VISTAS
 # ==============================================================================
 
-def renderizar_pestana_polizas_cuadrillas(
-    df_folios: pd.DataFrame,
-    df_raw: pd.DataFrame,
-    dimension_sel: str,
-    semanas_filtradas: Optional[List[str]] = None,
-    meses_filtrados: Optional[List[str]] = None,
-) -> None:
-    kpis = extraer_metricas_kpi_totales(
-        df_folios, df_raw, dimension_sel, semanas_filtradas, meses_filtrados
-    )
+def abrir_captura_completa():
+    st.session_state["seccion_principal"] = "Capturar / Actualizar datos"
 
-    sub_tab1, sub_tab2, sub_tab3, sub_tab4 = st.tabs([
+
+def renderizar_pestana_polizas_cuadrillas(df_folios: pd.DataFrame, df_raw: pd.DataFrame, dimension_sel: str) -> None:
+    kpis = extraer_metricas_kpi_totales(df_folios, df_raw, dimension_sel)
+    df_productivos = df_folios[df_folios["Codigo_Poliza"].isin(MAPEO_POLIZAS)].copy()
+
+    sub_tab1, sub_tab2, sub_tab3, sub_tab4, sub_tab5 = st.tabs([
         "Evolución y Productividad",
         "Desglose por Pólizas",
         "Ranking de Cuadrillas / Técnicos",
-        "Carga de Eventos",
+        "Descarga de Reportes",
+        "Cargar Datos"
     ])
+
+    with sub_tab5:
+        st.button("Abrir panel de carga de datos", on_click=abrir_captura_completa, key="abrir_captura_ancha")
 
     # --- SUBTAB 1: EVOLUCIÓN & PRODUCTIVIDAD ---
     with sub_tab1:
         # KPI Cards
         st.markdown(f"""
-        <div class="kpi-grid-4">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px;margin-bottom:16px;">
             <div class="kpi-card-enterprise">
                 <div class="kpi-card-title">Órdenes Totales</div>
                 <div class="kpi-card-value">{kpis.total_eventos:,}</div>
-                <div class="kpi-card-subtitle">Folios únicos completados tras filtros</div>
+                <div class="kpi-card-subtitle">Todos los tipos de evento</div>
             </div>
             <div class="kpi-card-enterprise">
-                <div class="kpi-card-title">Técnicos Activos</div>
+                <div class="kpi-card-title">Cuadrillas Productivas</div>
                 <div class="kpi-card-value">{kpis.total_usuarios:,}</div>
-                <div class="kpi-card-subtitle">Usuarios únicos en el período</div>
+                <div class="kpi-card-subtitle">Usuario completo y póliza válida</div>
             </div>
             <div class="kpi-card-enterprise">
-                <div class="kpi-card-title">Días Cuadrilla</div>
+                <div class="kpi-card-title">Días Operativos</div>
                 <div class="kpi-card-value">{kpis.dias_operativos}</div>
-                <div class="kpi-card-subtitle">Suma de días reales por usuario filtrado</div>
+                <div class="kpi-card-subtitle">Días calendario del período</div>
             </div>
             <div class="kpi-card-enterprise">
-                <div class="kpi-card-title">Productividad / Día</div>
-                <div class="kpi-card-value" style="color:{PALETA_COLOR['turquesa_cyan']} !important;">{kpis.productividad_diaria}</div>
-                <div class="kpi-card-subtitle">Eventos completados ÷ días-cuadrilla</div>
+                <div class="kpi-card-title">Eventos / Día del Equipo</div>
+                <div class="kpi-card-value" style="color:{PALETA_COLOR['naranja_desierto']} !important;">{kpis.eventos_diarios_equipo}</div>
+                <div class="kpi-card-subtitle">Promedio diario redondeado</div>
+            </div>
+            <div class="kpi-card-enterprise">
+                <div class="kpi-card-title">Productividad / Cuadrilla</div>
+                <div class="kpi-card-value" style="color:{PALETA_COLOR['turquesa_cyan']} !important;">{kpis.productividad_cuadrilla}</div>
+                <div class="kpi-card-subtitle">Eventos ÷ cuadrillas ÷ días calendario</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        toggle_modo = st.radio(
-            "Vista de barras:",
-            ["Eventos Completados", "Cuadrillas Únicas con Actividad"],
-            horizontal=True, key="radio_modo_barras_evolucion"
+        mask_g = df_productivos[dimension_sel].notnull() & (
+            ~df_productivos[dimension_sel].astype(str).str.lower().isin(["nan","none","null",""])
         )
-
-        mask_g = df_folios[dimension_sel].notnull() & (
-            ~df_folios[dimension_sel].astype(str).str.lower().isin(["nan","none","null",""])
-        )
-        fig_ev = generar_figura_evolucion_temporal(
-            df_folios[mask_g], dimension_sel,
-            modo_barras=toggle_modo,
-            semanas_filtradas=semanas_filtradas,
-            meses_filtrados=meses_filtrados,
-        )
+        fig_ev = generar_figura_evolucion_temporal(df_productivos[mask_g], dimension_sel)
         st.plotly_chart(fig_ev, use_container_width=True, key="grafico_evolucion_temporal",
                         config={"displayModeBar": False, "scrollZoom": False})
 
         nom_dim = {"FECHA_TRUNCADA":"Día","SEMANA_DIM":"Semana","MES_DIM":"Mes","AÑO_DIM":"Año"}.get(dimension_sel,"Período")
-        # La tabla siempre muestra la misma vista que el toggle del gráfico
-        es_cuadrillas = (toggle_modo == "Cuadrillas Únicas con Actividad")
-        etiqueta_vista = "CUADRILLAS ÚNICAS (TÉCNICOS)" if es_cuadrillas else "EVENTOS COMPLETADOS"
-        subtitulo_tbl  = "Técnicos únicos con actividad por período y proveedor." if es_cuadrillas else "Total de órdenes completadas por período y proveedor."
-
         st.markdown(f"""
         <div class="matrix-title-card">
-            <b>{etiqueta_vista} POR {nom_dim.upper()} Y PROVEEDOR</b>
-            <p>{subtitulo_tbl}</p>
+            <b>CUADRILLAS / TÉCNICOS ÚNICOS POR {nom_dim.upper()} Y PROVEEDOR</b>
+            <p>Conteo de usuarios técnicos con actividad registrada por período.</p>
         </div>""", unsafe_allow_html=True)
 
-        if not df_folios.empty:
-            # Pivot: técnicos únicos o eventos completados según toggle
-            agg_func_mz = "nunique" if es_cuadrillas else "count"
-            val_col_mz  = "Usuario_Tecnico" if es_cuadrillas else "FOLIO_KEY"
-
-            df_mz = pd.pivot_table(
-                df_folios, index="Empresa", columns=dimension_sel,
-                values=val_col_mz, aggfunc=agg_func_mz, fill_value=0
-            )
+        if not df_productivos.empty:
+            df_mz = pd.pivot_table(df_productivos, index="Empresa", columns=dimension_sel,
+                                   values="Usuario_ID", aggfunc="nunique", fill_value=0)
             cols_r = list(df_mz.columns)
             if dimension_sel == "FECHA_TRUNCADA":
                 cols_ord = sorted(cols_r, key=lambda x: pd.to_datetime(x, format="%d.%m.%Y", errors="coerce") or x)
@@ -1911,37 +1171,27 @@ def renderizar_pestana_polizas_cuadrillas(
             df_mz["Tendencia"]        = vals.tolist()
             df_mz["Promedio Período"] = np.round(vals.mean(axis=1), 1)
 
-            # Fila de totales
-            if es_cuadrillas:
-                fila_tot = df_folios.groupby(dimension_sel)["Usuario_Tecnico"].nunique().reindex(cols_ord).fillna(0).astype(int)
-            else:
-                fila_tot = df_folios.groupby(dimension_sel)["FOLIO_KEY"].count().reindex(cols_ord).fillna(0).astype(int)
-
+            fila_tot = df_productivos.groupby(dimension_sel)["Usuario_ID"].nunique().reindex(cols_ord).fillna(0).astype(int)
             row_dict = dict(zip(cols_ord, fila_tot.values))
             row_dict["Tendencia"]        = fila_tot.tolist()
             row_dict["Promedio Período"] = round(float(fila_tot.mean()), 1)
-            # TOTAL GENERAL separado: se añade DESPUÉS del sort para que no se mueva
-            df_mz_data = df_mz.copy()
-            df_mz_total = pd.DataFrame([row_dict], index=["TOTAL GENERAL"])
+            df_mz = pd.concat([df_mz, pd.DataFrame([row_dict], index=["TOTAL GENERAL"])])
 
             cols_fin = ["Tendencia"] + cols_ord + ["Promedio Período"]
-            etiq_col = "Empresa / Proveedor"
-            # Unir: datos ordenados + total al final (fijo)
-            df_mz_final = pd.concat([df_mz_data[cols_fin], df_mz_total[cols_fin]])
             st.dataframe(
-                df_mz_final.reset_index().rename(columns={"index": etiq_col}),
+                df_mz[cols_fin].reset_index().rename(columns={"index":"Empresa"}),
                 column_config={
-                    etiq_col:           st.column_config.Column(width="medium", pinned=True),
+                    "Empresa":          st.column_config.Column(width="medium", pinned=True),
                     "Tendencia":        st.column_config.LineChartColumn(width="small", y_min=0, pinned=True),
                     "Promedio Período": st.column_config.NumberColumn(format="%.1f"),
                 },
-                use_container_width=True, hide_index=True, height=320
+                use_container_width=True, hide_index=True, height=300
             )
 
             st.markdown("---")
             c1, c2 = st.columns(2)
             with c1:
-                df_pol = (df_folios.groupby("Nombre_Poliza", observed=True)
+                df_pol = (df_productivos.groupby("Nombre_Poliza", observed=True)
                           .size().reset_index(name="Total").sort_values("Total"))
                 fig_p  = px.bar(df_pol, x="Total", y="Nombre_Poliza", orientation="h",
                                 text="Total", title="<b>VOLUMEN POR TIPO DE PÓLIZA</b>",
@@ -1956,7 +1206,7 @@ def renderizar_pestana_polizas_cuadrillas(
                 st.plotly_chart(fig_p, use_container_width=True, config={"displayModeBar": False})
 
             with c2:
-                df_ev = (df_folios.groupby("Tipo_Orden", observed=True)
+                df_ev = (df_productivos.groupby("Tipo_Orden", observed=True)
                          .size().reset_index(name="Total").sort_values("Total").tail(10))
                 fig_e = px.bar(df_ev, x="Total", y="Tipo_Orden", orientation="h",
                                text="Total", title="<b>TOP 10 TIPOS DE EVENTO</b>",
@@ -1970,339 +1220,46 @@ def renderizar_pestana_polizas_cuadrillas(
                 fig_e.update_traces(textposition="outside", textfont=dict(color="#FFFFFF", size=10))
                 st.plotly_chart(fig_e, use_container_width=True, config={"displayModeBar": False})
 
-            # Descarga del dataset filtrado actual
-            st.download_button(
-                "Descargar dataset filtrado (CSV)",
-                df_folios.to_csv(index=False).encode("utf-8"),
-                f"Dataset_Filtrado_{ANIO_BASE_ESTRICTO}.csv", "text/csv",
-                key="dl_dataset_subtab1"
-            )
-
     # --- SUBTAB 2: DESGLOSE PÓLIZAS ---
-    # Esta tabla tiene sus PROPIOS filtros — no le afectan los filtros del sidebar.
-    # Fuente de datos: df_raw completo (pasado desde main como argumento).
     with sub_tab2:
-        st.markdown("### Desglose Operativo por Póliza, Distrito y Proveedor")
-        st.caption(
-            "Filtros independientes del sidebar. "
-            "Vivo = cuadrillas únicas (técnicos únicos con actividad en la combinación "
-            "Distrito × Empresa × Póliza para la semana seleccionada). "
-            "Balance = Vivo − Sugerido."
-        )
-
-        if not df_raw.empty and "SEMANA_DIM" in df_raw.columns:
-            # ---- Filtros propios ----
-            sems_raw   = sorted(df_raw["SEMANA_DIM"].dropna().unique(), key=_num_sem)
-            # Default: última semana registrada
-            sem_deflt  = [sems_raw[-1]] if sems_raw else []
-
-            cf1, cf2, cf3, cf4 = st.columns(4)
-            with cf1:
-                sem_sel_pol = st.multiselect(
-                    "Semana:", sems_raw, default=sem_deflt, key="pol_sem_sel"
-                )
-            with cf2:
-                dist_raw   = sorted(df_raw["Distrito"].dropna().unique())
-                dist_sel_pol = st.multiselect("Distrito:", dist_raw, key="pol_dist_sel")
-            with cf3:
-                emp_raw    = sorted(df_raw["Empresa"].dropna().unique())
-                emp_sel_pol = st.multiselect("Empresa / Proveedor:", emp_raw, key="pol_emp_sel")
-            with cf4:
-                pol_raw    = sorted([k for k in df_raw["Codigo_Poliza"].dropna().unique() if k in MAPEO_POLIZAS])
-                pol_sel_pol = st.multiselect("Póliza:", pol_raw, key="pol_pol_sel")
-
-            # Aplicar filtros propios
-            df_pol_base = df_raw.copy()
-            if sem_sel_pol:  df_pol_base = df_pol_base[df_pol_base["SEMANA_DIM"].isin(sem_sel_pol)]
-            if dist_sel_pol: df_pol_base = df_pol_base[df_pol_base["Distrito"].isin(dist_sel_pol)]
-            if emp_sel_pol:  df_pol_base = df_pol_base[df_pol_base["Empresa"].isin(emp_sel_pol)]
-            if pol_sel_pol:  df_pol_base = df_pol_base[df_pol_base["Codigo_Poliza"].isin(pol_sel_pol)]
-
-            if df_pol_base.empty:
-                st.info("Sin datos para los filtros seleccionados.")
-            else:
-                df_base_pol = (
-                    df_pol_base
-                    .groupby(["Distrito","Empresa","Codigo_Poliza","Nombre_Poliza"], observed=True)
-                    .agg(
-                        Vivo=("Usuario_Tecnico","nunique"),
-                        Eventos=("FOLIO_KEY","count"),
-                    )
-                    .reset_index()
-                    .sort_values(["Distrito","Empresa","Codigo_Poliza"])
-                    .rename(columns={"Codigo_Poliza":"Nomenclatura","Nombre_Poliza":"Modalidad"})
-                )
-
-                # Sugeridos persistidos en session_state
-                clave_sug = "sugeridos_poliza"
-                if clave_sug not in st.session_state:
-                    st.session_state[clave_sug] = {}
-
-                with st.container():
-                    def _get_sug(row):
-                        k = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
-                        return st.session_state[clave_sug].get(k, int(row["Vivo"]))
-
-                    df_base_pol["Sugerido"] = df_base_pol.apply(_get_sug, axis=1)
-                    # Un balance positivo representa cuadrillas vivas por encima de la sugerencia.
-                    df_base_pol["Balance"]  = df_base_pol["Vivo"] - df_base_pol["Sugerido"]
-
-                    def _color_balance(val):
-                        if val < 0:  return "color:#EF4444;font-weight:700;"
-                        if val == 0: return "color:#FBBF24;font-weight:700;"
-                        return "color:#10B981;font-weight:700;"
-
-                    # Resumen ejecutivo por póliza: Vivo / Sugerido y su balance total.
-                    df_resumen_pol = (
-                        df_base_pol.groupby("Nomenclatura", observed=True)
-                        .agg(Vivo=("Vivo", "sum"), Sugerido=("Sugerido", "sum"), Eventos=("Eventos", "sum"))
-                        .reset_index()
-                        .sort_values("Nomenclatura")
-                    )
-                    df_resumen_pol["Balance"] = df_resumen_pol["Vivo"] - df_resumen_pol["Sugerido"]
-
-                    st.markdown("<h4 style='color:#FFFFFF !important; margin:8px 0 2px 0;'>Resumen por póliza</h4>", unsafe_allow_html=True)
-                    st.caption("Formato: **Vivo / Sugerido**. El balance positivo indica cuadrillas disponibles por encima de la meta.")
-                    tarjetas = st.columns(len(df_resumen_pol))
-                    for tarjeta, (_, fila) in zip(tarjetas, df_resumen_pol.iterrows()):
-                        balance = int(fila["Balance"])
-                        color_balance = "#10B981" if balance > 0 else ("#EF4444" if balance < 0 else "#FBBF24")
-                        tarjeta.markdown(f"""
-                        <div style="border:1px solid #26354D;border-radius:8px;padding:8px 10px;background:#101A2E;min-height:82px;">
-                            <div style="font-size:13px;color:#CBD5E1;font-weight:700;">Póliza {fila['Nomenclatura']}</div>
-                            <div style="font-size:24px;line-height:1.15;color:#00D2C8;font-weight:800;">{int(fila['Vivo'])} <span style="font-size:16px;">/ {int(fila['Sugerido'])}</span></div>
-                            <div style="font-size:12px;color:{color_balance};font-weight:700;">Balance {balance:+d}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    empresas_sug = sorted(df_base_pol["Empresa"].dropna().unique().tolist())
-
-                    @st.dialog("Cuadrillas sugeridas por proveedor")
-                    def _dialog_sugeridos_poliza():
-                        st.caption("Selecciona el proveedor y captura todas sus pólizas disponibles dentro del período filtrado.")
-                        empresa_sug_sel = st.radio("Proveedor", empresas_sug, horizontal=True, key="empresa_sugeridos_poliza")
-                        filas_empresa_sug = df_base_pol[df_base_pol["Empresa"] == empresa_sug_sel]
-                        for _, row in filas_empresa_sug.iterrows():
-                            fila_key = f"{row['Distrito']}|{row['Empresa']}|{row['Nomenclatura']}"
-                            val_prev = st.session_state[clave_sug].get(fila_key, int(row["Vivo"]))
-                            st.session_state[clave_sug][fila_key] = st.number_input(
-                                f"{row['Nomenclatura']} · {row['Modalidad']} · {row['Distrito']}",
-                                min_value=0, value=val_prev, key=f"sug_{fila_key}",
-                            )
-
-                    @st.dialog("Detalle de técnicos y días trabajados")
-                    def _dialog_detalle_tecnicos():
-                        pol_detalle = st.selectbox(
-                            "Póliza a revisar",
-                            df_resumen_pol["Nomenclatura"].tolist(),
-                            key="poliza_detalle_tecnicos",
-                        )
-                        df_detalle_tecnicos = (
-                            df_pol_base[df_pol_base["Codigo_Poliza"] == pol_detalle]
-                            .groupby(["Usuario_Tecnico", "Distrito", "Empresa"], observed=True)
-                            .agg(
-                                Eventos=("FOLIO_KEY", "count"),
-                                Dias_Trabajados=("FECHA_TRUNCADA", "nunique"),
-                            )
-                            .reset_index()
-                            .sort_values(["Eventos", "Dias_Trabajados"], ascending=False)
-                            .rename(columns={"Usuario_Tecnico": "Técnico", "Dias_Trabajados": "Días trabajados"})
-                        )
-                        st.caption("El detalle respeta los filtros de semana, distrito, proveedor y póliza aplicados arriba.")
-                        st.dataframe(
-                            df_detalle_tecnicos,
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "Técnico": st.column_config.Column(width="medium", pinned=True),
-                                "Distrito": st.column_config.Column(width="small"),
-                                "Empresa": st.column_config.Column(width="medium"),
-                                "Eventos": st.column_config.NumberColumn(width="small"),
-                                "Días trabajados": st.column_config.NumberColumn(width="small"),
-                            },
-                        )
-                        st.download_button(
-                            "Descargar detalle de técnicos (CSV)",
-                            df_detalle_tecnicos.to_csv(index=False).encode("utf-8"),
-                            f"Detalle_Tecnicos_{pol_detalle}.csv",
-                            "text/csv",
-                            key="dl_detalle_tecnicos_poliza",
-                        )
-
-                    boton_sug, boton_det = st.columns(2)
-                    if boton_sug.button("Configurar cuadrillas sugeridas", type="primary", use_container_width=True):
-                        _dialog_sugeridos_poliza()
-                    if boton_det.button("Ver detalle de técnicos y días trabajados", use_container_width=True):
-                        _dialog_detalle_tecnicos()
-
-                    df_show_pol = df_base_pol[
-                        ["Distrito","Empresa","Nomenclatura","Modalidad","Sugerido","Vivo","Balance","Eventos"]
-                    ]
-                    st.dataframe(
-                        df_show_pol.style.applymap(_color_balance, subset=["Balance"]),
-                        use_container_width=True, hide_index=True, height=500,
-                        column_config={
-                            "Distrito":     st.column_config.Column(width="small",  pinned=True),
-                            "Empresa":      st.column_config.Column(width="medium"),
-                            "Nomenclatura": st.column_config.Column(width="small"),
-                            "Modalidad":    st.column_config.Column(width="medium"),
-                            "Sugerido":     st.column_config.NumberColumn(width="small"),
-                            "Vivo":         st.column_config.NumberColumn(width="small"),
-                            "Balance":      st.column_config.NumberColumn(width="small"),
-                            "Eventos":      st.column_config.NumberColumn(width="small"),
-                        }
-                    )
-                    st.download_button(
-                        "Descargar desglose (CSV)",
-                        df_show_pol.to_csv(index=False).encode("utf-8"),
-                        "Desglose_Polizas.csv","text/csv"
-                    )
-        else:
-            st.info("Sin datos disponibles en el repositorio.")
+        st.markdown("### Resumen Operativo por Tipo de Póliza")
+        if not df_productivos.empty:
+            df_rp = (df_productivos.groupby(["Codigo_Poliza","Nombre_Poliza"], observed=True)
+                     .agg(Total_Eventos=("FOLIO_KEY","count"),
+                          Cuadrillas=("Usuario_ID","nunique"))
+                     .reset_index())
+            dias_pol = df_productivos.groupby(["Codigo_Poliza","Nombre_Poliza"], observed=True).apply(
+                lambda g: dias_calendario_de_seleccion(g,dimension_sel), include_groups=False
+            ).rename("Días Calendario").reset_index()
+            df_rp = df_rp.merge(dias_pol,on=["Codigo_Poliza","Nombre_Poliza"])
+            df_rp["Eventos / Día Equipo"] = (df_rp["Total_Eventos"] / df_rp["Días Calendario"]).round().astype(int)
+            df_rp["Productividad / Cuadrilla"] = np.vectorize(calcular_indice_productividad_diaria)(df_rp["Total_Eventos"],df_rp["Cuadrillas"],df_rp["Días Calendario"])
+            st.dataframe(df_rp, use_container_width=True, hide_index=True)
 
     # --- SUBTAB 3: RANKING ---
     with sub_tab3:
         st.markdown("### Ranking de Productividad por Técnico / Cuadrilla")
-        st.caption("Solo pólizas elegibles (D1, D6, E3, M3, M4, MT, R3). Excluye proveedores ITAI, TOTALBOX y TOTALPLAY. Excluye generación-25.")
-        if not df_folios.empty:
-            col_rk1, col_rk2 = st.columns([0.6, 0.4])
-            with col_rk1:
-                ord_rk = st.radio("Ordenar por:", ["Productividad Diaria","Eventos Totales","Días Activos"],
-                                  horizontal=True, key="orden_ranking")
-            with col_rk2:
-                dir_rk = st.radio("Dirección:", ["Mayor a menor","Menor a mayor"],
-                                  horizontal=True, key="dir_ranking")
-            asc_rk = (dir_rk == "Menor a mayor")
-            col_ord_map = {
-                "Productividad Diaria": "Productividad_Diaria",
-                "Eventos Totales":      "Eventos_Totales",
-                "Días Activos":         "Dias_Activos",
-            }
+        if not df_productivos.empty:
+            df_rk = (df_productivos.groupby(["Usuario_Tecnico","Usuario_ID","Codigo_Poliza","Nombre_Poliza","Empresa"], observed=True)
+                     .agg(Eventos_Totales=("FOLIO_KEY","count"))
+                     .reset_index())
+            dias_rk = df_productivos.groupby(["Usuario_Tecnico","Usuario_ID","Codigo_Poliza","Nombre_Poliza","Empresa"], observed=True).apply(
+                lambda g: dias_calendario_de_seleccion(g,dimension_sel), include_groups=False
+            ).rename("Días Calendario").reset_index()
+            df_rk = df_rk.merge(dias_rk,on=["Usuario_Tecnico","Usuario_ID","Codigo_Poliza","Nombre_Poliza","Empresa"])
+            df_rk["Eventos / Día Equipo"] = (df_rk["Eventos_Totales"] / df_rk["Días Calendario"]).round().astype(int)
+            df_rk["Productividad / Cuadrilla"] = (df_rk["Eventos_Totales"] / df_rk["Días Calendario"]).round(2)
+            df_rk = df_rk.sort_values("Productividad / Cuadrilla", ascending=False)
+            st.dataframe(df_rk, use_container_width=True, hide_index=True, height=420)
 
-            df_rk = (df_folios.groupby(
-                ["Usuario_Tecnico","Distrito","Empresa","Codigo_Poliza","Nombre_Poliza"], observed=True
-            ).agg(
-                Eventos_Totales=("FOLIO_KEY","count"),
-                Dias_Activos=("FECHA_TRUNCADA","nunique"),
-            ).reset_index())
-
-            # Productividad por técnico = Eventos / Días-activos propios (no días globales)
-            df_rk["Productividad_Diaria"] = np.where(
-                df_rk["Dias_Activos"] > 0,
-                np.round(df_rk["Eventos_Totales"] / df_rk["Dias_Activos"], 2),
-                0.0
-            )
-            df_rk = df_rk.sort_values(col_ord_map[ord_rk], ascending=asc_rk)
-            df_rk.columns = [
-                "Técnico","Distrito","Empresa","Póliza","Modalidad",
-                "Eventos Totales","Días Activos","Productividad Diaria"
-            ]
-            st.dataframe(
-                df_rk,
-                use_container_width=True, hide_index=True, height=440,
-                column_config={
-                    "Técnico":             st.column_config.Column(width="large", pinned=True),
-                    "Distrito":            st.column_config.Column(width="small"),
-                    "Empresa":             st.column_config.Column(width="medium"),
-                    "Póliza":              st.column_config.Column(width="small"),
-                    "Modalidad":           st.column_config.Column(width="medium"),
-                    "Eventos Totales":     st.column_config.NumberColumn(width="small"),
-                    "Días Activos":        st.column_config.NumberColumn(width="small"),
-                    "Productividad Diaria":st.column_config.NumberColumn(format="%.2f", width="small"),
-                }
-            )
-            st.download_button(
-                "Descargar ranking (CSV)",
-                df_rk.to_csv(index=False).encode("utf-8"),
-                "Ranking_Cuadrillas.csv","text/csv"
-            )
-
-    # --- SUBTAB 4: CARGA DE EVENTOS ---
+    # --- SUBTAB 4: DESCARGA ---
     with sub_tab4:
-        st.markdown("### Carga de Eventos por Póliza")
-        st.caption("Eventos asignados, completados y participación de MTTO con filtros independientes del sidebar.")
-
-        if not df_raw.empty and "SEMANA_DIM" in df_raw.columns:
-            sems_carga = sorted(df_raw["SEMANA_DIM"].dropna().unique(), key=_num_sem)
-            sem_def_carga = [sems_carga[-1]] if sems_carga else []
-            cc1, cc2, cc3, cc4 = st.columns(4)
-            with cc1:
-                sem_sel_carga = st.multiselect("Semana:", sems_carga, default=sem_def_carga, key="carga_sem_sel")
-            with cc2:
-                dist_sel_carga = st.multiselect("Distrito:", sorted(df_raw["Distrito"].dropna().unique()), key="carga_dist_sel")
-            with cc3:
-                emp_sel_carga = st.multiselect("Empresa / Proveedor:", sorted(df_raw["Empresa"].dropna().unique()), key="carga_emp_sel")
-            with cc4:
-                pols_carga = sorted([p for p in df_raw["Codigo_Poliza"].dropna().unique() if p in MAPEO_POLIZAS])
-                pol_sel_carga = st.multiselect("Póliza:", pols_carga, key="carga_pol_sel")
-
-            df_carga = df_raw.copy()
-            if sem_sel_carga: df_carga = df_carga[df_carga["SEMANA_DIM"].isin(sem_sel_carga)]
-            if dist_sel_carga: df_carga = df_carga[df_carga["Distrito"].isin(dist_sel_carga)]
-            if emp_sel_carga: df_carga = df_carga[df_carga["Empresa"].isin(emp_sel_carga)]
-            if pol_sel_carga: df_carga = df_carga[df_carga["Codigo_Poliza"].isin(pol_sel_carga)]
-
-            if df_carga.empty:
-                st.info("Sin eventos para los filtros seleccionados.")
-            else:
-                df_carga["_COMPLETADO"] = False
-                if "Estatus_Registro" in df_carga.columns:
-                    df_carga["_COMPLETADO"] = df_carga["Estatus_Registro"].astype(str).str.upper().str.contains(
-                        r"TERMINAD|COMPLET|CERRAD", regex=True, na=False
-                    )
-                if "_datetime_termino" in df_carga.columns:
-                    df_carga["_COMPLETADO"] = df_carga["_COMPLETADO"] | pd.to_datetime(
-                        df_carga["_datetime_termino"], errors="coerce"
-                    ).notna()
-                df_carga["_ES_MTTO"] = df_carga["Codigo_Poliza"].eq("MT")
-
-                df_carga_pol = (
-                    df_carga.groupby(["Distrito", "Empresa", "Codigo_Poliza", "Nombre_Poliza"], observed=True)
-                    .agg(
-                        Asignados=("FOLIO_KEY", "nunique"),
-                        Completados=("_COMPLETADO", "sum"),
-                        Completados_MTTO=("_ES_MTTO", lambda s: int((s & df_carga.loc[s.index, "_COMPLETADO"]).sum())),
-                    )
-                    .reset_index()
-                    .rename(columns={"Codigo_Poliza": "Póliza", "Nombre_Poliza": "Modalidad", "Completados_MTTO": "MTTO completados"})
-                )
-                df_carga_pol["% completado"] = np.where(
-                    df_carga_pol["Asignados"] > 0,
-                    np.round(df_carga_pol["Completados"] / df_carga_pol["Asignados"] * 100, 1), 0.0
-                )
-
-                resumen_carga = (
-                    df_carga_pol.groupby("Póliza", observed=True)
-                    .agg(Asignados=("Asignados", "sum"), Completados=("Completados", "sum"), MTTO=("MTTO completados", "sum"))
-                    .reset_index().sort_values("Póliza")
-                )
-                st.markdown("<h4 style='color:#FFFFFF !important; margin:8px 0 2px 0;'>Carga por póliza</h4>", unsafe_allow_html=True)
-                st.caption("Formato: **Asignados / Completados** · MTTO indica los completados pertenecientes a la póliza MT.")
-                cards_carga = st.columns(len(resumen_carga))
-                for card, (_, fila) in zip(cards_carga, resumen_carga.iterrows()):
-                    mtto_txt = f"MTTO: {int(fila['MTTO'])}" if fila["Póliza"] == "MT" else ""
-                    card.markdown(f"""
-                    <div style="border:1px solid #26354D;border-radius:8px;padding:8px 10px;background:#101A2E;min-height:82px;">
-                        <div style="font-size:13px;color:#CBD5E1;font-weight:700;">Póliza {fila['Póliza']}</div>
-                        <div style="font-size:24px;line-height:1.15;color:#00D2C8;font-weight:800;">{int(fila['Asignados'])} <span style="font-size:16px;">/ {int(fila['Completados'])}</span></div>
-                        <div style="font-size:12px;color:#FBBF24;font-weight:700;">{mtto_txt}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                st.dataframe(
-                    df_carga_pol[["Distrito", "Empresa", "Póliza", "Modalidad", "Asignados", "Completados", "MTTO completados", "% completado"]],
-                    use_container_width=True, hide_index=True, height=500,
-                    column_config={"% completado": st.column_config.NumberColumn(format="%.1f%%")},
-                )
-                st.download_button(
-                    "Descargar carga de eventos (CSV)",
-                    df_carga_pol.to_csv(index=False).encode("utf-8"),
-                    "Carga_Eventos_Poliza.csv", "text/csv", key="dl_carga_eventos_poliza",
-                )
-        else:
-            st.info("Sin datos disponibles en el repositorio.")
-
-
+        st.markdown("### Descarga de Reportes")
+        st.download_button(
+            "Descargar Dataset (CSV)",
+            df_folios.to_csv(index=False).encode("utf-8"),
+            f"Reporte_{ANIO_BASE_ESTRICTO}.csv", "text/csv"
+        )
 
 
 # ==============================================================================
@@ -2311,75 +1268,16 @@ def renderizar_pestana_polizas_cuadrillas(
 
 def renderizar_modulo_carga_github():
     st.markdown("""<style>
-    /* ── Contenedor completo del formulario de carga ── */
-    .st-key-formulario_carga,
-    .st-key-formulario_carga * {
-        color: #000000 !important;
-        -webkit-text-fill-color: #000000 !important;
-    }
-    /* Labels de todos los campos */
-    .st-key-formulario_carga label,
-    .st-key-formulario_carga .stMarkdown p,
-    .st-key-formulario_carga .stCaption p {
-        color: #1E3E62 !important;
-        font-weight: 600 !important;
-    }
-    /* Selectbox / Dropdown */
-    .st-key-formulario_carga [data-testid="stSelectbox"] > div,
+    .st-key-formulario_carga [data-testid="stSelectbox"] div,
     .st-key-formulario_carga [data-testid="stSelectbox"] input,
-    .st-key-formulario_carga [data-testid="stSelectbox"] [role="combobox"],
-    .st-key-formulario_carga [data-baseweb="select"] > div {
-        background: #ffffff !important;
-        color: #000000 !important;
-        border: 1px solid #CBD5E1 !important;
-        border-radius: 7px !important;
-    }
-    /* Opciones del dropdown */
+    .st-key-formulario_carga [data-testid="stSelectbox"] [role="combobox"] {{
+        background: #ffffff !important; color: #000000 !important;
+        -webkit-text-fill-color: #000000 !important;
+    }}
     body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="listbox"],
-    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"] {
-        background-color: #ffffff !important;
-        color: #000000 !important;
-    }
-    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"]:hover {
-        background-color: #E2E8F0 !important;
-    }
-    /* Radio buttons */
-    .st-key-formulario_carga [data-testid="stRadio"] label,
-    .st-key-formulario_carga [data-testid="stRadio"] p {
-        color: #000000 !important;
-        font-weight: 500 !important;
-    }
-    /* Text inputs */
-    .st-key-formulario_carga [data-testid="stTextInput"] input,
-    .st-key-formulario_carga [data-testid="stTextArea"] textarea {
-        background-color: #ffffff !important;
-        color: #000000 !important;
-        border: 1px solid #CBD5E1 !important;
-        border-radius: 7px !important;
-    }
-    /* Password input */
-    .st-key-formulario_carga [data-testid="stTextInput"] input[type="password"] {
-        background-color: #ffffff !important;
-        color: #000000 !important;
-    }
-    /* Caption / info */
-    .st-key-formulario_carga [data-testid="stCaptionContainer"] p {
-        color: #475569 !important;
-    }
-    /* Botón principal de guardar */
-    .st-key-formulario_carga div.stButton > button[kind="primary"] {
-        background-color: #1E3E62 !important;
-        color: #ffffff !important;
-        border: none !important;
-        font-weight: 700 !important;
-    }
-    /* Métricas dentro del formulario */
-    .st-key-formulario_carga [data-testid="stMetricValue"] {
-        color: #1E3E62 !important;
-    }
-    .st-key-formulario_carga [data-testid="stMetricLabel"] {
-        color: #475569 !important;
-    }
+    body:has(.st-key-formulario_carga) [data-baseweb="popover"] [role="option"] {{
+        background-color: #ffffff !important; color: #000000 !important;
+    }}
     </style>""", unsafe_allow_html=True)
     with st.container(key="formulario_carga"):
         _renderizar_formulario_carga_github()
@@ -2452,21 +1350,8 @@ def _renderizar_formulario_carga_github():
                                    placeholder="CIERRE DIARIO SEM 38 2026.csv").strip()
         if nombre_inp:
             candidato = nombre_inp if nombre_inp.lower().endswith(".csv") else f"{nombre_inp}.csv"
-            ruta_candidato = prefijo + candidato
-            if ruta_candidato in inventario:
-                st.warning(
-                    f"**`{candidato}`** ya aparece en el inventario del repositorio. "
-                    "Si lo borraste de GitHub y quieres volver a cargarlo, confirma abajo. "
-                    "Si solo quieres actualizarlo con nuevas filas, elige 'Actualizar un CSV existente'."
-                )
-                sobrescribir = st.checkbox(
-                    "Sí, quiero sobrescribir / volver a crear este archivo",
-                    key="chk_sobrescribir_csv"
-                )
-                if sobrescribir:
-                    nombre_csv = candidato   # permitir la carga
-                    # Limpiar inventario para que no haya falsos positivos
-                    inventario_repositorio_github.clear()
+            if prefijo + candidato in inventario:
+                st.error("Ese nombre ya existe. Elige 'Actualizar' o escribe otro nombre.")
             else:
                 nombre_csv = candidato
 
@@ -2475,11 +1360,6 @@ def _renderizar_formulario_carga_github():
         st.info(f"Destino: `{GITHUB_REPO}/{destino}`")
 
     clave = st.text_input("Clave de autorización:", type="password", key="token_auth_carga_v2")
-
-    st.caption(
-        "El Parquet histórico se genera localmente con `generar_parquet.py`. "
-        "El dashboard sólo consulta el archivo consolidado para mantener una apertura rápida."
-    )
 
     puede_guardar = df_preview is not None and destino is not None
     if st.button("Guardar CSV en GitHub", type="primary", disabled=not puede_guardar, key="guardar_captura"):
@@ -2501,13 +1381,24 @@ def _renderizar_formulario_carga_github():
         st.success(f"Guardado y verificado: {destino} — {len(final):,} registros.")
         st.link_button("Ver el CSV en GitHub", confirmado["url"])
 
-        st.info(
-            "El CSV quedó guardado como respaldo. Para actualizar el dashboard, "
-            "ejecuta `generar_parquet.py` en VS Code y sube el Parquet resultante."
-        )
+        if carpeta and carpeta.rstrip("/") == GITHUB_FOLDER.strip("/"):
+            with st.spinner("Regenerando el dataset consolidado..."):
+                try:
+                    cons = _regenerar_parquet_consolidado(nombre_csv, final)
+                    if cons is None or cons.empty:
+                        raise ValueError("Consolidado vacío.")
+                    buf = io.BytesIO()
+                    cons.to_parquet(buf, index=False)
+                    rp = "/".join(p for p in (GITHUB_FOLDER.strip("/"), "datos_consolidados.parquet") if p)
+                    ok, det = _push_blob_git_data_api(rp, buf.getvalue(), f"Consolidado tras {nombre_csv}")
+                    if ok:
+                        st.success("Dataset consolidado actualizado. El dashboard reflejará los datos de inmediato.")
+                    else:
+                        raise ValueError(det)
+                except Exception as exc:
+                    st.warning(f"El CSV sí quedó guardado, pero no se pudo regenerar el consolidado: {exc}")
 
         st.cache_data.clear()
-        inventario_repositorio_github.clear()
         listar_archivos_semanales_github.clear()
         st.rerun()
 
@@ -2531,6 +1422,11 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
                "Num_Semana_Archivo":"Semana","TIPO_2":"Tipo / Causa Origen",
                "Falla_Nueva":"Falla (Soporte)","Empresa_Origen_Reincidencia":"Empresa Técnico"}
     df_show = df_m[cols_pr].rename(columns=renames)
+    cuentas = sorted(df_show["Cuenta"].dropna().astype(str).unique()) if "Cuenta" in df_show else []
+    if cuentas:
+        cuenta_copiable = st.selectbox("Cuenta para copiar", cuentas, key="cuenta_copiable_soporte")
+        st.caption("Toca el icono de copiar del recuadro para llevar la cuenta al portapapeles.")
+        st.code(cuenta_copiable, language=None)
     st.dataframe(df_show, use_container_width=True, hide_index=True, height=380)
     st.download_button(
         f"Descargar historial de {usuario_nom} (CSV)",
@@ -2547,6 +1443,8 @@ def mostrar_modal_detalle_cuenta(df_cuenta: pd.DataFrame, cuenta_id: str):
     (resuelto con la misma regla: N/A → Tipo_Orden; distinto → "Soporte"), falla y causa.
     """
     st.markdown(f"**Cuenta:** `{cuenta_id}`  ·  **{len(df_cuenta):,}** visitas reincidentes registradas")
+    st.caption("Copia la cuenta desde este recuadro:")
+    st.code(str(cuenta_id), language=None)
     if df_cuenta.empty:
         st.info("Sin folios reincidentes para esta cuenta.")
         return
@@ -2558,7 +1456,7 @@ def mostrar_modal_detalle_cuenta(df_cuenta: pd.DataFrame, cuenta_id: str):
         t2 = str(row.get("TIPO_2", "")).strip().upper()
         if t2 in ["", "N/A", "NAN", "NONE", "NULL"]:
             return str(row.get("Tipo_Orden", "SIN TIPO")).strip()
-        return "SOPORTE"
+        return str(row.get("TIPO_2", "SIN TIPO")).strip()
 
     df_m["Tipo Reincidente"] = df_m.apply(_tipo_rein_display, axis=1)
 
@@ -2578,13 +1476,10 @@ def mostrar_modal_detalle_cuenta(df_cuenta: pd.DataFrame, cuenta_id: str):
     # Mini-resumen por tipo reincidente
     resumen = df_m["Tipo Reincidente"].value_counts().reset_index()
     resumen.columns = ["Tipo Reincidente", "Visitas"]
-    c1, c2 = st.columns([0.35, 0.65])
-    with c1:
-        st.markdown("**Distribución por tipo:**")
-        st.dataframe(resumen, hide_index=True, use_container_width=True, height=180)
-    with c2:
-        st.markdown("**Historial de folios:**")
-        st.dataframe(df_show, hide_index=True, use_container_width=True, height=340)
+    st.markdown("**Distribución por tipo:**")
+    st.dataframe(resumen, hide_index=True, use_container_width=True, height=180)
+    st.markdown("**Historial de folios:**")
+    st.dataframe(df_show, hide_index=True, use_container_width=True, height=340)
 
     st.download_button(
         f"Descargar historial de cuenta {cuenta_id} (CSV)",
@@ -2654,7 +1549,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     tasa_efectividad  = round(100.0 - tasa_reincidencia, 2)
 
     st.markdown(f"""
-    <div class="kpi-grid-4">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">
         <div class="kpi-card-enterprise">
             <div class="kpi-card-title">Órdenes Completadas (Base)</div>
             <div class="kpi-card-value">{total_base:,}</div>
@@ -2679,13 +1574,8 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
     """, unsafe_allow_html=True)
 
     # --------------------------------------------------------------------------
-    # GRÁFICA: LÍNEA DE TIEMPO DE REINCIDENCIAS POR TIPO REINCIDENTE
-    # Regla de dimensión "Tipo Reincidente":
-    #   • Si TIPO_2 es N/A (o vacío) → se toma el valor de Tipo_Orden del evento
-    #     actual (la visita de Soporte reincidente).
-    #   • Si TIPO_2 tiene un valor distinto de N/A → se clasifica como "Soporte"
-    #     (porque TIPO_2 viene del antecedente, lo que indica que la visita actual
-    #     es un Soporte puro sobre un trabajo previo ya catalogado).
+    # LÍNEA DE TIEMPO: muestra la causa/tipo del antecedente inmediato. Si la
+    # causa es NA, TIPO_2 ya contiene el tipo anterior, incluida Instalación.
     # --------------------------------------------------------------------------
     if not df_fr.empty:
         st.markdown("""<div class="matrix-title-card" style="margin-top:16px;">
@@ -2697,7 +1587,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             t2 = str(row.get("TIPO_2", "")).strip().upper()
             if t2 in ["", "N/A", "NAN", "NONE", "NULL"]:
                 return str(row.get("Tipo_Orden", "SIN TIPO")).strip()
-            return "SOPORTE"
+            return str(row.get("TIPO_2", "SIN TIPO")).strip()
 
         df_fr_graf = df_fr.copy()
         df_fr_graf["_TIPO_REIN"] = df_fr_graf.apply(_resolver_tipo_rein, axis=1)
@@ -2721,9 +1611,14 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             .size().reset_index(name="Reincidencias")
         )
 
+        # Paleta de colores rotativa para los tipos
+        colores_tipos = [
+            PALETA_COLOR["naranja_desierto"], PALETA_COLOR["turquesa_cyan"],
+            PALETA_COLOR["amarillo_sol"],     PALETA_COLOR["verde_montana"],
+            PALETA_COLOR["azul_marina"],      "#A78BFA", "#F43F5E", "#06B6D4"
+        ]
         tipos_unicos = sorted(df_graf_agg["_TIPO_REIN"].unique())
-        # Misma identidad visual que Productividad: barras azul marina y tendencia turquesa.
-        mapa_color = {t: PALETA_COLOR["azul_marina"] for t in tipos_unicos}
+        mapa_color   = {t: colores_tipos[i % len(colores_tipos)] for i, t in enumerate(tipos_unicos)}
 
         fig_rein = go.Figure()
         for tipo in tipos_unicos:
@@ -2740,7 +1635,7 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             fig_rein.add_trace(go.Scatter(
                 x=sub[dim_col], y=tend, name=f"Tendencia {tipo}",
                 mode="lines", showlegend=False,
-                line=dict(color=PALETA_COLOR["turquesa_cyan"], width=1.5, dash="dot"),
+                line=dict(color=mapa_color[tipo], width=1.5, dash="dot"),
             ))
 
         fig_rein.update_layout(
@@ -2803,32 +1698,17 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
             "Efectividad_%":                "% Efectividad",
         }).sort_values("Total Reincidencias", ascending=False)
 
-        # Filtro de técnicos por cuenta seleccionada (se conecta con la sección de cuentas)
-        cuenta_filtro_tech = st.session_state.get("cuenta_activa_rein", None)
-        if cuenta_filtro_tech:
-            techs_de_cuenta = set(
-                df_fr[df_fr["Cuenta_Cliente"] == cuenta_filtro_tech]["Usuario_Origen_Reincidencia"].dropna()
-            )
-            df_agt_vis = df_agt[df_agt["Técnico Reincidente (Origen)"].isin(techs_de_cuenta)]
-            st.info(f"Mostrando técnicos involucrados en cuenta {cuenta_filtro_tech}. "
-                    f"({len(df_agt_vis)} de {len(df_agt)})")
-            if st.button("Ver todos los técnicos", key="btn_clear_cuenta_tech"):
-                st.session_state["cuenta_activa_rein"] = None
-                st.rerun()
-        else:
-            df_agt_vis = df_agt
-
         col_t1, col_t2 = st.columns([0.75, 0.25])
         with col_t1:
-            st.dataframe(df_agt_vis[["Técnico Reincidente (Origen)","Empresa","Eventos Completados",
-                                     "Total Reincidencias","% Efectividad","Causas_TIPO_2","Fallas_Nuevas"]],
+            st.dataframe(df_agt[["Técnico Reincidente (Origen)","Empresa","Eventos Completados",
+                                  "Total Reincidencias","% Efectividad","Causas_TIPO_2","Fallas_Nuevas"]],
                          use_container_width=True, hide_index=True, height=360,
                          column_config={"% Efectividad": st.column_config.NumberColumn(format="%.2f %%")})
         with col_t2:
             st.markdown("**Ver detalle ampliado:**")
-            tech_lista = sorted(df_agt_vis["Técnico Reincidente (Origen)"].unique())
-            tech_sel   = st.selectbox("Seleccionar técnico:", tech_lista, key="sb_pop_tech") if tech_lista else None
-            if tech_sel and st.button("Abrir detalle", use_container_width=True, key="btn_pop_tech"):
+            tech_lista = sorted(df_agt["Técnico Reincidente (Origen)"].unique())
+            tech_sel   = st.selectbox("Seleccionar técnico:", tech_lista, key="sb_pop_tech")
+            if st.button("Abrir detalle", use_container_width=True, key="btn_pop_tech"):
                 mostrar_modal_detalle_usuario(
                     df_fr[df_fr["Usuario_Origen_Reincidencia"] == tech_sel], tech_sel
                 )
@@ -2931,20 +1811,12 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
                 st.metric("Reincidencias de esta cuenta",
                           int(df_cta.loc[df_cta["Cuenta"] == cuenta_sel, "Reincidencias"].iloc[0]))
 
-            col_btn1, col_btn2 = st.columns(2)
-            with col_btn1:
-                if st.button("Ver historial completo", type="primary",
-                             disabled=(cuenta_sel is None), use_container_width=True,
-                             key="btn_popup_cuenta"):
-                    mostrar_modal_detalle_cuenta(
-                        df_fr[df_fr["Cuenta_Cliente"] == cuenta_sel], str(cuenta_sel)
-                    )
-            with col_btn2:
-                if st.button("Filtrar técnicos", type="secondary",
-                             disabled=(cuenta_sel is None), use_container_width=True,
-                             key="btn_filtrar_tech_por_cuenta"):
-                    st.session_state["cuenta_activa_rein"] = cuenta_sel
-                    st.rerun()
+            if st.button("Ver historial completo", type="primary",
+                         disabled=(cuenta_sel is None), use_container_width=True,
+                         key="btn_popup_cuenta"):
+                mostrar_modal_detalle_cuenta(
+                    df_fr[df_fr["Cuenta_Cliente"] == cuenta_sel], str(cuenta_sel)
+                )
 
         # Descarga completa
         st.download_button(
@@ -2957,332 +1829,32 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
 
 
 # ==============================================================================
-# 12a. MÓDULO CAMBIOS DE EQUIPO
-# ==============================================================================
-
-def renderizar_pestana_cambios_equipo(df_folios: pd.DataFrame, df_raw: pd.DataFrame, dimension_sel: str) -> None:
-    """
-    Módulo Cambios de Equipo.
-    Efectividad = Cambio de equipo sin Soporte con falla "Cambio de ONT" en 60 días posteriores.
-    Estructura preparada para conexión futura con consumo de materiales.
-    """
-    st.markdown("### Cambios de Equipo — Control de Efectividad")
-
-    # Filtros independientes
-    fi1, fi2, fi3, fi4 = st.columns(4)
-    df_ce_base = df_raw.copy() if not df_raw.empty else df_folios.copy()
-
-    sems_ce   = sorted(df_ce_base.get("SEMANA_DIM", pd.Series()).dropna().unique() if "SEMANA_DIM" in df_ce_base.columns else [], key=_num_sem)
-    distr_ce  = sorted(df_ce_base["Distrito"].dropna().unique()) if "Distrito" in df_ce_base.columns else []
-    emp_ce    = sorted(df_ce_base["Empresa"].dropna().unique())  if "Empresa"  in df_ce_base.columns else []
-
-    with fi1:
-        sel_sem_ce  = st.multiselect("Semana:", sems_ce,  key="ce_sem")
-    with fi2:
-        sel_dist_ce = st.multiselect("Distrito:", distr_ce, key="ce_dist")
-    with fi3:
-        sel_emp_ce  = st.multiselect("Empresa:", emp_ce,  key="ce_emp")
-    with fi4:
-        ventana_dias = st.number_input("Ventana de efectividad (días):", 1, 180, 60, key="ce_ventana")
-
-    df_ce = df_ce_base.copy()
-    if sel_sem_ce:  df_ce = df_ce[df_ce["SEMANA_DIM"].isin(sel_sem_ce)]
-    if sel_dist_ce: df_ce = df_ce[df_ce["Distrito"].isin(sel_dist_ce)]
-    if sel_emp_ce:  df_ce = df_ce[df_ce["Empresa"].isin(sel_emp_ce)]
-
-    # Cambios de equipo
-    mask_ce = df_ce["Tipo_Orden"].str.upper().str.contains("CAMBIO DE EQUIPO", na=False)
-    df_ce_ev = df_ce[mask_ce].copy()
-    total_ce = len(df_ce_ev)
-
-    # Soporte con falla "Cambio de ONT" (buscar en Falla_Registro o Causa_Registro)
-    mask_sop = df_ce["Tipo_Orden"].str.upper().str.contains("SOPORTE", na=False)
-    df_sop   = df_ce[mask_sop].copy()
-    col_falla_ce = "Falla_Registro" if "Falla_Registro" in df_sop.columns else None
-    if col_falla_ce:
-        mask_ont = df_sop[col_falla_ce].str.upper().str.contains("ONT", na=False)
-        df_sop_ont = df_sop[mask_ont].copy()
-    else:
-        df_sop_ont = pd.DataFrame()
-
-    # Cruzar: cambios de equipo que tienen un soporte ONT posterior en < ventana_dias
-    tiene_fechas = "_datetime_parsed" in df_ce.columns and "_datetime_termino" in df_ce.columns
-    ce_fallidos = 0
-    if not df_ce_ev.empty and not df_sop_ont.empty and tiene_fechas:
-        for _, ce_row in df_ce_ev.iterrows():
-            f_cierre_ce = ce_row.get("_datetime_termino")
-            cta = ce_row.get("Cuenta_Cliente")
-            if pd.isna(f_cierre_ce) or pd.isna(cta):
-                continue
-            sop_misma_cta = df_sop_ont[df_sop_ont["Cuenta_Cliente"] == cta]
-            for _, sop_row in sop_misma_cta.iterrows():
-                f_sop = sop_row.get("_datetime_parsed")
-                if pd.notna(f_sop):
-                    delta = (pd.Timestamp(f_sop) - pd.Timestamp(f_cierre_ce)).days
-                    if 0 < delta <= ventana_dias:
-                        ce_fallidos += 1
-                        break
-
-    ce_efectivos = total_ce - ce_fallidos
-    tasa_efect   = round(ce_efectivos / total_ce * 100, 1) if total_ce > 0 else 0.0
-
-    # KPIs
-    k1, k2, k3, k4 = st.columns(4)
-    _col_ce = st.columns(4)
-    for _c, _titulo, _val, _sub, _col in [
-        (_col_ce[0], "Total Cambios de Equipo",       f"{total_ce:,}",    "En el período filtrado",          PALETA_COLOR["turquesa_cyan"]),
-        (_col_ce[1], f"Fallidos (ONT ≤{ventana_dias}d)", f"{ce_fallidos:,}", "Con reincidencia de falla ONT",   PALETA_COLOR["amarillo_sol"]),
-        (_col_ce[2], "Efectivos",                     f"{ce_efectivos:,}","Sin falla ONT posterior",         PALETA_COLOR["verde_montana"]),
-        (_col_ce[3], "Tasa de Efectividad",           f"{tasa_efect}%",   "Cambios sin falla posterior",     PALETA_COLOR["turquesa_cyan"]),
-    ]:
-        _c.markdown(f"""<div class="kpi-card-enterprise">
-            <div class="kpi-card-title">{_titulo}</div>
-            <div class="kpi-card-value" style="color:{_col} !important;">{_val}</div>
-            <div class="kpi-card-subtitle">{_sub}</div>
-        </div>""", unsafe_allow_html=True)
-
-    # Gráfico de línea de tiempo
-    if not df_ce_ev.empty and "SEMANA_DIM" in df_ce_ev.columns:
-        st.markdown("---")
-        sems_ord_ce = sorted(df_ce_ev["SEMANA_DIM"].dropna().unique(), key=_num_sem)
-        cnt_ce = df_ce_ev.groupby("SEMANA_DIM").size().reindex(sems_ord_ce, fill_value=0)
-        tend_ce = calcular_tendencia_lineal_robusta(cnt_ce.tolist())
-
-        fig_ce = go.Figure()
-        fig_ce.add_trace(go.Bar(
-            x=sems_ord_ce, y=cnt_ce.values,
-            name="Cambios de Equipo", marker_color=PALETA_COLOR["azul_marina"], opacity=0.85,
-        ))
-        fig_ce.add_trace(go.Scatter(
-            x=sems_ord_ce, y=tend_ce, name="Tendencia",
-            mode="lines", line=dict(color=PALETA_COLOR["turquesa_cyan"], width=2, dash="dash"),
-        ))
-        fig_ce.update_layout(
-            paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-            font=dict(family="Arial, sans-serif", size=11, color="#000000"),
-            margin=dict(l=50, r=30, t=40, b=120),
-            title=dict(text="<b>CAMBIOS DE EQUIPO POR SEMANA</b>",
-                       x=0.01, font=dict(size=13, color="#000000")),
-            xaxis=dict(tickangle=-45, tickfont=dict(size=9, color="#000000"),
-                       type="category", categoryorder="array", categoryarray=sems_ord_ce),
-            yaxis=dict(showgrid=True, gridcolor="#E2E8F0", tickfont=dict(color="#000000", size=10)),
-            legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="center", x=0.5),
-            dragmode=False,
-        )
-        st.plotly_chart(fig_ce, use_container_width=True, key="fig_cambios_equipo",
-                        config={"displayModeBar": False})
-
-    # Tabla por técnico
-    st.markdown("---")
-    st.markdown("#### Detalle por Técnico")
-    if not df_ce_ev.empty:
-        df_ce_tech = (df_ce_ev.groupby(["Usuario_Tecnico","Empresa","Distrito"], observed=True)
-                      .size().reset_index(name="Cambios de Equipo")
-                      .sort_values("Cambios de Equipo", ascending=False))
-        st.dataframe(df_ce_tech, use_container_width=True, hide_index=True, height=360)
-        st.download_button("Descargar tabla (CSV)",
-                           df_ce_tech.to_csv(index=False).encode("utf-8"),
-                           "Cambios_Equipo_Tecnicos.csv","text/csv")
-
-    # PLACEHOLDER: conexión futura con consumo de materiales
-    st.markdown("---")
-    st.markdown("""<div class="matrix-title-card">
-        <b>CONSUMO DE MATERIALES — ESTRUCTURA PREPARADA</b>
-        <p>Este módulo se conectará con el archivo de consumo de materiales cuando esté disponible.
-        La lógica validará si la falla incluye consumo de equipo (ONT u otro dispositivo)
-        para correlacionar el cambio físico con la reincidencia posterior.</p>
-    </div>""", unsafe_allow_html=True)
-    st.info("Pendiente de definición del nombre y ubicación del archivo de materiales. "
-            "Al conectarlo, se cruzará automáticamente con los cambios de equipo registrados aquí.")
-
-
-# ==============================================================================
-# 12b. MÓDULO CAUSA Y SOLUCIÓN SOPORTE
-# ==============================================================================
-
-def renderizar_pestana_causa_solucion(df_folios: pd.DataFrame, dimension_sel: str) -> None:
-    """
-    Módulo Causa y Solución Soporte.
-    Solo considera eventos de tipo SOPORTE.
-    Pareto 80/20 con jerarquía dinámica (Causa / Falla / Solución).
-    """
-    st.markdown("### Causa y Solución — Soporte")
-
-    # Solo SOPORTE
-    df_sop = df_folios[df_folios["Tipo_Orden"].str.upper().str.contains("SOPORTE", na=False)].copy()
-    if df_sop.empty:
-        st.info("Sin registros de tipo Soporte para los filtros activos.")
-        return
-
-    # Verificar columnas disponibles
-    tiene_causa   = "Causa_Registro"    in df_sop.columns
-    tiene_falla   = "Falla_Registro"    in df_sop.columns
-    tiene_sol     = "Solucion_Registro" in df_sop.columns
-
-    if not (tiene_causa or tiene_falla or tiene_sol):
-        st.warning("Los archivos cargados no contienen columnas de Causa, Falla o Solución. "
-                   "Verifica que el CSV incluya esas columnas.")
-        return
-
-    # Rellenar valores faltantes
-    for col, nombre in [("Causa_Registro","SIN CAUSA"),("Falla_Registro","SIN FALLA"),
-                         ("Solucion_Registro","SIN SOLUCION")]:
-        if col not in df_sop.columns:
-            df_sop[col] = nombre
-        else:
-            df_sop[col] = df_sop[col].fillna(nombre).replace("SIN ESPECIFICAR", nombre)
-
-    DIMS = {"Causa": "Causa_Registro", "Falla": "Falla_Registro", "Solución": "Solucion_Registro"}
-
-    # ---- Controles ----
-    st.markdown("#### Configuración del Pareto")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        nivel1 = st.selectbox("Nivel 1 (eje principal):", list(DIMS.keys()), index=0, key="cs_n1")
-    niv_rest = [k for k in DIMS if k != nivel1]
-    with c2:
-        nivel2 = st.selectbox("Nivel 2:", niv_rest, index=0, key="cs_n2")
-    nivel3 = [k for k in DIMS if k not in [nivel1, nivel2]][0]
-    with c3:
-        st.markdown(f"**Nivel 3:** {nivel3}")
-
-    col_n1 = DIMS[nivel1]; col_n2 = DIMS[nivel2]; col_n3 = DIMS[nivel3]
-
-    with c4:
-        top_n = st.slider("Top N categorías:", 5, 30, 15, key="cs_topn")
-
-    # Filtros internos de la sección (multiselect independientes)
-    fi1, fi2, fi3 = st.columns(3)
-    with fi1:
-        opts_causa = sorted(df_sop["Causa_Registro"].dropna().unique())
-        sel_causa  = st.multiselect("Filtrar Causa:", opts_causa, key="cs_fil_causa")
-    with fi2:
-        opts_falla = sorted(df_sop["Falla_Registro"].dropna().unique())
-        sel_falla  = st.multiselect("Filtrar Falla:", opts_falla, key="cs_fil_falla")
-    with fi3:
-        opts_sol   = sorted(df_sop["Solucion_Registro"].dropna().unique())
-        sel_sol    = st.multiselect("Filtrar Solución:", opts_sol, key="cs_fil_sol")
-
-    df_f = df_sop.copy()
-    if sel_causa: df_f = df_f[df_f["Causa_Registro"].isin(sel_causa)]
-    if sel_falla: df_f = df_f[df_f["Falla_Registro"].isin(sel_falla)]
-    if sel_sol:   df_f = df_f[df_f["Solucion_Registro"].isin(sel_sol)]
-
-    if df_f.empty:
-        st.info("Sin registros para los filtros seleccionados.")
-        return
-
-    # ---- PARETO ----
-    st.markdown("---")
-    st.markdown(f"#### Pareto 80/20 — {nivel1} como eje principal")
-
-    df_pareto = (df_f.groupby(col_n1, observed=True)
-                 .size().reset_index(name="Frecuencia")
-                 .sort_values("Frecuencia", ascending=False)
-                 .head(top_n))
-    df_pareto["% Acumulado"] = (df_pareto["Frecuencia"].cumsum() /
-                                 df_pareto["Frecuencia"].sum() * 100).round(1)
-
-    fig_pareto = go.Figure()
-    fig_pareto.add_trace(go.Bar(
-        x=df_pareto[col_n1], y=df_pareto["Frecuencia"],
-        name="Frecuencia", marker_color=PALETA_COLOR["azul_marina"],
-        text=df_pareto["Frecuencia"], textposition="outside",
-        textfont=dict(size=9, color="#000000"),
-    ))
-    fig_pareto.add_trace(go.Scatter(
-        x=df_pareto[col_n1], y=df_pareto["% Acumulado"],
-        name="% Acumulado", yaxis="y2", mode="lines+markers",
-        line=dict(color=PALETA_COLOR["turquesa_cyan"], width=2),
-        marker=dict(size=6, color=PALETA_COLOR["azul_noche"]),
-    ))
-    # Línea 80%
-    fig_pareto.add_hline(y=80, yref="y2", line_dash="dash",
-                          line_color=PALETA_COLOR["verde_montana"], line_width=1.5,
-                          annotation_text="80%", annotation_position="top right",
-                          annotation_font_color="#000000")
-    fig_pareto.update_layout(
-        barmode="group",
-        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
-        font=dict(family="Arial, sans-serif", size=11, color="#000000"),
-        margin=dict(l=50, r=60, t=40, b=160),
-        title=dict(text=f"<b>PARETO DE {nivel1.upper()} — TOP {top_n}</b>",
-                   x=0.01, font=dict(size=13, color="#000000")),
-        legend=dict(orientation="h", yanchor="top", y=-0.45, xanchor="center", x=0.5,
-                    font=dict(size=10, color="#000000")),
-        xaxis=dict(tickangle=-45, tickfont=dict(size=9, color="#000000"),
-                   showgrid=False, type="category"),
-        yaxis=dict(title="Frecuencia", showgrid=True, gridcolor="#E2E8F0",
-                   tickfont=dict(color="#000000", size=10)),
-        yaxis2=dict(title="% Acumulado", overlaying="y", side="right",
-                    range=[0, 105], showgrid=False,
-                    tickfont=dict(color="#000000", size=10)),
-        dragmode=False,
-    )
-    st.plotly_chart(fig_pareto, use_container_width=True, key="pareto_causa_sol",
-                    config={"displayModeBar": False})
-
-    # ---- TABLA DESGLOSE ----
-    st.markdown(f"#### Desglose {nivel1} → {nivel2} → {nivel3}")
-    df_desg = (df_f.groupby([col_n1, col_n2, col_n3], observed=True)
-               .size().reset_index(name="Casos")
-               .sort_values("Casos", ascending=False))
-    df_desg.columns = [nivel1, nivel2, nivel3, "Casos"]
-    st.dataframe(df_desg, use_container_width=True, hide_index=True, height=320)
-
-    # ---- TÉCNICOS CON REINCIDENCIAS EN SOPORTE ----
-    st.markdown("---")
-    st.markdown("#### Técnicos — Reincidencias y Efectividad (filtrado a Soporte)")
-    if "ES_REINCIDENCIA" in df_f.columns and "Usuario_Tecnico" in df_f.columns:
-        df_tech_sop = (df_f.groupby("Usuario_Tecnico", observed=True)
-                       .agg(Total_Soportes=("FOLIO_KEY","count"),
-                            Reincidencias=("ES_REINCIDENCIA", lambda x: (x=="SI").sum()))
-                       .reset_index())
-        df_tech_sop["Efectividad_%"] = np.where(
-            df_tech_sop["Total_Soportes"] > 0,
-            np.round((1 - df_tech_sop["Reincidencias"] / df_tech_sop["Total_Soportes"]) * 100, 1),
-            100.0
-        )
-        df_tech_sop = df_tech_sop.sort_values("Reincidencias", ascending=False)
-        df_tech_sop.columns = ["Técnico","Total Soportes","Reincidencias","% Efectividad"]
-        st.dataframe(df_tech_sop, use_container_width=True, hide_index=True, height=320,
-                     column_config={"% Efectividad": st.column_config.NumberColumn(format="%.1f %%")})
-        st.download_button("Descargar tabla técnicos soporte (CSV)",
-                           df_tech_sop.to_csv(index=False).encode("utf-8"),
-                           "Soporte_Tecnicos.csv","text/csv")
-
-
-# ==============================================================================
 # 13. FUNCIÓN PRINCIPAL (main)
 # ==============================================================================
 
 def main():
     inyectar_estilos_css_enterprise()
 
-    st.markdown(f"""
-    <div class="main-header-enterprise">
-        <h1>OPERACIONES — REGIÓN NORTE LA BAJA</h1>
-        <p>Módulo Consolidado de Analítica, Pólizas y Control Técnico de Campo ({ANIO_BASE_ESTRICTO})</p>
-    </div>""", unsafe_allow_html=True)
+    col_hdr_left, col_hdr_right = st.columns([0.70, 0.30])
+    with col_hdr_left:
+        st.markdown(f"""
+        <div class="main-header-enterprise">
+            <h1>OPERACIONES — REGIÓN NORTE LA BAJA</h1>
+            <p>Módulo Consolidado de Analítica, Pólizas y Control Técnico de Campo ({ANIO_BASE_ESTRICTO})</p>
+        </div>""", unsafe_allow_html=True)
 
-    # Indicador de frescura del parquet vs CSV más reciente
-    try:
-        r_check = requests.head(
-            f"{GITHUB_RAW_BASE}/datos_consolidados.parquet",
-            headers=HEADERS, timeout=5, allow_redirects=True
-        )
-        parquet_ok = r_check.status_code == 200
-    except Exception:
-        parquet_ok = False
-
-    if parquet_ok:
-        st.sidebar.success("Dataset consolidado disponible")
-    else:
-        st.sidebar.warning("Sin parquet consolidado — carga lenta activa")
-
-    if st.sidebar.button("Actualizar datos", key="actualizar_parquet_dashboard"):
-        st.cache_data.clear()
-        st.rerun()
+    with col_hdr_right:
+        st.write("")
+        btn_c1, btn_c2 = st.columns(2)
+        with btn_c1:
+            if st.button("Recargar", use_container_width=True, type="primary"):
+                st.cache_data.clear(); st.rerun()
+        with btn_c2:
+            if st.button("Limpiar Caché", use_container_width=True, type="secondary"):
+                st.cache_data.clear()
+                for k in list(st.session_state.keys()):
+                    del st.session_state[k]
+                st.rerun()
 
     seccion = st.sidebar.radio(
         "Sección principal:",
@@ -3312,116 +1884,53 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Filtros Dinámicos")
-    st.sidebar.caption("Cada filtro reduce las opciones de los siguientes.")
     df_t = df_raw.copy()
 
-    # ── 1. MES ───────────────────────────────────────────────────────────────
     meses_disp = [m for m in LISTA_ORDENADA_MESES if m in df_t["MES_DIM"].unique()]
-    sel_meses  = st.sidebar.multiselect(
-        f"Mes: ({len(meses_disp)} disponibles)", meses_disp, key="f_mes"
-    )
-    if sel_meses: df_t = df_t[df_t["MES_DIM"].isin(sel_meses)]
+    sel_meses  = st.sidebar.multiselect("Mes:", meses_disp)
+    if sel_meses:   df_t = df_t[df_t["MES_DIM"].isin(sel_meses)]
 
-    # ── 2. SEMANA (opciones reducidas por mes seleccionado) ──────────────────
     sems_disp  = sorted(df_t["SEMANA_DIM"].dropna().unique(), key=_num_sem)
-    sel_sems   = st.sidebar.multiselect(
-        f"Semana: ({len(sems_disp)} disponibles)", sems_disp, key="f_sem"
-    )
-    if sel_sems:
-        # Primero se identifica el cierre semanal y enseguida se valida la fecha
-        # real de cada orden. Así, en la vista Día, Sem 38 sólo puede mostrar
-        # 14–21 de septiembre; productividad y días-cuadrilla usan ese mismo
-        # subconjunto, además de Distrito y Póliza seleccionados más abajo.
-        df_t = df_t[df_t["SEMANA_DIM"].isin(sel_sems)]
-        df_t, rangos_semana = acotar_fechas_a_semanas_seleccionadas(df_t, sel_sems)
-        if rangos_semana:
-            st.sidebar.caption("Fechas operativas: " + " · ".join(rangos_semana))
+    sel_sems   = st.sidebar.multiselect("Semana:", sems_disp)
+    if sel_sems:    df_t = df_t[df_t["SEMANA_DIM"].isin(sel_sems)]
 
-    # ── 3. PÓLIZA ─────────────────────────────────────────────────────────────
-    pols_disp   = sorted([k for k in df_t["Codigo_Poliza"].dropna().unique() if k in MAPEO_POLIZAS])
-    opc_pol     = [f"{c} — {MAPEO_POLIZAS[c]}" for c in pols_disp]
-    default_pol = [op for op in opc_pol if not any(op.startswith(exc) for exc in POLIZAS_DEFAULT_EXCLUIDAS)]
-    sel_pol     = st.sidebar.multiselect(
-        f"Póliza: ({len(opc_pol)} disponibles)", opc_pol,
-        default=default_pol, key="f_pol"
-    )
-    cods_pol = [p.split(" — ")[0] for p in sel_pol]
-    if cods_pol: df_t = df_t[df_t["Codigo_Poliza"].isin(cods_pol)]
+    pols_disp  = sorted([k for k in df_t["Codigo_Poliza"].unique() if k in MAPEO_POLIZAS])
+    opc_pol    = [f"{c} — {MAPEO_POLIZAS[c]}" for c in pols_disp]
+    sel_pol    = st.sidebar.multiselect("Pólizas:", opc_pol)
+    cods_pol   = [p.split(" — ")[0] for p in sel_pol]
+    if cods_pol:    df_t = df_t[df_t["Codigo_Poliza"].isin(cods_pol)]
 
-    # ── 4. TIPO DE EVENTO ─────────────────────────────────────────────────────
-    tipos_ev  = sorted(df_t["Tipo_Orden"].dropna().unique())
-    sel_tipos = st.sidebar.multiselect(
-        f"Tipo de Evento: ({len(tipos_ev)} disponibles)", tipos_ev, key="f_tipo"
-    )
-    if sel_tipos: df_t = df_t[df_t["Tipo_Orden"].isin(sel_tipos)]
+    tipos_ev   = sorted(df_t["Tipo_Orden"].unique())
+    sel_tipos  = st.sidebar.multiselect("Tipo de Evento:", tipos_ev)
+    if sel_tipos:   df_t = df_t[df_t["Tipo_Orden"].isin(sel_tipos)]
 
-    # ── 5. DISTRITO ───────────────────────────────────────────────────────────
-    distr_disp = sorted(df_t["Distrito"].dropna().unique())
-    sel_distr  = st.sidebar.multiselect(
-        f"Distrito: ({len(distr_disp)} disponibles)", distr_disp, key="f_dist"
-    )
-    if sel_distr: df_t = df_t[df_t["Distrito"].isin(sel_distr)]
+    distr_disp = sorted(df_t["Distrito"].unique())
+    sel_distr  = st.sidebar.multiselect("Distrito / Zona:", distr_disp)
+    if sel_distr:   df_t = df_t[df_t["Distrito"].isin(sel_distr)]
 
-    # ── 6. EMPRESA / PROVEEDOR ────────────────────────────────────────────────
-    emps_disp = sorted(df_t["Empresa"].dropna().unique())
-    sel_emps  = st.sidebar.multiselect(
-        f"Empresa: ({len(emps_disp)} disponibles)", emps_disp, key="f_emp"
-    )
-    if sel_emps: df_t = df_t[df_t["Empresa"].isin(sel_emps)]
-
-    # ── 7. CLUSTER ────────────────────────────────────────────────────────────
-    if "Cluster_Base" in df_t.columns:
-        clusters_disp = sorted([
-            c for c in df_t["Cluster_Base"].dropna().unique()
-            if str(c).upper() not in ["SIN CLUSTER","CLUSTER GENERAL",""]
-        ])
-        sel_clusters = st.sidebar.multiselect(
-            f"Cluster: ({len(clusters_disp)} disponibles)",
-            clusters_disp, key="f_cluster"
-        )
-        if sel_clusters: df_t = df_t[df_t["Cluster_Base"].isin(sel_clusters)]
-
-    # ── 8. TÉCNICO (código — ID primario) ────────────────────────────────────
-    if "Usuario_Tecnico" in df_t.columns:
-        df_t["_cod_tecnico"] = df_t["Usuario_Tecnico"].str.split(" | ").str[0].str.strip()
-        cods_tech_disp = sorted(df_t["_cod_tecnico"].dropna().unique())
-        sel_techs = st.sidebar.multiselect(
-            f"Técnico: ({len(cods_tech_disp)} disponibles)",
-            cods_tech_disp, key="f_tecnico"
-        )
-        if sel_techs: df_t = df_t[df_t["_cod_tecnico"].isin(sel_techs)]
-        df_t = df_t.drop(columns=["_cod_tecnico"], errors="ignore")
-
-    # Indicador de registros activos
-    st.sidebar.markdown("---")
-    st.sidebar.metric("Registros activos", f"{len(df_t):,}", f"de {len(df_raw):,} totales")
+    emps_disp  = sorted(df_t["Empresa"].unique())
+    sel_emps   = st.sidebar.multiselect("Proveedor / Empresa:", emps_disp)
+    if sel_emps:    df_t = df_t[df_t["Empresa"].isin(sel_emps)]
 
     df_folios = df_t.drop_duplicates(subset=["FOLIO_KEY"], keep="first")
-    # Productividad, eventos y ranking usan únicamente OTs terminadas y con
-    # Fecha término válida. Reincidencias conserva el universo filtrado para
-    # relacionar término del antecedente contra creación del evento posterior.
-    df_eventos_completados = filtrar_eventos_completados(df_folios)
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "Pólizas y Cuadrillas",
         "Reincidencias",
         "Cambios de Equipo",
-        "Causa y Solución Soporte",
+        "Causa y Solución Soporte"
     ])
 
     with tab1:
-        renderizar_pestana_polizas_cuadrillas(
-            df_eventos_completados, df_raw, dimension_sel,
-            semanas_filtradas=sel_sems,
-            meses_filtrados=sel_meses,
-        )
+        renderizar_pestana_polizas_cuadrillas(df_folios, df_raw, dimension_sel)
     with tab2:
         renderizar_pestana_reincidencias_total(df_folios, dimension_sel)
     with tab3:
-        renderizar_pestana_cambios_equipo(df_folios, df_raw, dimension_sel)
+        st.markdown("### Cambios de Equipo")
+        st.info("Módulo en desarrollo.")
     with tab4:
-        renderizar_pestana_causa_solucion(df_folios, dimension_sel)
-
+        st.markdown("### Causa y Solución Soporte")
+        st.info("Módulo en desarrollo.")
 
 
 if __name__ == "__main__":
