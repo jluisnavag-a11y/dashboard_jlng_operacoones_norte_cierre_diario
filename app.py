@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 15.0.3-REINCIDENCIAS-POR-INGRESO
+# Archivo: app.py | Versión: 15.0.4-RESPONSABLE-ZONA
 # ==============================================================================
 
 import os
@@ -63,7 +63,7 @@ GITHUB_RAW_BASE_SOPORTE= f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITH
 ANIO_BASE_ESTRICTO: int       = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str           = "TOTALPLAY / OPERACIONES — REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str          = "15.0.1-PRODUCTIVIDAD-DINAMICA"
+VERSION_SISTEMA: str          = "15.0.4-RESPONSABLE-ZONA"
 
 # Tipos elegibles para denominador de efectividad y para el cálculo de productividad
 TIPOS_ELEGIBLES_EFECTIVIDAD = frozenset(["INSTALACION", "INSTALACIÓN", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO"])
@@ -215,6 +215,48 @@ MAPEO_BASE_CLUSTERS: Dict[str, str] = {
         "TECATE","VALLE VERDE","VILLA DEL CAMPO","ZAPATA"
     ]
 }
+
+# Asignación territorial para análisis de reincidencias.
+# RESPONSABLE DE ZONA no depende de quién cierre el evento: se deriva del
+# Cluster Unificado y permite comparar la empresa que originó la reincidencia
+# contra el proveedor territorial responsable de la zona.
+MAPEO_RESPONSABLE_ZONA_POR_CLUSTER: Dict[str, str] = {
+    # MEXICALI D
+    "AVIACION": "ADDNOVATI",
+    "GONZALEZ ORTEGA": "WEB",
+    "HACIENDA REAL": "WEB",
+    "PUEBLO NUEVO": "WEB",
+    "UABC": "ADDNOVATI",
+
+    # TIJUANA PLAYAS D
+    "ALTAMIRA": "CRCE",
+    "FUNDADORES": "CRCE",
+    "PLAYAS TIJUANA": "CRCE",
+    "SALVATIERRA": "CRCE",
+    "ZAPATA": "JELTM",
+    "REFUGIO": "JELTM",
+    "ROSAMAR": "JELTM",
+    "SANTA FE TIJUANA": "JELTM",
+    "NATURA": "JELTM",
+    "PLAYA HERMOSA": "JELTM",
+    "VALLE VERDE": "ADDNOVATI",
+
+    # TIJUANA RIO D
+    "AGUA CALIENTE": "ECO TELECOM",
+    "CERRO COLORADO": "ECO TELECOM",
+    "COLINAS DEL FLORIDO": "ECO TELECOM",
+    "DOS MIL": "SOLUCIONIKA",
+    "FONTANA": "SOLUCIONIKA",
+    "LOMAS DE VIRREY": "SOLUCIONIKA",
+    "MAGISTERIAL": "TETSI",
+    "MATAMOROS": "SOLUCIONIKA",
+    "OTAY": "SOLUCIONIKA",
+    "PACIFICO": "ECO TELECOM",
+    "PATRIA NUEVA": "SOLUCIONIKA",
+    "ROSAS MAGALLON": "ECO TELECOM",
+    "TECATE": "SOLUCIONIKA",
+    "VILLA DEL CAMPO": "ECO TELECOM",
+}
 RE_SEMANA = re.compile(r"(?:SEM|SEMANA|S)[\s_\-]*(\d{1,2})", re.IGNORECASE)
 
 # ==============================================================================
@@ -277,6 +319,22 @@ def _normalizar_cluster_string(txt: str) -> str:
 def normalizar_clusters_vectorizado(serie: pd.Series) -> pd.Series:
     mapa = {v: _normalizar_cluster_string(str(v)) for v in serie.unique()}
     return serie.map(mapa)
+
+
+def aplicar_responsable_zona(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrega Cluster_Unificado y Responsable_Zona sin depender del proveedor de cierre."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    if "Cluster_Base" in df.columns:
+        cluster = df["Cluster_Base"].astype(str).map(_normalizar_cluster_string)
+    elif "Cluster_Raw" in df.columns:
+        cluster = normalizar_clusters_vectorizado(df["Cluster_Raw"].astype(str))
+    else:
+        cluster = pd.Series("CLUSTER GENERAL", index=df.index)
+    df["Cluster_Unificado"] = cluster
+    df["Responsable_Zona"] = cluster.map(MAPEO_RESPONSABLE_ZONA_POR_CLUSTER).fillna("SIN ASIGNACION")
+    return df
 
 
 def detectar_columna_por_patrones(columnas: List[str], patrones: List[str]) -> Optional[str]:
@@ -730,6 +788,7 @@ def transformar_dataset_completo(df: pd.DataFrame) -> pd.DataFrame:
     df["Tipo_Orden"]   = s_tipo
     df["Cluster_Raw"]  = sanit_txt(df[c_clus]) if c_clus else "SIN CLUSTER"
     df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
+    df = aplicar_responsable_zona(df)
 
     # Pólizas: el ID primario es el campo Usuario (primeros 5 chars → posiciones 3-4)
     c_pol = c_usr or c_nom
@@ -884,6 +943,7 @@ def transformar_dataset_base(df: pd.DataFrame) -> pd.DataFrame:
     df["Tipo_Orden"]   = s_tipo
     df["Cluster_Raw"]  = sanit_txt(df[c_clus]) if c_clus else "SIN CLUSTER"
     df["Cluster_Base"] = normalizar_clusters_vectorizado(df["Cluster_Raw"])
+    df = aplicar_responsable_zona(df)
 
     c_pol = c_usr or c_nom
     if c_pol and c_pol in cols:
@@ -947,8 +1007,9 @@ def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
     un error inmediato en lugar de activar una carga lenta por archivos.
     """
     cols_base = ["FOLIO_KEY","Cuenta_Cliente","Usuario_Tecnico","Empresa",
-                 "Distrito","Tipo_Orden","Cluster_Base","Nombre_Poliza",
-                 "Num_Semana_Archivo","SEMANA_DIM","FECHA_TRUNCADA"]
+                 "Distrito","Tipo_Orden","Cluster_Base","Cluster_Unificado",
+                 "Responsable_Zona","Nombre_Poliza","Num_Semana_Archivo",
+                 "SEMANA_DIM","FECHA_TRUNCADA"]
 
     try:
         resp = requests.get(f"{GITHUB_RAW_BASE}/datos_consolidados.parquet", headers=HEADERS, timeout=15)
@@ -958,7 +1019,9 @@ def ejecutar_pipeline_ingestion_datos() -> pd.DataFrame:
                 # También corrige parquets generados antes de este cambio: las
                 # dimensiones de productividad se derivan en tiempo de carga de
                 # Fecha término, sin esperar una reconstrucción histórica.
-                return aplicar_dimensiones_productividad(_homologar_tipos_df(df))
+                return aplicar_responsable_zona(
+                    aplicar_dimensiones_productividad(_homologar_tipos_df(df))
+                )
         logger.error("Parquet no disponible o incompleto (HTTP %s).", resp.status_code)
     except Exception as e:
         logger.warning(f"No se pudo descargar Parquet consolidado: {e}")
@@ -2432,7 +2495,7 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
     cols_p  = [
         "FOLIO_KEY", "Cuenta_Cliente", "SEMANA_REINCIDENCIA_DIM",
         "FECHA_REINCIDENCIA_DIM", "TIPO_2", "Falla_Nueva",
-        "Empresa_Origen_Reincidencia"
+        "Empresa_Origen_Reincidencia", "Cluster_Unificado", "Responsable_Zona"
     ]
     cols_pr = [c for c in cols_p if c in df_m.columns]
     renames = {
@@ -2443,6 +2506,8 @@ def mostrar_modal_detalle_usuario(df_usuario: pd.DataFrame, usuario_nom: str):
         "TIPO_2":"Tipo / Causa Origen",
         "Falla_Nueva":"Falla (Soporte)",
         "Empresa_Origen_Reincidencia":"Empresa Técnico",
+        "Cluster_Unificado":"Cluster Unificado",
+        "Responsable_Zona":"Responsable de Zona",
     }
     df_show = df_m[cols_pr].rename(columns=renames)
     st.dataframe(df_show, use_container_width=True, hide_index=True, height=380)
@@ -2486,6 +2551,8 @@ def mostrar_modal_detalle_cuenta(df_cuenta: pd.DataFrame, cuenta_id: str):
         "Falla_Nueva":                    "Falla (Soporte)",
         "Usuario_Origen_Reincidencia":    "Técnico Origen",
         "Empresa_Origen_Reincidencia":    "Empresa Origen",
+        "Cluster_Unificado":              "Cluster Unificado",
+        "Responsable_Zona":               "Responsable de Zona",
         "SEMANA_DIM":                     "Semana Término (Productividad)",
     }
     cols_ok = {k: v for k, v in cols_display.items() if k in df_m.columns}
@@ -2526,41 +2593,65 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         if col_req not in df_folios.columns:
             df_folios[col_req] = default
 
-    df_rein_base = df_folios[df_folios["ES_REINCIDENCIA"] == "SI"]
+    # Asegurar dimensiones territoriales aun con parquets históricos.
+    df_folios = aplicar_responsable_zona(df_folios)
+    df_rein_base = df_folios[df_folios["ES_REINCIDENCIA"] == "SI"].copy()
 
     st.markdown("#### Filtros de Reincidencias")
-    col_f0, col_f1, col_f2, col_f3, col_f4 = st.columns(5)
+    st.caption(
+        "Responsable de Zona se asigna por Cluster Unificado y es independiente "
+        "de la empresa que cerró el evento. Empresa Reincidente corresponde al antecedente que originó la reincidencia."
+    )
+    col_f0, col_f1, col_f2, col_f3 = st.columns(4)
+    col_f4, col_f5, col_f6 = st.columns(3)
 
-    _opt = lambda df, col: sorted([x for x in df[col].unique() if str(x).upper() not in ["N/A","NAN","NONE",""]]) if col in df.columns else []
+    _opt = lambda df, col: sorted([
+        x for x in df[col].dropna().unique()
+        if str(x).upper() not in ["N/A","NAN","NONE","", "SIN ASIGNACION", "CLUSTER GENERAL", "SIN CLUSTER"]
+    ]) if col in df.columns else []
 
     with col_f0:
         st.markdown("**Distrito**")
         f_dist = st.multiselect("Distrito:", _opt(df_rein_base,"Distrito"), key="fltr_dist_rein", label_visibility="collapsed")
     with col_f1:
-        st.markdown("**Empresa Reincidente**")
-        f_emp = st.multiselect("Empresa:", _opt(df_rein_base,"Empresa_Origen_Reincidencia"), key="fltr_emp_rein", label_visibility="collapsed")
+        st.markdown("**Cluster Unificado**")
+        f_cluster = st.multiselect("Cluster Unificado:", _opt(df_rein_base,"Cluster_Unificado"), key="fltr_cluster_unif_rein", label_visibility="collapsed")
     with col_f2:
+        st.markdown("**Responsable de Zona**")
+        f_resp_zona = st.multiselect("Responsable de Zona:", _opt(df_rein_base,"Responsable_Zona"), key="fltr_resp_zona_rein", label_visibility="collapsed")
+    with col_f3:
+        st.markdown("**Empresa Reincidente**")
+        f_emp = st.multiselect("Empresa Reincidente:", _opt(df_rein_base,"Empresa_Origen_Reincidencia"), key="fltr_emp_rein", label_visibility="collapsed")
+    with col_f4:
         st.markdown("**Técnico Reincidente**")
         f_tech = st.multiselect("Técnico:", _opt(df_rein_base,"Usuario_Origen_Reincidencia"), key="fltr_tech_rein", label_visibility="collapsed")
-    with col_f3:
+    with col_f5:
         st.markdown("**Tipo / Causa Origen**")
         f_tipo2 = st.multiselect("Tipo 2:", _opt(df_rein_base,"TIPO_2"), key="fltr_tipo2_rein", label_visibility="collapsed")
-    with col_f4:
+    with col_f6:
         st.markdown("**Falla Nueva (Soporte)**")
         f_falla = st.multiselect("Falla:", _opt(df_rein_base,"Falla_Nueva"), key="fltr_falla_rein", label_visibility="collapsed")
 
     df_fr = df_rein_base.copy()
-    if f_dist:  df_fr = df_fr[df_fr["Distrito"].isin(f_dist)]
-    if f_emp:   df_fr = df_fr[df_fr["Empresa_Origen_Reincidencia"].isin(f_emp)]
-    if f_tech:  df_fr = df_fr[df_fr["Usuario_Origen_Reincidencia"].isin(f_tech)]
-    if f_tipo2: df_fr = df_fr[df_fr["TIPO_2"].isin(f_tipo2)]
-    if f_falla: df_fr = df_fr[df_fr["Falla_Nueva"].isin(f_falla)]
+    if f_dist:      df_fr = df_fr[df_fr["Distrito"].isin(f_dist)]
+    if f_cluster:   df_fr = df_fr[df_fr["Cluster_Unificado"].isin(f_cluster)]
+    if f_resp_zona: df_fr = df_fr[df_fr["Responsable_Zona"].isin(f_resp_zona)]
+    if f_emp:       df_fr = df_fr[df_fr["Empresa_Origen_Reincidencia"].isin(f_emp)]
+    if f_tech:      df_fr = df_fr[df_fr["Usuario_Origen_Reincidencia"].isin(f_tech)]
+    if f_tipo2:     df_fr = df_fr[df_fr["TIPO_2"].isin(f_tipo2)]
+    if f_falla:     df_fr = df_fr[df_fr["Falla_Nueva"].isin(f_falla)]
 
     # Denominador: solo los 4 tipos elegibles
     col_tipo_base = "Tipo_Orden" if "Tipo_Orden" in df_folios.columns else "TIPO"
     patron_efect  = r"INSTALA|SOPORTE|CAMBIO.*DOMICILIO|CAMBIO.*EQUIPO"
     mask_efect    = df_folios[col_tipo_base].astype(str).str.upper().str.contains(patron_efect, regex=True, na=False)
-    df_base_efect = df_folios[mask_efect]
+    df_base_efect = df_folios[mask_efect].copy()
+    # Para medir impacto territorial, el denominador respeta los filtros
+    # geográficos. Los filtros de Empresa/Técnico/Causa/Falla son atributos de
+    # la reincidencia y por eso solo afectan al numerador.
+    if f_dist:      df_base_efect = df_base_efect[df_base_efect["Distrito"].isin(f_dist)]
+    if f_cluster:   df_base_efect = df_base_efect[df_base_efect["Cluster_Unificado"].isin(f_cluster)]
+    if f_resp_zona: df_base_efect = df_base_efect[df_base_efect["Responsable_Zona"].isin(f_resp_zona)]
 
     total_base      = len(df_base_efect)
     total_rein_fil  = len(df_fr)
@@ -2593,6 +2684,27 @@ def renderizar_pestana_reincidencias_total(df_folios: pd.DataFrame, dimension_se
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Impacto por responsable territorial vs empresa que originó la reincidencia
+    if not df_fr.empty:
+        st.markdown("#### Impacto por Responsable de Zona")
+        df_impacto_zona = (
+            df_fr.groupby(["Responsable_Zona", "Empresa_Origen_Reincidencia"], observed=True)
+            .size().reset_index(name="Reincidencias")
+            .rename(columns={
+                "Responsable_Zona": "Responsable de Zona",
+                "Empresa_Origen_Reincidencia": "Empresa Reincidente",
+            })
+            .sort_values("Reincidencias", ascending=False)
+        )
+        st.dataframe(
+            df_impacto_zona, use_container_width=True, hide_index=True, height=260,
+            column_config={
+                "Responsable de Zona": st.column_config.Column(width="medium"),
+                "Empresa Reincidente": st.column_config.Column(width="medium"),
+                "Reincidencias": st.column_config.NumberColumn(width="small"),
+            },
+        )
 
     # --------------------------------------------------------------------------
     # GRÁFICA: LÍNEA DE TIEMPO DE REINCIDENCIAS POR TIPO REINCIDENTE
