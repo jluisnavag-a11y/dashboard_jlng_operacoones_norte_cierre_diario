@@ -2250,7 +2250,7 @@ def renderizar_pestana_polizas_cuadrillas(
             # generar una segunda fila en el ranking.
             # ------------------------------------------------------------------
             df_rk_base = df_folios.copy()
-            usr_parts = df_rk_base["Usuario_Tecnico"].astype(str).str.split(" | ", n=1, expand=True)
+            usr_parts = df_rk_base["Usuario_Tecnico"].astype(str).str.split(" | ", n=1, expand=True, regex=False)
             df_rk_base["_Usuario_ID"] = usr_parts[0].astype(str).str.strip().str.upper()
             if usr_parts.shape[1] > 1:
                 df_rk_base["_Nombre_Tecnico"] = usr_parts[1].astype(str).str.strip().str.upper()
@@ -2325,7 +2325,7 @@ def renderizar_pestana_polizas_cuadrillas(
                     df_rein_rk["_Usuario_ID"] = (
                         df_rein_rk["Usuario_Origen_Reincidencia"]
                         .astype(str)
-                        .str.split(" | ", n=1)
+                        .str.split(" | ", n=1, regex=False)
                         .str[0]
                         .str.strip()
                         .str.upper()
