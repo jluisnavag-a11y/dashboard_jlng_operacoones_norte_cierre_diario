@@ -1,6 +1,6 @@
 # ==============================================================================
 # SISTEMA ENTERPRISE DE CONTROL OPERATIVO DE CUADRILLAS EN CAMPO 2026
-# Archivo: app.py | Versión: 15.0.4-RESPONSABLE-ZONA
+# Archivo: app.py | Versión: 15.0.5-RANKING-REINCIDENCIAS
 # ==============================================================================
 
 import os
@@ -63,7 +63,7 @@ GITHUB_RAW_BASE_SOPORTE= f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITH
 ANIO_BASE_ESTRICTO: int       = 2026
 EXCEL_EPOCH_START: pd.Timestamp = pd.Timestamp("1899-12-30")
 NOMBRE_SISTEMA: str           = "TOTALPLAY / OPERACIONES — REGIÓN NORTE LA BAJA"
-VERSION_SISTEMA: str          = "15.0.4-RESPONSABLE-ZONA"
+VERSION_SISTEMA: str          = "15.0.5-RANKING-REINCIDENCIAS"
 
 # Tipos elegibles para denominador de efectividad y para el cálculo de productividad
 TIPOS_ELEGIBLES_EFECTIVIDAD = frozenset(["INSTALACION", "INSTALACIÓN", "SOPORTE", "CAMBIO DE DOMICILIO", "CAMBIO DE EQUIPO"])
@@ -1941,6 +1941,7 @@ def renderizar_pestana_polizas_cuadrillas(
     dimension_sel: str,
     semanas_filtradas: Optional[List[str]] = None,
     meses_filtrados: Optional[List[str]] = None,
+    df_reincidencias: Optional[pd.DataFrame] = None,
 ) -> None:
     kpis = extraer_metricas_kpi_totales(
         df_folios, df_raw, dimension_sel, semanas_filtradas, meses_filtrados
@@ -2215,52 +2216,174 @@ def renderizar_pestana_polizas_cuadrillas(
     # --- SUBTAB 3: RANKING ---
     with sub_tab3:
         st.markdown("### Ranking de Productividad por Técnico / Cuadrilla")
-        st.caption("Solo pólizas elegibles (D1, D6, E3, M3, M4, MT, R3). Excluye proveedores ITAI, TOTALBOX y TOTALPLAY. Excluye generación-25.")
+        st.caption(
+            "Una sola fila por código de usuario. El nombre se usa únicamente como etiqueta "
+            "y se toma su variante más frecuente. Distrito, empresa y póliza se consolidan "
+            "si el mismo usuario tuvo más de un contexto. Reincidencias = eventos posteriores "
+            "atribuidos al técnico que originó el antecedente."
+        )
         if not df_folios.empty:
             col_rk1, col_rk2 = st.columns([0.6, 0.4])
             with col_rk1:
-                ord_rk = st.radio("Ordenar por:", ["Productividad Diaria","Eventos Totales","Días Activos"],
-                                  horizontal=True, key="orden_ranking")
+                ord_rk = st.radio(
+                    "Ordenar por:",
+                    ["Productividad Diaria","Eventos Totales","Días Activos","Reincidencias"],
+                    horizontal=True, key="orden_ranking"
+                )
             with col_rk2:
-                dir_rk = st.radio("Dirección:", ["Mayor a menor","Menor a mayor"],
-                                  horizontal=True, key="dir_ranking")
+                dir_rk = st.radio(
+                    "Dirección:", ["Mayor a menor","Menor a mayor"],
+                    horizontal=True, key="dir_ranking"
+                )
             asc_rk = (dir_rk == "Menor a mayor")
             col_ord_map = {
                 "Productividad Diaria": "Productividad_Diaria",
                 "Eventos Totales":      "Eventos_Totales",
                 "Días Activos":         "Dias_Activos",
+                "Reincidencias":        "Reincidencias",
             }
 
-            df_rk = (df_folios.groupby(
-                ["Usuario_Tecnico","Distrito","Empresa","Codigo_Poliza","Nombre_Poliza"], observed=True
-            ).agg(
-                Eventos_Totales=("FOLIO_KEY","count"),
-                Dias_Activos=("FECHA_TRUNCADA","nunique"),
-            ).reset_index())
+            # ------------------------------------------------------------------
+            # IDENTIDAD CANÓNICA DE CUADRILLA
+            # El código de usuario es el ID primario. El nombre puede cambiar
+            # por espacios, captura o actualización del catálogo y NO debe
+            # generar una segunda fila en el ranking.
+            # ------------------------------------------------------------------
+            df_rk_base = df_folios.copy()
+            usr_parts = df_rk_base["Usuario_Tecnico"].astype(str).str.split(" | ", n=1, expand=True)
+            df_rk_base["_Usuario_ID"] = usr_parts[0].astype(str).str.strip().str.upper()
+            if usr_parts.shape[1] > 1:
+                df_rk_base["_Nombre_Tecnico"] = usr_parts[1].astype(str).str.strip().str.upper()
+            else:
+                df_rk_base["_Nombre_Tecnico"] = ""
 
-            # Productividad por técnico = Eventos / Días-activos propios (no días globales)
+            df_rk_base = df_rk_base[
+                ~df_rk_base["_Usuario_ID"].isin(["", "SIN ESPECIFICAR", "NAN", "NONE"])
+            ].copy()
+
+            def _valor_representativo(serie: pd.Series) -> str:
+                vals = serie.dropna().astype(str).str.strip()
+                vals = vals[~vals.str.upper().isin(["", "NAN", "NONE", "SIN ESPECIFICAR"])]
+                if vals.empty:
+                    return "SIN ESPECIFICAR"
+                # La variante más frecuente evita que un typo ocasional cambie
+                # el nombre mostrado para el mismo código de usuario.
+                return str(vals.value_counts().index[0])
+
+            def _combinar_contexto(serie: pd.Series) -> str:
+                vals = [
+                    str(v).strip() for v in serie.dropna().tolist()
+                    if str(v).strip().upper() not in ["", "NAN", "NONE", "SIN ESPECIFICAR"]
+                ]
+                unicos = list(dict.fromkeys(vals))
+                return " / ".join(unicos) if unicos else "SIN ESPECIFICAR"
+
+            # Una fila por código de usuario, incluso si cambió el nombre,
+            # distrito, proveedor o contexto durante el período seleccionado.
+            df_rk = (
+                df_rk_base.groupby("_Usuario_ID", observed=True)
+                .agg(
+                    Nombre_Tecnico=("_Nombre_Tecnico", _valor_representativo),
+                    Distrito=("Distrito", _combinar_contexto),
+                    Empresa=("Empresa", _combinar_contexto),
+                    Codigo_Poliza=("Codigo_Poliza", _combinar_contexto),
+                    Nombre_Poliza=("Nombre_Poliza", _combinar_contexto),
+                    Eventos_Totales=("FOLIO_KEY", "count"),
+                    Dias_Activos=("FECHA_TRUNCADA", "nunique"),
+                )
+                .reset_index()
+            )
+
+            # Productividad por técnico = Eventos / Días-activos propios.
             df_rk["Productividad_Diaria"] = np.where(
                 df_rk["Dias_Activos"] > 0,
                 np.round(df_rk["Eventos_Totales"] / df_rk["Dias_Activos"], 2),
                 0.0
             )
+
+            # ------------------------------------------------------------------
+            # REINCIDENCIAS ATRIBUIDAS AL TÉCNICO ORIGEN
+            # No se cuentan contra quien cerró el Soporte actual; se atribuyen
+            # al Usuario_Origen_Reincidencia, respetando los filtros de
+            # reincidencias (Fecha creación/ingreso del evento posterior).
+            # ------------------------------------------------------------------
+            df_rk["Reincidencias"] = 0
+            df_rein_rk = (
+                df_reincidencias.copy()
+                if df_reincidencias is not None
+                else pd.DataFrame()
+            )
+            if (
+                not df_rein_rk.empty
+                and "ES_REINCIDENCIA" in df_rein_rk.columns
+                and "Usuario_Origen_Reincidencia" in df_rein_rk.columns
+            ):
+                df_rein_rk = df_rein_rk[
+                    df_rein_rk["ES_REINCIDENCIA"].astype(str).str.upper().eq("SI")
+                ].copy()
+                if not df_rein_rk.empty:
+                    df_rein_rk["_Usuario_ID"] = (
+                        df_rein_rk["Usuario_Origen_Reincidencia"]
+                        .astype(str)
+                        .str.split(" | ", n=1)
+                        .str[0]
+                        .str.strip()
+                        .str.upper()
+                    )
+                    rein_por_usr = (
+                        df_rein_rk[
+                            ~df_rein_rk["_Usuario_ID"].isin(
+                                ["", "SIN ESPECIFICAR", "N/A", "NAN", "NONE"]
+                            )
+                        ]
+                        .groupby("_Usuario_ID", observed=True)
+                        .size()
+                        .rename("Reincidencias")
+                        .reset_index()
+                    )
+                    df_rk = df_rk.drop(columns=["Reincidencias"]).merge(
+                        rein_por_usr, on="_Usuario_ID", how="left"
+                    )
+                    df_rk["Reincidencias"] = (
+                        pd.to_numeric(df_rk["Reincidencias"], errors="coerce")
+                        .fillna(0)
+                        .astype(int)
+                    )
+
+            # Etiqueta visible canónica: mismo código = una sola cuadrilla.
+            df_rk["Técnico"] = np.where(
+                df_rk["Nombre_Tecnico"].ne("SIN ESPECIFICAR") & df_rk["Nombre_Tecnico"].ne(""),
+                df_rk["_Usuario_ID"] + " | " + df_rk["Nombre_Tecnico"],
+                df_rk["_Usuario_ID"]
+            )
+
             df_rk = df_rk.sort_values(col_ord_map[ord_rk], ascending=asc_rk)
-            df_rk.columns = [
-                "Técnico","Distrito","Empresa","Póliza","Modalidad",
-                "Eventos Totales","Días Activos","Productividad Diaria"
-            ]
+            df_rk = df_rk[
+                [
+                    "Técnico","Distrito","Empresa","Codigo_Poliza","Nombre_Poliza",
+                    "Eventos_Totales","Dias_Activos","Productividad_Diaria","Reincidencias"
+                ]
+            ].rename(columns={
+                "Codigo_Poliza": "Póliza",
+                "Nombre_Poliza": "Modalidad",
+                "Eventos_Totales": "Eventos Totales",
+                "Dias_Activos": "Días Activos",
+                "Productividad_Diaria": "Productividad Diaria",
+            })
+
             st.dataframe(
                 df_rk,
                 use_container_width=True, hide_index=True, height=440,
                 column_config={
-                    "Técnico":             st.column_config.Column(width="large", pinned=True),
-                    "Distrito":            st.column_config.Column(width="small"),
-                    "Empresa":             st.column_config.Column(width="medium"),
-                    "Póliza":              st.column_config.Column(width="small"),
-                    "Modalidad":           st.column_config.Column(width="medium"),
-                    "Eventos Totales":     st.column_config.NumberColumn(width="small"),
-                    "Días Activos":        st.column_config.NumberColumn(width="small"),
-                    "Productividad Diaria":st.column_config.NumberColumn(format="%.2f", width="small"),
+                    "Técnico":              st.column_config.Column(width="large", pinned=True),
+                    "Distrito":             st.column_config.Column(width="small"),
+                    "Empresa":              st.column_config.Column(width="medium"),
+                    "Póliza":               st.column_config.Column(width="small"),
+                    "Modalidad":            st.column_config.Column(width="medium"),
+                    "Eventos Totales":      st.column_config.NumberColumn(width="small"),
+                    "Días Activos":         st.column_config.NumberColumn(width="small"),
+                    "Productividad Diaria": st.column_config.NumberColumn(format="%.2f", width="small"),
+                    "Reincidencias":        st.column_config.NumberColumn(width="small"),
                 }
             )
             st.download_button(
@@ -3506,6 +3629,7 @@ def main():
             df_eventos_completados, df_raw, dimension_sel,
             semanas_filtradas=sel_sems,
             meses_filtrados=sel_meses,
+            df_reincidencias=df_folios_rein,
         )
     with tab2:
         renderizar_pestana_reincidencias_total(df_folios_rein, dimension_sel)
